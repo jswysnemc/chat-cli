@@ -963,6 +963,9 @@ fn prepare_ask(
     if let Ok(history) = read_events(paths, config, &session_id) {
         for event in history {
             if let SessionEvent::Message(message) = event {
+                if message.content.is_empty() {
+                    continue;
+                }
                 messages.push(ChatMessage {
                     role: message.role,
                     content: message.content,
@@ -1020,26 +1023,26 @@ fn persist_session(
         return Ok(());
     }
 
-    let events = vec![
-        SessionEvent::Message(SessionMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-            created_at: now_rfc3339(),
-        }),
-        SessionEvent::Message(SessionMessage {
+    let mut events = vec![SessionEvent::Message(SessionMessage {
+        role: "user".to_string(),
+        content: prompt.to_string(),
+        created_at: now_rfc3339(),
+    })];
+    if !response.content.is_empty() {
+        events.push(SessionEvent::Message(SessionMessage {
             role: "assistant".to_string(),
             content: response.content.clone(),
             created_at: now_rfc3339(),
-        }),
-        SessionEvent::Response(SessionResponse {
-            provider: response.provider_id.clone(),
-            model: response.model_id.clone(),
-            finish_reason: response.finish_reason.clone(),
-            latency_ms: response.latency_ms,
-            usage: response.usage.clone(),
-            created_at: now_rfc3339(),
-        }),
-    ];
+        }));
+    }
+    events.push(SessionEvent::Response(SessionResponse {
+        provider: response.provider_id.clone(),
+        model: response.model_id.clone(),
+        finish_reason: response.finish_reason.clone(),
+        latency_ms: response.latency_ms,
+        usage: response.usage.clone(),
+        created_at: now_rfc3339(),
+    }));
     append_events(paths, config, session_id, &events)?;
     let temp = is_temp_session(session_id) || args.temp;
     set_current_session(paths, config, Some(session_id), temp)
