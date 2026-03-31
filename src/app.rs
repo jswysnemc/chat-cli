@@ -15,9 +15,10 @@ use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, send_chat, stream_chat, test_provider,
 };
 use crate::session::{
-    SessionEvent, SessionMessage, SessionResponse, append_events, delete_session, gc_sessions,
-    generate_session_id, generate_temp_session_id, is_temp_session, list_session_summaries,
-    load_state, now_rfc3339, read_events, resolve_session_id, set_current_session, short_id,
+    SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions, delete_session,
+    gc_sessions, generate_session_id, generate_temp_session_id, is_temp_session,
+    list_session_summaries, load_state, now_rfc3339, read_events, resolve_session_id,
+    set_current_session, short_id,
 };
 use clap::CommandFactory;
 use serde_json::{Value, json};
@@ -498,6 +499,14 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
                 set_current_session(paths, config, None, false)?;
             }
             println!("deleted session {}", short_id(&resolved));
+            Ok(())
+        }
+        SessionCommand::Clear { all } => {
+            let removed = clear_sessions(paths, config, all)?;
+            if all {
+                set_current_session(paths, config, None, false)?;
+            }
+            println!("cleared {} sessions", removed);
             Ok(())
         }
         SessionCommand::Gc => {

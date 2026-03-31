@@ -144,6 +144,10 @@ pub enum SessionCommand {
     Show { id: String },
     Export { id: String },
     Delete { id: String },
+    Clear {
+        #[arg(long)]
+        all: bool,
+    },
     Gc,
 }
 

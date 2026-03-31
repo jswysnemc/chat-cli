@@ -326,6 +326,40 @@ pub fn delete_session(paths: &AppPaths, config: &AppConfig, session_id: &str) ->
     )
 }
 
+pub fn clear_sessions(
+    paths: &AppPaths,
+    config: &AppConfig,
+    include_current: bool,
+) -> AppResult<usize> {
+    let dir = paths.sessions_dir(config);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let current = if include_current {
+        String::new()
+    } else {
+        load_state(paths)?
+            .current_session
+            .unwrap_or_default()
+    };
+    let mut removed = 0;
+    for entry in fs::read_dir(&dir).code(EXIT_SESSION, "failed to read sessions dir")? {
+        let entry = entry.code(EXIT_SESSION, "failed to read sessions dir entry")?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if !current.is_empty() && name == current {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 pub fn gc_sessions(paths: &AppPaths, config: &AppConfig) -> AppResult<usize> {
     let dir = paths.sessions_dir(config);
     if !dir.exists() {
