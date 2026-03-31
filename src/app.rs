@@ -584,13 +584,14 @@ async fn handle_ask(
     secrets: &SecretsConfig,
     args: AskArgs,
 ) -> AppResult<()> {
-    if args.tools && args.stream {
+    let use_tools = args.tools || config.defaults.tools.unwrap_or(false);
+    if use_tools && args.stream {
         return Err(AppError::new(
             EXIT_ARGS,
             "--tools cannot be used together with --stream",
         ));
     }
-    if args.tools {
+    if use_tools {
         let result =
             execute_ask_with_tools(cli, paths, config, secrets, &args, cli.output.clone()).await?;
         let rendered = render_ask_output(
@@ -675,7 +676,19 @@ async fn handle_repl(
             timeout: None,
             raw_provider_response: false,
         };
-        if args.stream {
+        let use_tools = ask_args.tools || config.defaults.tools.unwrap_or(false);
+        if use_tools {
+            let result = execute_ask_with_tools(
+                cli,
+                paths,
+                config,
+                secrets,
+                &ask_args,
+                Some(OutputFormat::Text),
+            )
+            .await?;
+            println!("{}", result.output.message.content);
+        } else if args.stream {
             execute_ask_stream(
                 cli,
                 paths,

@@ -93,6 +93,7 @@ pub struct DefaultsConfig {
     pub auto_create_session: Option<bool>,
     pub auto_save_session: Option<bool>,
     pub session_id_kind: Option<String>,
+    pub tools: Option<bool>,
 }
 
 impl Default for DefaultsConfig {
@@ -105,6 +106,7 @@ impl Default for DefaultsConfig {
             auto_create_session: Some(true),
             auto_save_session: Some(true),
             session_id_kind: Some("ulid".to_string()),
+            tools: None,
         }
     }
 }
@@ -290,6 +292,11 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .auto_save_session
             .unwrap_or(true)
             .to_string()),
+        "defaults.tools" => Ok(config
+            .defaults
+            .tools
+            .unwrap_or(false)
+            .to_string()),
         "session.store_format" => Ok(config
             .session
             .store_format
@@ -316,6 +323,9 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         }
         "defaults.auto_save_session" => {
             config.defaults.auto_save_session = Some(parse_bool(value)?);
+        }
+        "defaults.tools" => {
+            config.defaults.tools = Some(parse_bool(value)?);
         }
         "session.store_format" => config.session.store_format = Some(value.to_string()),
         "session.dir" => config.session.dir = Some(value.to_string()),
