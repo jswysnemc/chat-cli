@@ -87,6 +87,9 @@ pub struct AskArgs {
     pub ephemeral: bool,
 
     #[arg(long)]
+    pub temp: bool,
+
+    #[arg(long)]
     pub stream: bool,
 
     #[arg(long)]
@@ -117,6 +120,9 @@ pub struct ReplArgs {
     pub ephemeral: bool,
 
     #[arg(long)]
+    pub temp: bool,
+
+    #[arg(long)]
     pub system: Option<String>,
 
     #[arg(long)]
@@ -129,6 +135,12 @@ pub struct ReplArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub enum SessionCommand {
     List,
+    Current,
+    Switch { id: String },
+    New {
+        #[arg(long)]
+        temp: bool,
+    },
     Show { id: String },
     Export { id: String },
     Delete { id: String },

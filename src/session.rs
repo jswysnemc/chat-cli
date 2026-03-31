@@ -47,12 +47,15 @@ pub struct SessionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionState {
     pub current_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_temp: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: String,
     pub is_current: bool,
+    pub is_temp: bool,
     pub created_at: Option<u64>,
     pub updated_at: Option<u64>,
     pub first_prompt: Option<String>,
@@ -62,6 +65,86 @@ pub struct SessionSummary {
 
 pub fn generate_session_id() -> String {
     format!("sess_{}", Ulid::new())
+}
+
+pub fn generate_temp_session_id() -> String {
+    format!("tmp_{}", Ulid::new())
+}
+
+pub fn is_temp_session(session_id: &str) -> bool {
+    session_id.starts_with("tmp_")
+}
+
+/// Returns the short display ID: strips the prefix (sess_/tmp_) and takes the first 8 chars.
+pub fn short_id(session_id: &str) -> String {
+    let bare = session_id
+        .strip_prefix("sess_")
+        .or_else(|| session_id.strip_prefix("tmp_"))
+        .unwrap_or(session_id);
+    let prefix = if session_id.starts_with("tmp_") {
+        "tmp_"
+    } else {
+        ""
+    };
+    let short = if bare.len() > 8 {
+        &bare[..8]
+    } else {
+        bare
+    };
+    format!("{prefix}{short}")
+}
+
+/// Resolve a potentially abbreviated session ID to its full form via prefix matching.
+/// Supports: full ID, prefixed short ID ("sess_01JQ"), bare short ID ("01JQ"), tmp-prefixed ("tmp_01JQ").
+pub fn resolve_session_id(
+    paths: &AppPaths,
+    config: &AppConfig,
+    input: &str,
+) -> AppResult<String> {
+    let all_sessions = list_sessions(paths, config)?;
+
+    // Exact match first
+    if all_sessions.contains(&input.to_string()) {
+        return Ok(input.to_string());
+    }
+
+    // Prefix match: try input as-is prefix
+    let mut matches: Vec<&String> = all_sessions
+        .iter()
+        .filter(|id| id.starts_with(input))
+        .collect();
+
+    // If no match, try matching as bare ID (without sess_/tmp_ prefix) against the bare part
+    if matches.is_empty() {
+        matches = all_sessions
+            .iter()
+            .filter(|id| {
+                let bare = id
+                    .strip_prefix("sess_")
+                    .or_else(|| id.strip_prefix("tmp_"))
+                    .unwrap_or(id);
+                bare.starts_with(input)
+            })
+            .collect();
+    }
+
+    match matches.len() {
+        0 => Err(AppError::new(
+            EXIT_SESSION,
+            format!("no session matching `{input}`"),
+        )),
+        1 => Ok(matches[0].clone()),
+        n => {
+            let previews: Vec<String> = matches.iter().map(|id| short_id(id)).collect();
+            Err(AppError::new(
+                EXIT_SESSION,
+                format!(
+                    "`{input}` is ambiguous, matches {n} sessions: {}",
+                    previews.join(", ")
+                ),
+            ))
+        }
+    }
 }
 
 pub fn session_file(paths: &AppPaths, config: &AppConfig, session_id: &str) -> PathBuf {
@@ -93,9 +176,26 @@ pub fn save_state(paths: &AppPaths, state: &SessionState) -> AppResult<()> {
     )
 }
 
-pub fn set_current_session(paths: &AppPaths, session_id: Option<&str>) -> AppResult<()> {
+pub fn set_current_session(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: Option<&str>,
+    temp: bool,
+) -> AppResult<()> {
     let mut state = load_state(paths)?;
+
+    // Auto-cleanup: if the old current session was temp, delete it
+    if let Some(old_id) = &state.current_session {
+        if state.is_temp.unwrap_or(false) {
+            let old_file = session_file(paths, config, old_id);
+            if old_file.exists() {
+                let _ = fs::remove_file(&old_file);
+            }
+        }
+    }
+
     state.current_session = session_id.map(|value| value.to_string());
+    state.is_temp = if temp { Some(true) } else { None };
     save_state(paths, &state)
 }
 
@@ -230,6 +330,8 @@ pub fn gc_sessions(paths: &AppPaths, config: &AppConfig) -> AppResult<usize> {
     if !dir.exists() {
         return Ok(0);
     }
+    let state = load_state(paths)?;
+    let current = state.current_session.as_deref().unwrap_or("");
     let mut removed = 0;
     for entry in fs::read_dir(&dir).code(EXIT_SESSION, "failed to read sessions dir")? {
         let entry = entry.code(EXIT_SESSION, "failed to read sessions dir entry")?;
@@ -237,9 +339,15 @@ pub fn gc_sessions(paths: &AppPaths, config: &AppConfig) -> AppResult<usize> {
         if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         let metadata = fs::metadata(&path).code(EXIT_SESSION, "failed to read session metadata")?;
-        if metadata.len() == 0 {
-            fs::remove_file(&path).code(EXIT_SESSION, "failed to remove empty session file")?;
+        let should_remove = metadata.len() == 0
+            || (is_temp_session(stem) && stem != current);
+        if should_remove {
+            fs::remove_file(&path).code(EXIT_SESSION, "failed to remove session file")?;
             removed += 1;
         }
     }
@@ -298,6 +406,7 @@ fn build_session_summary(
     SessionSummary {
         session_id: session_id.to_string(),
         is_current,
+        is_temp: is_temp_session(session_id),
         created_at,
         updated_at,
         first_prompt,

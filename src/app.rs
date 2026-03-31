@@ -16,8 +16,8 @@ use crate::provider::{
 };
 use crate::session::{
     SessionEvent, SessionMessage, SessionResponse, append_events, delete_session, gc_sessions,
-    generate_session_id, list_session_summaries, load_state, now_rfc3339, read_events,
-    set_current_session,
+    generate_session_id, generate_temp_session_id, is_temp_session, list_session_summaries,
+    load_state, now_rfc3339, read_events, resolve_session_id, set_current_session, short_id,
 };
 use clap::CommandFactory;
 use serde_json::{Value, json};
@@ -395,10 +395,13 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
         SessionCommand::List => {
             let current_session = load_state(paths)?.current_session;
             for summary in list_session_summaries(paths, config, current_session.as_deref())? {
+                let marker = if summary.is_current { "* " } else { "  " };
+                let temp_tag = if summary.is_temp { " [temp]" } else { "" };
                 println!(
-                    "{}{} created_at={} updated_at={} user_messages={} assistant_messages={} first_prompt={}",
-                    if summary.is_current { "* " } else { "  " },
-                    summary.session_id,
+                    "{}{}{} created_at={} updated_at={} user_messages={} assistant_messages={} first_prompt={}",
+                    marker,
+                    short_id(&summary.session_id),
+                    temp_tag,
                     summary.created_at.unwrap_or(0),
                     summary.updated_at.unwrap_or(0),
                     summary.user_messages,
@@ -409,8 +412,41 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             }
             Ok(())
         }
+        SessionCommand::Current => {
+            let state = load_state(paths)?;
+            match state.current_session {
+                Some(id) => {
+                    let temp_tag = if state.is_temp.unwrap_or(false) {
+                        " [temp]"
+                    } else {
+                        ""
+                    };
+                    println!("{}{}", short_id(&id), temp_tag);
+                }
+                None => println!("no active session"),
+            }
+            Ok(())
+        }
+        SessionCommand::Switch { id } => {
+            let resolved = resolve_session_id(paths, config, &id)?;
+            let temp = is_temp_session(&resolved);
+            set_current_session(paths, config, Some(&resolved), temp)?;
+            println!("switched to {}", short_id(&resolved));
+            Ok(())
+        }
+        SessionCommand::New { temp } => {
+            let session_id = if temp {
+                generate_temp_session_id()
+            } else {
+                generate_session_id()
+            };
+            set_current_session(paths, config, Some(&session_id), temp)?;
+            println!("{}", short_id(&session_id));
+            Ok(())
+        }
         SessionCommand::Show { id } => {
-            let events = read_events(paths, config, &id)?;
+            let resolved = resolve_session_id(paths, config, &id)?;
+            let events = read_events(paths, config, &resolved)?;
             let mut messages = 0;
             let mut responses = 0;
             for event in &events {
@@ -443,7 +479,8 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             Ok(())
         }
         SessionCommand::Export { id } => {
-            let path = crate::session::session_file(paths, config, &id);
+            let resolved = resolve_session_id(paths, config, &id)?;
+            let path = crate::session::session_file(paths, config, &resolved);
             let text = fs::read_to_string(&path).map_err(|err| {
                 AppError::new(
                     crate::error::EXIT_SESSION,
@@ -454,12 +491,13 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             Ok(())
         }
         SessionCommand::Delete { id } => {
-            delete_session(paths, config, &id)?;
+            let resolved = resolve_session_id(paths, config, &id)?;
+            delete_session(paths, config, &resolved)?;
             let state = load_state(paths)?;
-            if state.current_session.as_deref() == Some(id.as_str()) {
-                set_current_session(paths, None)?;
+            if state.current_session.as_deref() == Some(resolved.as_str()) {
+                set_current_session(paths, config, None, false)?;
             }
-            println!("deleted session {id}");
+            println!("deleted session {}", short_id(&resolved));
             Ok(())
         }
         SessionCommand::Gc => {
@@ -564,9 +602,11 @@ async fn handle_repl(
         ));
     }
     let session_id = if let Some(session_id) = &args.session {
-        session_id.clone()
+        resolve_session_id(paths, config, session_id)?
     } else if args.new_session {
         generate_session_id()
+    } else if args.temp {
+        generate_temp_session_id()
     } else if args.ephemeral {
         generate_session_id()
     } else if let Some(current_session) = load_state(paths)?.current_session {
@@ -598,6 +638,7 @@ async fn handle_repl(
             session: Some(session_id.clone()),
             new_session: false,
             ephemeral: args.ephemeral,
+            temp: args.temp,
             stream: args.stream,
             temperature: None,
             max_output_tokens: None,
@@ -906,9 +947,11 @@ fn prepare_ask(
     }
 
     let session_id = if let Some(session_id) = &args.session {
-        session_id.clone()
+        resolve_session_id(paths, config, session_id)?
     } else if args.new_session {
         generate_session_id()
+    } else if args.temp {
+        generate_temp_session_id()
     } else if args.ephemeral {
         generate_session_id()
     } else if let Some(current_session) = load_state(paths)?.current_session {
@@ -998,7 +1041,8 @@ fn persist_session(
         }),
     ];
     append_events(paths, config, session_id, &events)?;
-    set_current_session(paths, Some(session_id))
+    let temp = is_temp_session(session_id) || args.temp;
+    set_current_session(paths, config, Some(session_id), temp)
 }
 
 fn write_stream_json(stdout: &mut io::Stdout, value: &Value) -> AppResult<()> {
