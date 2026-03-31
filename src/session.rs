@@ -184,9 +184,10 @@ pub fn set_current_session(
 ) -> AppResult<()> {
     let mut state = load_state(paths)?;
 
-    // Auto-cleanup: if the old current session was temp, delete it
+    // Auto-cleanup: if the old current session was temp and we're switching away, delete it
     if let Some(old_id) = &state.current_session {
-        if state.is_temp.unwrap_or(false) {
+        let switching_away = session_id.map_or(true, |new_id| new_id != old_id);
+        if switching_away && state.is_temp.unwrap_or(false) {
             let old_file = session_file(paths, config, old_id);
             if old_file.exists() {
                 let _ = fs::remove_file(&old_file);
