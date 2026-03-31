@@ -10,6 +10,10 @@ use std::time::Instant;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[allow(dead_code)]
+    pub tool_calls: Option<Vec<Value>>,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +28,7 @@ pub struct ChatRequest {
     pub max_output_tokens: Option<u32>,
     pub params: BTreeMap<String, Value>,
     pub timeout_secs: Option<u64>,
+    pub tools: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +40,7 @@ pub struct ChatResponse {
     pub usage: Usage,
     pub latency_ms: u64,
     pub raw: Value,
+    pub tool_calls: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,16 +186,15 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
             format!("failed to parse provider response: {err}"),
         )
     })?;
-    let content = extract_openai_content(&raw).ok_or_else(|| {
-        AppError::new(
-            EXIT_NETWORK,
-            "provider response did not contain assistant content",
-        )
-    })?;
+    let content = extract_openai_content(&raw).unwrap_or_default();
     let finish_reason = raw["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("stop")
         .to_string();
+    let tool_calls = raw["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let usage = Usage {
         input_tokens: raw["usage"]["prompt_tokens"].as_u64(),
         output_tokens: raw["usage"]["completion_tokens"].as_u64(),
@@ -203,6 +208,7 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
         usage,
         latency_ms: elapsed_ms(started),
         raw,
+        tool_calls,
     })
 }
 
@@ -280,6 +286,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
+        tool_calls: Vec::new(),
     })
 }
 
@@ -340,6 +347,7 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
         usage,
         latency_ms: elapsed_ms(started),
         raw,
+        tool_calls: Vec::new(),
     })
 }
 
@@ -414,6 +422,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
+        tool_calls: Vec::new(),
     })
 }
 
@@ -463,6 +472,7 @@ async fn send_ollama(request: ChatRequest) -> AppResult<ChatResponse> {
         usage,
         latency_ms: elapsed_ms(started),
         raw,
+        tool_calls: Vec::new(),
     })
 }
 
@@ -537,6 +547,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
+        tool_calls: Vec::new(),
     })
 }
 
@@ -560,7 +571,31 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
             request
                 .messages
                 .iter()
-                .map(|msg| json!({ "role": msg.role, "content": msg.content }))
+                .map(|msg| {
+                    let mut m = Map::new();
+                    m.insert("role".to_string(), json!(msg.role));
+                    if msg.role == "tool" {
+                        m.insert("content".to_string(), json!(msg.content));
+                        if let Some(id) = &msg.tool_call_id {
+                            m.insert("tool_call_id".to_string(), json!(id));
+                        }
+                    } else if msg.role == "assistant" {
+                        if let Some(tc) = &msg.tool_calls {
+                            m.insert("tool_calls".to_string(), Value::Array(tc.clone()));
+                            // content can be null when assistant has tool_calls
+                            if msg.content.is_empty() {
+                                m.insert("content".to_string(), Value::Null);
+                            } else {
+                                m.insert("content".to_string(), json!(msg.content));
+                            }
+                        } else {
+                            m.insert("content".to_string(), json!(msg.content));
+                        }
+                    } else {
+                        m.insert("content".to_string(), json!(msg.content));
+                    }
+                    Value::Object(m)
+                })
                 .collect(),
         ),
     );
@@ -570,6 +605,9 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
             "stream_options".to_string(),
             json!({ "include_usage": true }),
         );
+    }
+    if !request.tools.is_empty() {
+        body.insert("tools".to_string(), Value::Array(request.tools.clone()));
     }
     if let Some(temperature) = request.temperature {
         body.insert("temperature".to_string(), json!(temperature));

@@ -5,6 +5,7 @@ mod error;
 mod output;
 mod provider;
 mod session;
+mod tool;
 
 use clap::Parser;
 

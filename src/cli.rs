@@ -90,6 +90,12 @@ pub struct AskArgs {
     pub temp: bool,
 
     #[arg(long)]
+    pub tools: bool,
+
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    #[arg(long)]
     pub stream: bool,
 
     #[arg(long)]
@@ -121,6 +127,12 @@ pub struct ReplArgs {
 
     #[arg(long)]
     pub temp: bool,
+
+    #[arg(long)]
+    pub tools: bool,
+
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 
     #[arg(long)]
     pub system: Option<String>,

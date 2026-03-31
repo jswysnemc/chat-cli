@@ -20,6 +20,7 @@ use crate::session::{
     list_session_summaries, load_state, now_rfc3339, read_events, resolve_session_id,
     set_current_session, short_id,
 };
+use crate::tool::{execute_tool, parse_tool_call, tool_definitions};
 use clap::CommandFactory;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -583,6 +584,23 @@ async fn handle_ask(
     secrets: &SecretsConfig,
     args: AskArgs,
 ) -> AppResult<()> {
+    if args.tools && args.stream {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "--tools cannot be used together with --stream",
+        ));
+    }
+    if args.tools {
+        let result =
+            execute_ask_with_tools(cli, paths, config, secrets, &args, cli.output.clone()).await?;
+        let rendered = render_ask_output(
+            result.format.clone(),
+            &result.output,
+            args.raw_provider_response,
+        )?;
+        println!("{rendered}");
+        return Ok(());
+    }
     if args.stream {
         execute_ask_stream(cli, paths, config, secrets, &args, cli.output.clone()).await?;
         return Ok(());
@@ -648,6 +666,8 @@ async fn handle_repl(
             new_session: false,
             ephemeral: args.ephemeral,
             temp: args.temp,
+            tools: args.tools,
+            yes: args.yes,
             stream: args.stream,
             temperature: None,
             max_output_tokens: None,
@@ -747,6 +767,90 @@ async fn execute_ask(
 ) -> AppResult<AskExecution> {
     let prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     let response = send_chat(prepared.request.clone()).await?;
+    persist_session(
+        paths,
+        config,
+        args,
+        &prepared.prompt,
+        &prepared.session_id,
+        &response,
+    )?;
+
+    Ok(AskExecution {
+        format: prepared.format,
+        output: AskOutput {
+            ok: true,
+            provider: response.provider_id,
+            model: response.model_id,
+            session_id: prepared.session_id,
+            message: AssistantMessage {
+                role: "assistant".to_string(),
+                content: response.content,
+            },
+            usage: response.usage,
+            finish_reason: response.finish_reason,
+            latency_ms: response.latency_ms,
+            raw_provider_response: if args.raw_provider_response {
+                Some(response.raw)
+            } else {
+                None
+            },
+        },
+    })
+}
+
+async fn execute_ask_with_tools(
+    cli: &Cli,
+    paths: &AppPaths,
+    config: &AppConfig,
+    secrets: &SecretsConfig,
+    args: &AskArgs,
+    output_override: Option<OutputFormat>,
+) -> AppResult<AskExecution> {
+    let mut prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
+    prepared.request.tools = tool_definitions();
+    let max_rounds = 20;
+    let mut final_response: Option<ChatResponse> = None;
+
+    for round in 0..max_rounds {
+        let response = send_chat(prepared.request.clone()).await?;
+
+        if response.tool_calls.is_empty() {
+            final_response = Some(response);
+            break;
+        }
+
+        eprintln!(
+            "[round {}] model requested {} tool call(s)",
+            round + 1,
+            response.tool_calls.len()
+        );
+
+        prepared.request.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: response.content.clone(),
+            tool_calls: Some(response.tool_calls.clone()),
+            tool_call_id: None,
+            name: None,
+        });
+
+        for raw_call in &response.tool_calls {
+            let call = parse_tool_call(raw_call)?;
+            let result = execute_tool(&call, args.yes)?;
+            prepared.request.messages.push(ChatMessage {
+                role: "tool".to_string(),
+                content: result.content,
+                tool_calls: None,
+                tool_call_id: Some(result.tool_call_id),
+                name: Some(call.name),
+            });
+        }
+    }
+
+    let response = final_response.ok_or_else(|| {
+        AppError::new(EXIT_ARGS, "max tool calling rounds (20) exceeded")
+    })?;
+
     persist_session(
         paths,
         config,
@@ -978,6 +1082,9 @@ fn prepare_ask(
                 messages.push(ChatMessage {
                     role: message.role,
                     content: message.content,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
                 });
             }
         }
@@ -987,12 +1094,18 @@ fn prepare_ask(
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: system,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             });
         }
     }
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: prompt.clone(),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
     });
 
     let temperature = args.temperature.or(model.temperature);
@@ -1015,6 +1128,7 @@ fn prepare_ask(
             max_output_tokens,
             params,
             timeout_secs: args.timeout,
+            tools: Vec::new(),
         },
     })
 }
