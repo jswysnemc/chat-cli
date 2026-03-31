@@ -189,7 +189,7 @@ async fn handle_provider_command(
                 AppError::new(EXIT_PROVIDER, format!("provider `{id}` does not exist"))
             })?;
             let api_key = resolve_api_key(&id, provider, secrets)?;
-            test_provider(&id, provider, &api_key).await?;
+            test_provider(&id, provider, &api_key, &config.models).await?;
             println!("provider {id} ok");
             Ok(())
         }
@@ -539,7 +539,7 @@ async fn handle_doctor(
     for (provider_id, provider) in &config.providers {
         print_auth_status(config, secrets, provider_id)?;
         match resolve_api_key(provider_id, provider, secrets) {
-            Ok(api_key) => match test_provider(provider_id, provider, &api_key).await {
+            Ok(api_key) => match test_provider(provider_id, provider, &api_key, &config.models).await {
                 Ok(()) => println!("provider_test={} ok=1", provider_id),
                 Err(err) => {
                     doctor_code.get_or_insert(err.code);

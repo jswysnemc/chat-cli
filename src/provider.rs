@@ -76,6 +76,7 @@ pub async fn test_provider(
     provider_id: &str,
     provider: &ProviderConfig,
     api_key: &str,
+    models: &BTreeMap<String, ModelConfig>,
 ) -> AppResult<()> {
     match provider.kind.as_str() {
         "openai_compatible" => {
@@ -91,9 +92,13 @@ pub async fn test_provider(
                     let Some(default_model) = &provider.default_model else {
                         return Err(err);
                     };
+                    let remote_name = models
+                        .get(default_model)
+                        .map(|m| m.remote_name.as_str())
+                        .unwrap_or(default_model);
                     let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
                     let body = json!({
-                        "model": default_model,
+                        "model": remote_name,
                         "messages": [{"role":"user","content":"ping"}],
                         "max_tokens": 1,
                         "stream": false,
@@ -735,12 +740,8 @@ fn add_bearer_auth(headers: &mut HeaderMap, api_key: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn openai_compatible_uses_raw_authorization(provider: &ProviderConfig) -> bool {
-    provider
-        .base_url
-        .as_deref()
-        .map(|url| url.to_ascii_lowercase().contains("minimaxi.com"))
-        .unwrap_or(false)
+fn openai_compatible_uses_raw_authorization(_provider: &ProviderConfig) -> bool {
+    false
 }
 
 fn apply_custom_headers(headers: &mut HeaderMap, provider: &ProviderConfig) -> AppResult<()> {
