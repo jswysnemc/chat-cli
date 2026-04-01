@@ -585,21 +585,22 @@ async fn handle_ask(
     args: AskArgs,
 ) -> AppResult<()> {
     let use_tools = args.tools || config.defaults.tools.unwrap_or(false);
-    if use_tools && args.stream {
-        return Err(AppError::new(
-            EXIT_ARGS,
-            "--tools cannot be used together with --stream",
-        ));
-    }
     if use_tools {
+        let output_fmt = if args.stream {
+            Some(OutputFormat::Text)
+        } else {
+            cli.output.clone()
+        };
         let result =
-            execute_ask_with_tools(cli, paths, config, secrets, &args, cli.output.clone()).await?;
-        let rendered = render_ask_output(
-            result.format.clone(),
-            &result.output,
-            args.raw_provider_response,
-        )?;
-        println!("{rendered}");
+            execute_ask_with_tools(cli, paths, config, secrets, &args, output_fmt).await?;
+        if !args.stream {
+            let rendered = render_ask_output(
+                result.format.clone(),
+                &result.output,
+                args.raw_provider_response,
+            )?;
+            println!("{rendered}");
+        }
         return Ok(());
     }
     if args.stream {
@@ -824,15 +825,106 @@ async fn execute_ask_with_tools(
     prepared.request.tools = tool_definitions();
     let max_rounds = 20;
     let mut final_response: Option<ChatResponse> = None;
+    let mut did_tool_call = false;
 
     for round in 0..max_rounds {
         let response = send_chat(prepared.request.clone()).await?;
 
         if response.tool_calls.is_empty() {
+            // If streaming is requested, output as text
+            if args.stream {
+                if did_tool_call {
+                // Remove tools so the model just generates text
+                let mut stream_request = prepared.request.clone();
+                stream_request.tools = Vec::new();
+
+                let mut stdout = io::stdout();
+                let stream_response = stream_chat(stream_request, |chunk| {
+                    if !chunk.delta.is_empty() {
+                        write!(stdout, "{}", chunk.delta).map_err(|err| {
+                            AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                        })?;
+                        stdout.flush().map_err(|err| {
+                            AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
+                        })?;
+                    }
+                    Ok(())
+                })
+                .await?;
+                writeln!(stdout).map_err(|err| {
+                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                })?;
+
+                persist_session(
+                    paths,
+                    config,
+                    args,
+                    &prepared.prompt,
+                    &prepared.session_id,
+                    &stream_response,
+                )?;
+
+                return Ok(AskExecution {
+                    format: prepared.format,
+                    output: AskOutput {
+                        ok: true,
+                        provider: stream_response.provider_id,
+                        model: stream_response.model_id,
+                        session_id: prepared.session_id,
+                        message: AssistantMessage {
+                            role: "assistant".to_string(),
+                            content: stream_response.content,
+                        },
+                        usage: stream_response.usage,
+                        finish_reason: stream_response.finish_reason,
+                        latency_ms: stream_response.latency_ms,
+                        raw_provider_response: None,
+                    },
+                });
+                } else {
+                    // No tool calls happened, just print the already-received content
+                    let mut stdout = io::stdout();
+                    write!(stdout, "{}", response.content).map_err(|err| {
+                        AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                    })?;
+                    writeln!(stdout).map_err(|err| {
+                        AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                    })?;
+
+                    persist_session(
+                        paths,
+                        config,
+                        args,
+                        &prepared.prompt,
+                        &prepared.session_id,
+                        &response,
+                    )?;
+
+                    return Ok(AskExecution {
+                        format: prepared.format,
+                        output: AskOutput {
+                            ok: true,
+                            provider: response.provider_id,
+                            model: response.model_id,
+                            session_id: prepared.session_id,
+                            message: AssistantMessage {
+                                role: "assistant".to_string(),
+                                content: response.content,
+                            },
+                            usage: response.usage,
+                            finish_reason: response.finish_reason,
+                            latency_ms: response.latency_ms,
+                            raw_provider_response: None,
+                        },
+                    });
+                }
+            }
+
             final_response = Some(response);
             break;
         }
 
+        did_tool_call = true;
         eprintln!(
             "[round {}] model requested {} tool call(s)",
             round + 1,
