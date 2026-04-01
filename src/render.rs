@@ -294,9 +294,28 @@ fn render_table(lines: &[&str]) -> String {
         return String::new();
     }
 
-    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    // Pre-render all cells so we can measure their actual display width
+    let rendered_rows: Vec<Vec<String>> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            row.iter()
+                .map(|cell| {
+                    if idx == 0 && separator_idx.is_some() {
+                        // Header: bold, no inline markdown processing
+                        format!("{BOLD}{cell}{RESET}")
+                    } else {
+                        render_inline(cell)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    // Calculate column widths from rendered cells
+    let col_count = rendered_rows.iter().map(|r| r.len()).max().unwrap_or(0);
     let mut col_widths = vec![0usize; col_count];
-    for row in &rows {
+    for row in &rendered_rows {
         for (j, cell) in row.iter().enumerate() {
             if j < col_count {
                 let display_len = strip_ansi_len(cell);
@@ -311,23 +330,20 @@ fn render_table(lines: &[&str]) -> String {
     output.push_str(&table_border(&col_widths, '┌', '┬', '┐'));
     output.push_str(&format!("{RESET}\n"));
 
-    for (idx, row) in rows.iter().enumerate() {
+    for row in &rendered_rows {
         output.push_str(&format!("{DIM}│{RESET}"));
         for (j, width) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
             let display_len = strip_ansi_len(cell);
             let padding = width.saturating_sub(display_len);
-            if idx == 0 && separator_idx.is_some() {
-                output.push_str(&format!(" {BOLD}{cell}{RESET}"));
-            } else {
-                output.push_str(&format!(" {}", render_inline(cell)));
-            }
+            output.push_str(&format!(" {cell}"));
             output.push_str(&" ".repeat(padding));
             output.push_str(&format!(" {DIM}│{RESET}"));
         }
         output.push('\n');
 
-        if idx == 0 && separator_idx.is_some() {
+        // After the first row (header), draw separator if present
+        if std::ptr::eq(row, &rendered_rows[0]) && separator_idx.is_some() {
             output.push_str(&format!("{DIM}"));
             output.push_str(&table_border(&col_widths, '├', '┼', '┤'));
             output.push_str(&format!("{RESET}\n"));
