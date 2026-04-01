@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod output;
 mod provider;
+mod render;
 mod session;
 mod tool;
 

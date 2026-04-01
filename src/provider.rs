@@ -1,6 +1,7 @@
 use crate::config::{ModelConfig, ProviderConfig};
 use crate::error::{AppError, AppResult, EXIT_AUTH, EXIT_NETWORK, EXIT_PROVIDER, EXIT_RATE_LIMIT};
 use crate::session::Usage;
+use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -48,6 +49,7 @@ pub struct ChatStreamChunk {
     pub delta: String,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
+    pub tool_calls_delta: Vec<Value>,
     pub raw: Value,
 }
 
@@ -245,12 +247,16 @@ where
     let mut usage = Usage::default();
     let mut raw_events = Vec::new();
 
-    while let Some(chunk) = response.chunk().await.map_err(|err| {
-        AppError::new(
-            EXIT_NETWORK,
-            format!("failed to read provider stream chunk: {err}"),
-        )
-    })? {
+    let mut tool_calls_acc: Vec<Value> = Vec::new();
+
+    let mut byte_stream = response.bytes_stream();
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = chunk_result.map_err(|err| {
+            AppError::new(
+                EXIT_NETWORK,
+                format!("failed to read provider stream chunk: {err}"),
+            )
+        })?;
         for payload in parser.push_bytes(&chunk)? {
             if let Some(event) = parse_openai_stream_payload(&payload)? {
                 accumulate_stream_event(
@@ -260,6 +266,7 @@ where
                     &mut raw_events,
                     &event,
                 );
+                accumulate_tool_calls(&mut tool_calls_acc, &event.tool_calls_delta);
                 on_chunk(event)?;
             }
         }
@@ -274,6 +281,7 @@ where
                 &mut raw_events,
                 &event,
             );
+            accumulate_tool_calls(&mut tool_calls_acc, &event.tool_calls_delta);
             on_chunk(event)?;
         }
     }
@@ -286,7 +294,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
-        tool_calls: Vec::new(),
+        tool_calls: tool_calls_acc,
     })
 }
 
@@ -381,12 +389,14 @@ where
     let mut usage = Usage::default();
     let mut raw_events = Vec::new();
 
-    while let Some(chunk) = response.chunk().await.map_err(|err| {
-        AppError::new(
-            EXIT_NETWORK,
-            format!("failed to read provider stream chunk: {err}"),
-        )
-    })? {
+    let mut byte_stream = response.bytes_stream();
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = chunk_result.map_err(|err| {
+            AppError::new(
+                EXIT_NETWORK,
+                format!("failed to read provider stream chunk: {err}"),
+            )
+        })?;
         for payload in parser.push_bytes(&chunk)? {
             if let Some(event) = parse_anthropic_stream_payload(&payload)? {
                 accumulate_stream_event(
@@ -506,12 +516,14 @@ where
     let mut usage = Usage::default();
     let mut raw_events = Vec::new();
 
-    while let Some(chunk) = response.chunk().await.map_err(|err| {
-        AppError::new(
-            EXIT_NETWORK,
-            format!("failed to read provider stream chunk: {err}"),
-        )
-    })? {
+    let mut byte_stream = response.bytes_stream();
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = chunk_result.map_err(|err| {
+            AppError::new(
+                EXIT_NETWORK,
+                format!("failed to read provider stream chunk: {err}"),
+            )
+        })?;
         for payload in parser.push_bytes(&chunk)? {
             if let Some(event) = parse_ollama_stream_payload(&payload)? {
                 accumulate_stream_event(
@@ -932,6 +944,32 @@ fn merge_usage(target: &mut Usage, update: &Usage) {
         .or(target.total_tokens);
 }
 
+/// Accumulate streaming tool_calls deltas into complete tool_call objects.
+/// In OpenAI streaming, tool_calls arrive as incremental deltas with an index field.
+fn accumulate_tool_calls(acc: &mut Vec<Value>, deltas: &[Value]) {
+    for delta in deltas {
+        let index = delta["index"].as_u64().unwrap_or(0) as usize;
+
+        // Grow the accumulator if needed
+        while acc.len() <= index {
+            acc.push(json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
+        }
+
+        // Merge fields
+        if let Some(id) = delta["id"].as_str() {
+            acc[index]["id"] = json!(id);
+        }
+        if let Some(name) = delta["function"]["name"].as_str() {
+            let existing = acc[index]["function"]["name"].as_str().unwrap_or("");
+            acc[index]["function"]["name"] = json!(format!("{}{}", existing, name));
+        }
+        if let Some(args) = delta["function"]["arguments"].as_str() {
+            let existing = acc[index]["function"]["arguments"].as_str().unwrap_or("");
+            acc[index]["function"]["arguments"] = json!(format!("{}{}", existing, args));
+        }
+    }
+}
+
 fn parse_openai_stream_payload(payload: &str) -> AppResult<Option<ChatStreamChunk>> {
     if payload.trim() == "[DONE]" {
         return Ok(None);
@@ -942,12 +980,17 @@ fn parse_openai_stream_payload(payload: &str) -> AppResult<Option<ChatStreamChun
             format!("failed to parse provider stream event: {err}"),
         )
     })?;
+    let tool_calls_delta = raw["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     Ok(Some(ChatStreamChunk {
         delta: extract_openai_delta(&raw),
         finish_reason: raw["choices"][0]["finish_reason"]
             .as_str()
             .map(|value| value.to_string()),
         usage: extract_openai_usage(&raw),
+        tool_calls_delta,
         raw,
     }))
 }
@@ -988,6 +1031,7 @@ fn parse_anthropic_stream_payload(payload: &str) -> AppResult<Option<ChatStreamC
                 delta: String::new(),
                 finish_reason: None,
                 usage: Some(usage),
+                tool_calls_delta: Vec::new(),
                 raw,
             }))
         }
@@ -1004,6 +1048,7 @@ fn parse_anthropic_stream_payload(payload: &str) -> AppResult<Option<ChatStreamC
                 delta,
                 finish_reason: None,
                 usage: None,
+                tool_calls_delta: Vec::new(),
                 raw,
             }))
         }
@@ -1020,6 +1065,7 @@ fn parse_anthropic_stream_payload(payload: &str) -> AppResult<Option<ChatStreamC
                     output_tokens: output,
                     total_tokens: sum_optional(input, output),
                 }),
+                tool_calls_delta: Vec::new(),
                 raw,
             }))
         }
@@ -1051,6 +1097,7 @@ fn parse_ollama_stream_payload(payload: &str) -> AppResult<Option<ChatStreamChun
             None
         },
         usage: extract_ollama_usage(&raw),
+        tool_calls_delta: Vec::new(),
         raw,
     }))
 }

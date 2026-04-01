@@ -48,6 +48,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Display the last response's thinking content
+    Thinking,
     Doctor,
     Completion {
         shell: clap_complete::Shell,
