@@ -94,13 +94,14 @@ pub fn render_markdown(input: &str, collapse_thinking: bool) -> String {
     if collapse_thinking {
         render_markdown_inner(&content)
     } else {
-        // Show thinking dimmed before the main content
+        // Show thinking dimmed before the main content with markers
         let mut output = String::new();
         if !thinking.is_empty() {
+            output.push_str(&format!("{DIM}--- thinking ---{RESET}\n"));
             for line in thinking.lines() {
                 output.push_str(&format!("{DIM}{line}{RESET}\n"));
             }
-            output.push('\n');
+            output.push_str(&format!("{DIM}--- end thinking ---{RESET}\n\n"));
         }
         output.push_str(&render_markdown_inner(&content));
         output
@@ -499,6 +500,9 @@ impl StreamRenderer {
                         output.push_str(&format!(
                             "{DIM}[thinking collapsed]{RESET}\n"
                         ));
+                    } else {
+                        // Show end-of-thinking separator
+                        output.push_str(&format!("{DIM}--- end thinking ---{RESET}\n\n"));
                     }
 
                     // Save thinking content
@@ -555,6 +559,9 @@ impl StreamRenderer {
                     self.in_thinking = true;
                     self.thinking_content.clear();
                     self.thinking_lines_shown = 0;
+                    // Show thinking header
+                    output.push_str(&format!("{DIM}--- thinking ---{RESET}\n"));
+                    self.thinking_lines_shown += 1;
                     // Skip newline right after <think>
                     if self.tag_buffer.starts_with('\n') {
                         self.tag_buffer = self.tag_buffer[1..].to_string();
@@ -612,6 +619,8 @@ impl StreamRenderer {
                     output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
                 }
                 output.push_str(&format!("{DIM}[thinking collapsed]{RESET}\n"));
+            } else {
+                output.push_str(&format!("{DIM}--- end thinking ---{RESET}\n\n"));
             }
             save_thinking(self.thinking_content.trim());
             self.in_thinking = false;
@@ -714,13 +723,15 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 /// Print a status bar line to stderr.
 pub fn print_status_bar(provider: &str, model: &str, session_id: &str) {
-    let short_session = if session_id.len() > 8 {
-        &session_id[..8]
-    } else {
-        session_id
-    };
+    // Strip sess_ prefix, keep tmp_ prefix, then truncate bare ID to 8 chars
+    let bare = session_id
+        .strip_prefix("sess_")
+        .or_else(|| session_id.strip_prefix("tmp_"))
+        .unwrap_or(session_id);
+    let prefix = if session_id.starts_with("tmp_") { "tmp_" } else { "" };
+    let short = if bare.len() > 8 { &bare[..8] } else { bare };
     eprintln!(
-        "{DIM}{provider} {RESET}{BOLD}{CYAN}{model}{RESET} {DIM}{short_session}{RESET}"
+        "{DIM}{provider} {RESET}{BOLD}{CYAN}{model}{RESET} {DIM}{prefix}{short}{RESET}"
     );
 }
 
