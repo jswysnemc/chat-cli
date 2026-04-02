@@ -62,7 +62,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Commands::Thinking => {
             match crate::render::load_thinking() {
                 Some(content) => {
-                    println!("{}", render_markdown(&content));
+                    println!("{}", render_markdown(&content, false));
                     Ok(())
                 }
                 None => {
@@ -701,7 +701,7 @@ async fn handle_repl(
                 Some(OutputFormat::Text),
             )
             .await?;
-            println!("{}", render_markdown(&result.output.message.content));
+            println!("{}", render_markdown(&result.output.message.content, config.defaults.collapse_thinking.unwrap_or(false)));
         } else if args.stream {
             execute_ask_stream(
                 cli,
@@ -722,7 +722,7 @@ async fn handle_repl(
                 Some(OutputFormat::Text),
             )
             .await?;
-            println!("{}", render_markdown(&result.output.message.content));
+            println!("{}", render_markdown(&result.output.message.content, config.defaults.collapse_thinking.unwrap_or(false)));
         }
         first_turn = false;
     }
@@ -842,7 +842,8 @@ async fn execute_ask_with_tools(
     for round in 0..max_rounds {
         let use_stream = args.stream;
         let mut stdout = io::stdout();
-        let mut renderer = StreamRenderer::new();
+        let collapse = config.defaults.collapse_thinking.unwrap_or(false);
+        let mut renderer = StreamRenderer::new(collapse);
 
         // Status bar on first round
         if round == 0 {
@@ -1007,7 +1008,8 @@ async fn execute_ask_stream(
         );
     }
 
-    let mut renderer = StreamRenderer::new();
+    let collapse = config.defaults.collapse_thinking.unwrap_or(false);
+    let mut renderer = StreamRenderer::new(collapse);
     let mut spinner = if format == OutputFormat::Text {
         Some(Spinner::start("thinking..."))
     } else {

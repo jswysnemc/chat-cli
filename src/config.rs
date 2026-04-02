@@ -96,6 +96,7 @@ pub struct DefaultsConfig {
     pub tools: Option<bool>,
     pub system_prompt_file: Option<String>,
     pub system_prompt_mode: Option<String>,
+    pub collapse_thinking: Option<bool>,
 }
 
 impl Default for DefaultsConfig {
@@ -111,6 +112,7 @@ impl Default for DefaultsConfig {
             tools: None,
             system_prompt_file: None,
             system_prompt_mode: Some("append".to_string()),
+            collapse_thinking: Some(false),
         }
     }
 }
@@ -311,6 +313,11 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .system_prompt_mode
             .clone()
             .unwrap_or_else(|| "append".to_string())),
+        "defaults.collapse_thinking" => Ok(config
+            .defaults
+            .collapse_thinking
+            .unwrap_or(false)
+            .to_string()),
         "session.store_format" => Ok(config
             .session
             .store_format
@@ -351,6 +358,9 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
                 }
                 _ => return Err(AppError::new(EXIT_CONFIG, "system_prompt_mode must be 'append' or 'override'")),
             }
+        }
+        "defaults.collapse_thinking" => {
+            config.defaults.collapse_thinking = Some(parse_bool(value)?);
         }
         "session.store_format" => config.session.store_format = Some(value.to_string()),
         "session.dir" => config.session.dir = Some(value.to_string()),

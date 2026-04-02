@@ -86,12 +86,25 @@ fn strip_thinking(input: &str) -> (String, String) {
 
 /// Render markdown text to ANSI-formatted terminal output (non-streaming).
 /// Strips thinking blocks and saves them.
-pub fn render_markdown(input: &str) -> String {
+pub fn render_markdown(input: &str, collapse_thinking: bool) -> String {
     let (content, thinking) = strip_thinking(input);
     if !thinking.is_empty() {
         save_thinking(&thinking);
     }
-    render_markdown_inner(&content)
+    if collapse_thinking {
+        render_markdown_inner(&content)
+    } else {
+        // Show thinking dimmed before the main content
+        let mut output = String::new();
+        if !thinking.is_empty() {
+            for line in thinking.lines() {
+                output.push_str(&format!("{DIM}{line}{RESET}\n"));
+            }
+            output.push('\n');
+        }
+        output.push_str(&render_markdown_inner(&content));
+        output
+    }
 }
 
 fn render_markdown_inner(input: &str) -> String {
@@ -424,12 +437,13 @@ pub struct StreamRenderer {
     in_thinking: bool,
     thinking_content: String,
     thinking_lines_shown: usize,
+    collapse_thinking: bool,
     // Tag detection buffer
     tag_buffer: String,
 }
 
 impl StreamRenderer {
-    pub fn new() -> Self {
+    pub fn new(collapse_thinking: bool) -> Self {
         Self {
             buffer: String::new(),
             in_code_block: false,
@@ -438,6 +452,7 @@ impl StreamRenderer {
             in_thinking: false,
             thinking_content: String::new(),
             thinking_lines_shown: 0,
+            collapse_thinking,
             tag_buffer: String::new(),
         }
     }
@@ -476,14 +491,15 @@ impl StreamRenderer {
                         self.thinking_lines_shown += 1;
                     }
 
-                    // Collapse: erase all thinking lines
-                    for _ in 0..self.thinking_lines_shown {
-                        output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
+                    // Collapse or keep thinking output
+                    if self.collapse_thinking {
+                        for _ in 0..self.thinking_lines_shown {
+                            output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
+                        }
+                        output.push_str(&format!(
+                            "{DIM}[thinking collapsed]{RESET}\n"
+                        ));
                     }
-                    // Show collapsed indicator
-                    output.push_str(&format!(
-                        "{DIM}[thinking collapsed]{RESET}\n"
-                    ));
 
                     // Save thinking content
                     save_thinking(self.thinking_content.trim());
@@ -590,11 +606,13 @@ impl StreamRenderer {
                 output.push_str(&format!("{DIM}{partial}{RESET}\n"));
                 self.thinking_lines_shown += 1;
             }
-            // Collapse
-            for _ in 0..self.thinking_lines_shown {
-                output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
+            // Collapse if configured
+            if self.collapse_thinking {
+                for _ in 0..self.thinking_lines_shown {
+                    output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
+                }
+                output.push_str(&format!("{DIM}[thinking collapsed]{RESET}\n"));
             }
-            output.push_str(&format!("{DIM}[thinking collapsed]{RESET}\n"));
             save_thinking(self.thinking_content.trim());
             self.in_thinking = false;
             self.thinking_lines_shown = 0;
