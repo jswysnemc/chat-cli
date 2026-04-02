@@ -593,9 +593,9 @@ fn confirm_tool_action(
 
     loop {
         if editable_content.is_some() {
-            eprint!("  {DIM}{description} ({GREEN}y{DIM})es / ({RED}n{DIM})o / ({YELLOW}e{DIM})dit{RESET} > ");
+            eprint!("  {DIM}{description} {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}/or type replacement:{RESET} ");
         } else {
-            eprint!("  {DIM}{description} ({GREEN}y{DIM})es / ({RED}n{DIM})o{RESET} > ");
+            eprint!("  {DIM}{description} {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}:{RESET} ");
         }
         io::stderr()
             .flush()
@@ -605,34 +605,19 @@ fn confirm_tool_action(
         io::stdin()
             .read_line(&mut input)
             .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read input: {err}")))?;
-        let answer = input.trim().to_lowercase();
+        let trimmed = input.trim();
+        let lower = trimmed.to_lowercase();
 
-        match answer.as_str() {
+        match lower.as_str() {
             "y" | "yes" | "" => return Ok(ConfirmResult::Yes),
             "n" | "no" => return Ok(ConfirmResult::No),
-            "e" | "edit" => {
-                if editable_content.is_some() {
-                    eprint!("  {DIM}enter new content (single line):{RESET} ");
-                    io::stderr().flush().map_err(|err| {
-                        AppError::new(EXIT_ARGS, format!("failed to flush stderr: {err}"))
-                    })?;
-                    let mut new_content = String::new();
-                    io::stdin().read_line(&mut new_content).map_err(|err| {
-                        AppError::new(EXIT_ARGS, format!("failed to read input: {err}"))
-                    })?;
-                    let trimmed = new_content.trim().to_string();
-                    if trimmed.is_empty() {
-                        eprintln!("  {DIM}empty input, cancelled{RESET}");
-                        return Ok(ConfirmResult::No);
-                    }
-                    return Ok(ConfirmResult::Edit(trimmed));
-                } else {
-                    eprintln!("  {DIM}edit not available for this action{RESET}");
-                }
-            }
             _ => {
-                eprintln!("  {DIM}please enter y, n{}{RESET}",
-                    if editable_content.is_some() { ", or e" } else { "" });
+                if editable_content.is_some() {
+                    // Any other input is treated as replacement content
+                    return Ok(ConfirmResult::Edit(trimmed.to_string()));
+                } else {
+                    eprintln!("  {DIM}please enter y or n{RESET}");
+                }
             }
         }
     }
