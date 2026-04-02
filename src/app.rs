@@ -14,6 +14,9 @@ use crate::output::{AskOutput, AssistantMessage, render_ask_output};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, send_chat, stream_chat, test_provider,
 };
+use crate::render::{
+    Spinner, StreamRenderer, print_status_bar, print_stream_phase, render_markdown,
+};
 use crate::session::{
     SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions, delete_session,
     gc_sessions, generate_session_id, generate_temp_session_id, is_temp_session,
@@ -21,7 +24,6 @@ use crate::session::{
     set_current_session, short_id,
 };
 use crate::tool::{execute_tool, parse_tool_call, tool_definitions};
-use crate::render::{StreamRenderer, Spinner, print_status_bar, render_markdown};
 use clap::CommandFactory;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -59,18 +61,16 @@ pub async fn run(cli: Cli) -> AppResult<()> {
             handle_config(&paths, &mut config, &mut secrets, command).await
         }
         Commands::Doctor => handle_doctor(&paths, &config, &secrets).await,
-        Commands::Thinking => {
-            match crate::render::load_thinking() {
-                Some(content) => {
-                    println!("{}", render_markdown(&content, false));
-                    Ok(())
-                }
-                None => {
-                    eprintln!("no thinking content available");
-                    Ok(())
-                }
+        Commands::Thinking => match crate::render::load_thinking() {
+            Some(content) => {
+                println!("{}", render_markdown(&content, false));
+                Ok(())
             }
-        }
+            None => {
+                eprintln!("no thinking content available");
+                Ok(())
+            }
+        },
         Commands::Completion { .. } => Ok(()),
     }
 }
@@ -562,17 +562,19 @@ async fn handle_doctor(
     for (provider_id, provider) in &config.providers {
         print_auth_status(config, secrets, provider_id)?;
         match resolve_api_key(provider_id, provider, secrets) {
-            Ok(api_key) => match test_provider(provider_id, provider, &api_key, &config.models).await {
-                Ok(()) => println!("provider_test={} ok=1", provider_id),
-                Err(err) => {
-                    doctor_code.get_or_insert(err.code);
-                    println!(
-                        "provider_test={} ok=0 error={}",
-                        provider_id,
-                        serde_json::to_string(&err.message).unwrap_or_default()
-                    );
+            Ok(api_key) => {
+                match test_provider(provider_id, provider, &api_key, &config.models).await {
+                    Ok(()) => println!("provider_test={} ok=1", provider_id),
+                    Err(err) => {
+                        doctor_code.get_or_insert(err.code);
+                        println!(
+                            "provider_test={} ok=0 error={}",
+                            provider_id,
+                            serde_json::to_string(&err.message).unwrap_or_default()
+                        );
+                    }
                 }
-            },
+            }
             Err(err) => {
                 doctor_code.get_or_insert(err.code);
                 println!(
@@ -604,8 +606,7 @@ async fn handle_ask(
         } else {
             cli.output.clone()
         };
-        let result =
-            execute_ask_with_tools(cli, paths, config, secrets, &args, output_fmt).await?;
+        let result = execute_ask_with_tools(cli, paths, config, secrets, &args, output_fmt).await?;
         if !args.stream {
             let rendered = render_ask_output(
                 result.format.clone(),
@@ -630,6 +631,36 @@ async fn handle_ask(
     Ok(())
 }
 
+fn select_session_id(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session: Option<&str>,
+    new_session: bool,
+    temp: bool,
+    ephemeral: bool,
+) -> AppResult<String> {
+    if let Some(session_id) = session {
+        return resolve_session_id(paths, config, session_id);
+    }
+    if let Some(session_id) = requested_session_id(new_session, temp, ephemeral) {
+        return Ok(session_id);
+    }
+    if let Some(current_session) = load_state(paths)?.current_session {
+        return Ok(current_session);
+    }
+    Ok(generate_session_id())
+}
+
+fn requested_session_id(new_session: bool, temp: bool, ephemeral: bool) -> Option<String> {
+    if temp {
+        Some(generate_temp_session_id())
+    } else if new_session || ephemeral {
+        Some(generate_session_id())
+    } else {
+        None
+    }
+}
+
 async fn handle_repl(
     cli: &Cli,
     paths: &AppPaths,
@@ -643,19 +674,14 @@ async fn handle_repl(
             "--new-session cannot be used together with --session",
         ));
     }
-    let session_id = if let Some(session_id) = &args.session {
-        resolve_session_id(paths, config, session_id)?
-    } else if args.new_session {
-        generate_session_id()
-    } else if args.temp {
-        generate_temp_session_id()
-    } else if args.ephemeral {
-        generate_session_id()
-    } else if let Some(current_session) = load_state(paths)?.current_session {
-        current_session
-    } else {
-        generate_session_id()
-    };
+    let session_id = select_session_id(
+        paths,
+        config,
+        args.session.as_deref(),
+        args.new_session,
+        args.temp,
+        args.ephemeral,
+    )?;
     let mut first_turn = true;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -701,7 +727,7 @@ async fn handle_repl(
                 Some(OutputFormat::Text),
             )
             .await?;
-            println!("{}", render_markdown(&result.output.message.content, config.defaults.collapse_thinking.unwrap_or(false)));
+            println!("{}", render_markdown(&result.output.message.content, false));
         } else if args.stream {
             execute_ask_stream(
                 cli,
@@ -722,7 +748,7 @@ async fn handle_repl(
                 Some(OutputFormat::Text),
             )
             .await?;
-            println!("{}", render_markdown(&result.output.message.content, config.defaults.collapse_thinking.unwrap_or(false)));
+            println!("{}", render_markdown(&result.output.message.content, false));
         }
         first_turn = false;
     }
@@ -846,7 +872,7 @@ async fn execute_ask_with_tools(
         let mut renderer = StreamRenderer::new(collapse);
 
         // Status bar on first round
-        if round == 0 {
+        if round == 0 && use_stream {
             print_status_bar(
                 &prepared.request.provider_id,
                 &prepared.request.model_id,
@@ -855,7 +881,7 @@ async fn execute_ask_with_tools(
         }
 
         let response = if use_stream {
-            let mut spinner = Some(Spinner::start("thinking..."));
+            let mut spinner = Some(Spinner::start("waiting"));
             stream_chat(prepared.request.clone(), |chunk| {
                 // Stop spinner on first content
                 if spinner.is_some() {
@@ -865,6 +891,9 @@ async fn execute_ask_with_tools(
                 }
                 if !chunk.delta.is_empty() {
                     let rendered = renderer.push(&chunk.delta);
+                    for phase in renderer.drain_phase_transitions() {
+                        print_stream_phase(phase);
+                    }
                     if !rendered.is_empty() {
                         write!(stdout, "{}", rendered).map_err(|err| {
                             AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
@@ -884,14 +913,19 @@ async fn execute_ask_with_tools(
         if response.tool_calls.is_empty() {
             if use_stream {
                 let remaining = renderer.flush();
+                for phase in renderer.drain_phase_transitions() {
+                    print_stream_phase(phase);
+                }
                 if !remaining.is_empty() {
                     write!(stdout, "{}", remaining).map_err(|err| {
                         AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                     })?;
                 }
-                writeln!(stdout).map_err(|err| {
-                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                })?;
+                if !remaining.is_empty() && !remaining.ends_with('\n') {
+                    writeln!(stdout).map_err(|err| {
+                        AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                    })?;
+                }
             }
             final_response = Some(response);
             break;
@@ -900,14 +934,19 @@ async fn execute_ask_with_tools(
         // Model wants to call tools — flush renderer and newline
         if use_stream {
             let remaining = renderer.flush();
+            for phase in renderer.drain_phase_transitions() {
+                print_stream_phase(phase);
+            }
             if !remaining.is_empty() {
                 write!(stdout, "{}", remaining).map_err(|err| {
                     AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                 })?;
             }
-            writeln!(stdout).map_err(|err| {
-                AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-            })?;
+            if !remaining.is_empty() && !remaining.ends_with('\n') {
+                writeln!(stdout).map_err(|err| {
+                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                })?;
+            }
         }
 
         eprintln!(
@@ -937,9 +976,8 @@ async fn execute_ask_with_tools(
         }
     }
 
-    let response = final_response.ok_or_else(|| {
-        AppError::new(EXIT_ARGS, "max tool calling rounds (20) exceeded")
-    })?;
+    let response = final_response
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "max tool calling rounds (20) exceeded"))?;
 
     persist_session(
         paths,
@@ -1011,7 +1049,7 @@ async fn execute_ask_stream(
     let collapse = config.defaults.collapse_thinking.unwrap_or(false);
     let mut renderer = StreamRenderer::new(collapse);
     let mut spinner = if format == OutputFormat::Text {
-        Some(Spinner::start("thinking..."))
+        Some(Spinner::start("waiting"))
     } else {
         None
     };
@@ -1027,6 +1065,9 @@ async fn execute_ask_stream(
             OutputFormat::Text => {
                 if !chunk.delta.is_empty() {
                     let rendered = renderer.push(&chunk.delta);
+                    for phase in renderer.drain_phase_transitions() {
+                        print_stream_phase(phase);
+                    }
                     if !rendered.is_empty() {
                         write!(stdout, "{}", rendered).map_err(|err| {
                             AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
@@ -1072,14 +1113,19 @@ async fn execute_ask_stream(
     match format {
         OutputFormat::Text => {
             let remaining = renderer.flush();
+            for phase in renderer.drain_phase_transitions() {
+                print_stream_phase(phase);
+            }
             if !remaining.is_empty() {
                 write!(stdout, "{}", remaining).map_err(|err| {
                     AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                 })?;
             }
-            writeln!(stdout).map_err(|err| {
-                AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-            })?;
+            if !remaining.is_empty() && !remaining.ends_with('\n') {
+                writeln!(stdout).map_err(|err| {
+                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                })?;
+            }
             stdout.flush().map_err(|err| {
                 AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
             })?;
@@ -1181,19 +1227,14 @@ fn prepare_ask(
         ));
     }
 
-    let session_id = if let Some(session_id) = &args.session {
-        resolve_session_id(paths, config, session_id)?
-    } else if args.new_session {
-        generate_session_id()
-    } else if args.temp {
-        generate_temp_session_id()
-    } else if args.ephemeral {
-        generate_session_id()
-    } else if let Some(current_session) = load_state(paths)?.current_session {
-        current_session
-    } else {
-        generate_session_id()
-    };
+    let session_id = select_session_id(
+        paths,
+        config,
+        args.session.as_deref(),
+        args.new_session,
+        args.temp,
+        args.ephemeral,
+    )?;
     let mut messages = Vec::new();
     if let Ok(history) = read_events(paths, config, &session_id) {
         for event in history {
@@ -1214,11 +1255,17 @@ fn prepare_ask(
     if messages.is_empty() {
         // Build system prompt from CLI args and config file
         let cli_system = read_system_prompt(&args.system)?;
-        let file_system = config.defaults.system_prompt_file.as_ref().and_then(|path| {
-            let expanded = crate::config::expand_tilde(path);
-            std::fs::read_to_string(&expanded).ok()
-        });
-        let mode = config.defaults.system_prompt_mode
+        let file_system = config
+            .defaults
+            .system_prompt_file
+            .as_ref()
+            .and_then(|path| {
+                let expanded = crate::config::expand_tilde(path);
+                std::fs::read_to_string(&expanded).ok()
+            });
+        let mode = config
+            .defaults
+            .system_prompt_mode
             .as_deref()
             .unwrap_or("append");
 
@@ -1468,4 +1515,15 @@ fn read_stdin_all() -> AppResult<String> {
         .read_to_string(&mut buffer)
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read stdin: {err}")))?;
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requested_session_id_prefers_temp_over_new_session() {
+        let session_id = requested_session_id(true, true, false).unwrap();
+        assert!(session_id.starts_with("tmp_"));
+    }
 }

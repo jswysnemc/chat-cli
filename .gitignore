@@ -1,1 +1,26 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.agent.claude/
+
+# Local config (contains secrets)
+# Uncomment if you want to ignore local overrides
+# config.local.toml
+
+# docs (internal)
+/docs/next.md
+/docs/product-plan.md

@@ -952,7 +952,9 @@ fn accumulate_tool_calls(acc: &mut Vec<Value>, deltas: &[Value]) {
 
         // Grow the accumulator if needed
         while acc.len() <= index {
-            acc.push(json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
+            acc.push(
+                json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}),
+            );
         }
 
         // Merge fields

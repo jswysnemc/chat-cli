@@ -298,11 +298,7 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .auto_save_session
             .unwrap_or(true)
             .to_string()),
-        "defaults.tools" => Ok(config
-            .defaults
-            .tools
-            .unwrap_or(false)
-            .to_string()),
+        "defaults.tools" => Ok(config.defaults.tools.unwrap_or(false).to_string()),
         "defaults.system_prompt_file" => Ok(config
             .defaults
             .system_prompt_file
@@ -351,14 +347,17 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         "defaults.system_prompt_file" => {
             config.defaults.system_prompt_file = Some(value.to_string());
         }
-        "defaults.system_prompt_mode" => {
-            match value {
-                "append" | "override" => {
-                    config.defaults.system_prompt_mode = Some(value.to_string());
-                }
-                _ => return Err(AppError::new(EXIT_CONFIG, "system_prompt_mode must be 'append' or 'override'")),
+        "defaults.system_prompt_mode" => match value {
+            "append" | "override" => {
+                config.defaults.system_prompt_mode = Some(value.to_string());
             }
-        }
+            _ => {
+                return Err(AppError::new(
+                    EXIT_CONFIG,
+                    "system_prompt_mode must be 'append' or 'override'",
+                ));
+            }
+        },
         "defaults.collapse_thinking" => {
             config.defaults.collapse_thinking = Some(parse_bool(value)?);
         }

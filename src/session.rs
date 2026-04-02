@@ -86,21 +86,13 @@ pub fn short_id(session_id: &str) -> String {
     } else {
         ""
     };
-    let short = if bare.len() > 8 {
-        &bare[..8]
-    } else {
-        bare
-    };
+    let short = if bare.len() > 8 { &bare[..8] } else { bare };
     format!("{prefix}{short}")
 }
 
 /// Resolve a potentially abbreviated session ID to its full form via prefix matching.
 /// Supports: full ID, prefixed short ID ("sess_01JQ"), bare short ID ("01JQ"), tmp-prefixed ("tmp_01JQ").
-pub fn resolve_session_id(
-    paths: &AppPaths,
-    config: &AppConfig,
-    input: &str,
-) -> AppResult<String> {
+pub fn resolve_session_id(paths: &AppPaths, config: &AppConfig, input: &str) -> AppResult<String> {
     let all_sessions = list_sessions(paths, config)?;
 
     // Exact match first
@@ -338,9 +330,7 @@ pub fn clear_sessions(
     let current = if include_current {
         String::new()
     } else {
-        load_state(paths)?
-            .current_session
-            .unwrap_or_default()
+        load_state(paths)?.current_session.unwrap_or_default()
     };
     let mut removed = 0;
     for entry in fs::read_dir(&dir).code(EXIT_SESSION, "failed to read sessions dir")? {
@@ -379,8 +369,7 @@ pub fn gc_sessions(paths: &AppPaths, config: &AppConfig) -> AppResult<usize> {
             .and_then(|s| s.to_str())
             .unwrap_or_default();
         let metadata = fs::metadata(&path).code(EXIT_SESSION, "failed to read session metadata")?;
-        let should_remove = metadata.len() == 0
-            || (is_temp_session(stem) && stem != current);
+        let should_remove = metadata.len() == 0 || (is_temp_session(stem) && stem != current);
         if should_remove {
             fs::remove_file(&path).code(EXIT_SESSION, "failed to remove session file")?;
             removed += 1;

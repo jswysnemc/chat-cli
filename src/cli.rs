@@ -150,14 +150,22 @@ pub struct ReplArgs {
 pub enum SessionCommand {
     List,
     Current,
-    Switch { id: String },
+    Switch {
+        id: String,
+    },
     New {
         #[arg(long)]
         temp: bool,
     },
-    Show { id: String },
-    Export { id: String },
-    Delete { id: String },
+    Show {
+        id: String,
+    },
+    Export {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
     Clear {
         #[arg(long)]
         all: bool,

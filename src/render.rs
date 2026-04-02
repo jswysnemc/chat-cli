@@ -8,7 +8,7 @@
 /// - Tables with box-drawing characters
 /// - Horizontal rules
 /// - <think>...</think> tag collapsing
-
+use crate::session::{is_temp_session, short_id};
 use std::path::PathBuf;
 
 // ANSI escape codes
@@ -86,26 +86,20 @@ fn strip_thinking(input: &str) -> (String, String) {
 
 /// Render markdown text to ANSI-formatted terminal output (non-streaming).
 /// Strips thinking blocks and saves them.
-pub fn render_markdown(input: &str, collapse_thinking: bool) -> String {
+pub fn render_markdown(input: &str, _collapse_thinking: bool) -> String {
     let (content, thinking) = strip_thinking(input);
     if !thinking.is_empty() {
         save_thinking(&thinking);
     }
-    if collapse_thinking {
-        render_markdown_inner(&content)
-    } else {
-        // Show thinking dimmed before the main content with markers
-        let mut output = String::new();
-        if !thinking.is_empty() {
-            output.push_str(&format!("{DIM}--- thinking ---{RESET}\n"));
-            for line in thinking.lines() {
-                output.push_str(&format!("{DIM}{line}{RESET}\n"));
-            }
-            output.push_str(&format!("{DIM}--- end thinking ---{RESET}\n\n"));
-        }
-        output.push_str(&render_markdown_inner(&content));
-        output
+
+    let mut sections = Vec::new();
+    if !thinking.is_empty() {
+        sections.push(render_thinking_content(&thinking));
     }
+    if !content.is_empty() {
+        sections.push(render_markdown_inner(&content));
+    }
+    sections.join("\n\n")
 }
 
 fn render_markdown_inner(input: &str) -> String {
@@ -423,22 +417,121 @@ fn is_wide_char(c: char) -> bool {
     )
 }
 
-/// Streaming-friendly markdown renderer with thinking tag support.
-///
-/// During streaming:
-/// - `<think>` content is shown dimmed in real-time
-/// - When `</think>` is received, all thinking lines are erased from terminal
-/// - A collapsed indicator is shown instead
-pub struct StreamRenderer {
-    buffer: String,
+#[derive(Default)]
+struct LineRenderer {
     in_code_block: bool,
     table_buffer: Vec<String>,
     in_table: bool,
+}
+
+impl LineRenderer {
+    fn process_line(&mut self, line: &str) -> String {
+        if line.trim_start().starts_with("```") {
+            if self.in_code_block {
+                self.in_code_block = false;
+                return String::new();
+            }
+
+            self.in_code_block = true;
+            let lang = line.trim_start().trim_start_matches('`').trim();
+            if !lang.is_empty() {
+                return format!("{DIM}{CYAN}  {lang}{RESET}\n");
+            }
+            return String::new();
+        }
+
+        if self.in_code_block {
+            return format!("{DIM}  {line}{RESET}\n");
+        }
+
+        if line.contains('|') && !self.in_table {
+            self.in_table = true;
+            self.table_buffer.push(line.to_string());
+            return String::new();
+        }
+
+        if self.in_table {
+            if line.contains('|') {
+                self.table_buffer.push(line.to_string());
+                return String::new();
+            }
+
+            let mut output = self.flush();
+            output.push_str(&self.render_single_line(line));
+            return output;
+        }
+
+        self.render_single_line(line)
+    }
+
+    fn flush(&mut self) -> String {
+        if !self.in_table {
+            return String::new();
+        }
+
+        self.in_table = false;
+        let lines: Vec<&str> = self.table_buffer.iter().map(|s| s.as_str()).collect();
+        let result = render_table(&lines);
+        self.table_buffer.clear();
+        result
+    }
+
+    fn render_single_line(&self, line: &str) -> String {
+        if is_horizontal_rule(line) {
+            return format!("{DIM}{}{RESET}\n", "─".repeat(48));
+        }
+        if let Some(rendered) = render_header(line) {
+            return format!("{rendered}\n");
+        }
+        format!("{}\n", render_inline(line))
+    }
+}
+
+fn sticky_style(style: &str, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let persisted = text.replace(RESET, &format!("{RESET}{style}"));
+    format!("{style}{persisted}{RESET}")
+}
+
+fn render_thinking_content(content: &str) -> String {
+    let rendered = render_markdown_inner(content);
+    sticky_style(DIM, &rendered)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPhase {
+    Thinking,
+    Answering,
+}
+
+impl StreamPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "thinking",
+            Self::Answering => "answering",
+        }
+    }
+}
+
+/// Streaming-friendly markdown renderer with thinking tag support.
+///
+/// During streaming:
+/// - `<think>` content is shown inline in dim style
+/// - Phase changes are surfaced separately by the caller (`thinking` / `answering`)
+/// - When collapsed, previewed thinking lines are erased without extra markers
+pub struct StreamRenderer {
+    buffer: String,
+    normal_renderer: LineRenderer,
+    thinking_renderer: LineRenderer,
     // Thinking state
     in_thinking: bool,
     thinking_content: String,
     thinking_lines_shown: usize,
     collapse_thinking: bool,
+    phase_transitions: Vec<StreamPhase>,
+    current_phase: Option<StreamPhase>,
     // Tag detection buffer
     tag_buffer: String,
 }
@@ -447,13 +540,14 @@ impl StreamRenderer {
     pub fn new(collapse_thinking: bool) -> Self {
         Self {
             buffer: String::new(),
-            in_code_block: false,
-            table_buffer: Vec::new(),
-            in_table: false,
+            normal_renderer: LineRenderer::default(),
+            thinking_renderer: LineRenderer::default(),
             in_thinking: false,
             thinking_content: String::new(),
             thinking_lines_shown: 0,
             collapse_thinking,
+            phase_transitions: Vec::new(),
+            current_phase: None,
             tag_buffer: String::new(),
         }
     }
@@ -480,16 +574,13 @@ impl StreamRenderer {
                         self.buffer = self.buffer[nl + 1..].to_string();
                         self.thinking_content.push_str(&line);
                         self.thinking_content.push('\n');
-                        // Show dimmed thinking line
-                        output.push_str(&format!("{DIM}{line}{RESET}\n"));
-                        self.thinking_lines_shown += 1;
+                        self.push_thinking_line(&mut output, &line);
                     }
                     // Flush remaining partial line
                     if !self.buffer.is_empty() {
                         let partial = std::mem::take(&mut self.buffer);
                         self.thinking_content.push_str(&partial);
-                        output.push_str(&format!("{DIM}{partial}{RESET}\n"));
-                        self.thinking_lines_shown += 1;
+                        self.push_thinking_line(&mut output, &partial);
                     }
 
                     // Collapse or keep thinking output
@@ -497,12 +588,8 @@ impl StreamRenderer {
                         for _ in 0..self.thinking_lines_shown {
                             output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
                         }
-                        output.push_str(&format!(
-                            "{DIM}[thinking collapsed]{RESET}\n"
-                        ));
                     } else {
-                        // Show end-of-thinking separator
-                        output.push_str(&format!("{DIM}--- end thinking ---{RESET}\n\n"));
+                        output.push_str(&self.flush_thinking_renderer());
                     }
 
                     // Save thinking content
@@ -510,6 +597,7 @@ impl StreamRenderer {
 
                     self.in_thinking = false;
                     self.thinking_lines_shown = 0;
+                    self.thinking_renderer = LineRenderer::default();
                     // Skip newline right after </think>
                     if self.tag_buffer.starts_with('\n') {
                         self.tag_buffer = self.tag_buffer[1..].to_string();
@@ -535,8 +623,7 @@ impl StreamRenderer {
                         self.buffer = self.buffer[nl + 1..].to_string();
                         self.thinking_content.push_str(&line);
                         self.thinking_content.push('\n');
-                        output.push_str(&format!("{DIM}{line}{RESET}\n"));
-                        self.thinking_lines_shown += 1;
+                        self.push_thinking_line(&mut output, &line);
                     }
                     break;
                 }
@@ -549,19 +636,25 @@ impl StreamRenderer {
 
                     // Process normal content
                     self.buffer.push_str(&before);
+                    if !before.is_empty() {
+                        self.note_phase(StreamPhase::Answering);
+                    }
                     while let Some(nl) = self.buffer.find('\n') {
                         let line = self.buffer[..nl].to_string();
                         self.buffer = self.buffer[nl + 1..].to_string();
-                        output.push_str(&self.process_line(&line));
+                        let rendered = self.normal_renderer.process_line(&line);
+                        if !rendered.is_empty() {
+                            self.note_phase(StreamPhase::Answering);
+                            output.push_str(&rendered);
+                        }
                     }
 
                     // Enter thinking mode
                     self.in_thinking = true;
                     self.thinking_content.clear();
                     self.thinking_lines_shown = 0;
-                    // Show thinking header
-                    output.push_str(&format!("{DIM}--- thinking ---{RESET}\n"));
-                    self.thinking_lines_shown += 1;
+                    self.thinking_renderer = LineRenderer::default();
+                    self.note_phase(StreamPhase::Thinking);
                     // Skip newline right after <think>
                     if self.tag_buffer.starts_with('\n') {
                         self.tag_buffer = self.tag_buffer[1..].to_string();
@@ -574,9 +667,15 @@ impl StreamRenderer {
                         let safe_end = self.tag_buffer.len() - could_be_tag;
                         let safe = self.tag_buffer[..safe_end].to_string();
                         self.tag_buffer = self.tag_buffer[safe_end..].to_string();
+                        if !safe.is_empty() {
+                            self.note_phase(StreamPhase::Answering);
+                        }
                         self.buffer.push_str(&safe);
                     } else {
                         let all = std::mem::take(&mut self.tag_buffer);
+                        if !all.is_empty() {
+                            self.note_phase(StreamPhase::Answering);
+                        }
                         self.buffer.push_str(&all);
                     }
 
@@ -584,7 +683,11 @@ impl StreamRenderer {
                     while let Some(nl) = self.buffer.find('\n') {
                         let line = self.buffer[..nl].to_string();
                         self.buffer = self.buffer[nl + 1..].to_string();
-                        output.push_str(&self.process_line(&line));
+                        let rendered = self.normal_renderer.process_line(&line);
+                        if !rendered.is_empty() {
+                            self.note_phase(StreamPhase::Answering);
+                            output.push_str(&rendered);
+                        }
                     }
                     break;
                 }
@@ -610,93 +713,70 @@ impl StreamRenderer {
             if !self.buffer.is_empty() {
                 let partial = std::mem::take(&mut self.buffer);
                 self.thinking_content.push_str(&partial);
-                output.push_str(&format!("{DIM}{partial}{RESET}\n"));
-                self.thinking_lines_shown += 1;
+                self.push_thinking_line(&mut output, &partial);
             }
             // Collapse if configured
             if self.collapse_thinking {
                 for _ in 0..self.thinking_lines_shown {
                     output.push_str(&format!("{CURSOR_UP}{CLEAR_LINE}"));
                 }
-                output.push_str(&format!("{DIM}[thinking collapsed]{RESET}\n"));
             } else {
-                output.push_str(&format!("{DIM}--- end thinking ---{RESET}\n\n"));
+                output.push_str(&self.flush_thinking_renderer());
             }
             save_thinking(self.thinking_content.trim());
             self.in_thinking = false;
             self.thinking_lines_shown = 0;
+            self.thinking_renderer = LineRenderer::default();
         }
 
         // Flush table if pending
-        if self.in_table {
-            output.push_str(&self.flush_table());
+        let table_output = self.normal_renderer.flush();
+        if !table_output.is_empty() {
+            self.note_phase(StreamPhase::Answering);
+            output.push_str(&table_output);
         }
 
         // Flush remaining text
         if !self.buffer.is_empty() {
             let remaining = std::mem::take(&mut self.buffer);
-            output.push_str(&render_inline(&remaining));
+            let rendered = render_inline(&remaining);
+            if !rendered.is_empty() {
+                self.note_phase(StreamPhase::Answering);
+                output.push_str(&rendered);
+            }
         }
 
         output
     }
 
-    fn process_line(&mut self, line: &str) -> String {
-        // Handle code block toggle
-        if line.trim_start().starts_with("```") {
-            if self.in_code_block {
-                self.in_code_block = false;
-                return String::new();
-            } else {
-                self.in_code_block = true;
-                let lang = line.trim_start().trim_start_matches('`').trim();
-                if !lang.is_empty() {
-                    return format!("{DIM}{CYAN}  {lang}{RESET}\n");
-                }
-                return String::new();
-            }
-        }
-
-        if self.in_code_block {
-            return format!("{DIM}  {line}{RESET}\n");
-        }
-
-        // Table handling
-        if line.contains('|') && !self.in_table {
-            self.in_table = true;
-            self.table_buffer.push(line.to_string());
-            return String::new();
-        }
-        if self.in_table {
-            if line.contains('|') {
-                self.table_buffer.push(line.to_string());
-                return String::new();
-            } else {
-                let mut output = self.flush_table();
-                output.push_str(&self.render_single_line(line));
-                return output;
-            }
-        }
-
-        self.render_single_line(line)
+    fn push_thinking_line(&mut self, output: &mut String, line: &str) {
+        let rendered = self.thinking_renderer.process_line(line);
+        self.push_thinking_rendered(output, &rendered);
     }
 
-    fn render_single_line(&self, line: &str) -> String {
-        if is_horizontal_rule(line) {
-            return format!("{DIM}{}{RESET}\n", "─".repeat(48));
-        }
-        if let Some(rendered) = render_header(line) {
-            return format!("{rendered}\n");
-        }
-        format!("{}\n", render_inline(line))
+    fn flush_thinking_renderer(&mut self) -> String {
+        let rendered = self.thinking_renderer.flush();
+        let mut output = String::new();
+        self.push_thinking_rendered(&mut output, &rendered);
+        output
     }
 
-    fn flush_table(&mut self) -> String {
-        self.in_table = false;
-        let lines: Vec<&str> = self.table_buffer.iter().map(|s| s.as_str()).collect();
-        let result = render_table(&lines);
-        self.table_buffer.clear();
-        result
+    fn push_thinking_rendered(&mut self, output: &mut String, rendered: &str) {
+        if !rendered.is_empty() {
+            output.push_str(&sticky_style(DIM, rendered));
+            self.thinking_lines_shown += rendered.lines().count();
+        }
+    }
+
+    pub fn drain_phase_transitions(&mut self) -> Vec<StreamPhase> {
+        std::mem::take(&mut self.phase_transitions)
+    }
+
+    fn note_phase(&mut self, phase: StreamPhase) {
+        if self.current_phase != Some(phase) {
+            self.phase_transitions.push(phase);
+            self.current_phase = Some(phase);
+        }
     }
 }
 
@@ -716,23 +796,26 @@ fn could_be_partial_tag(text: &str, tag: &str) -> usize {
 // ─── Spinner + Status Bar ───
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Print a status bar line to stderr.
 pub fn print_status_bar(provider: &str, model: &str, session_id: &str) {
-    // Strip sess_ prefix, keep tmp_ prefix, then truncate bare ID to 8 chars
-    let bare = session_id
-        .strip_prefix("sess_")
-        .or_else(|| session_id.strip_prefix("tmp_"))
-        .unwrap_or(session_id);
-    let prefix = if session_id.starts_with("tmp_") { "tmp_" } else { "" };
-    let short = if bare.len() > 8 { &bare[..8] } else { bare };
+    let badge = if is_temp_session(session_id) {
+        format!("{YELLOW}[temp]{RESET}")
+    } else {
+        format!("{DIM}[saved]{RESET}")
+    };
     eprintln!(
-        "{DIM}{provider} {RESET}{BOLD}{CYAN}{model}{RESET} {DIM}{prefix}{short}{RESET}"
+        "{DIM}{provider}{RESET} {BOLD}{CYAN}{model}{RESET} {badge} {DIM}{}{RESET}",
+        short_id(session_id)
     );
+}
+
+pub fn print_stream_phase(phase: StreamPhase) {
+    eprintln!("{DIM}{}{RESET}", phase.label());
 }
 
 /// A loading spinner that runs on a background thread.
@@ -781,3 +864,37 @@ impl Drop for Spinner {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_markdown_keeps_thinking_without_markers() {
+        let rendered = render_markdown("answer\n<think>\nhello\n</think>\nworld", false);
+        assert!(rendered.contains("hello"));
+        assert!(rendered.contains("world"));
+        assert!(!rendered.contains("Thinking"));
+        assert!(!rendered.contains("╭"));
+    }
+
+    #[test]
+    fn render_markdown_renders_fenced_code_inside_thinking() {
+        let rendered = render_markdown(
+            "<think>\n```txt\nThis is the overwritten content using overwrite mode.\nLine 2\nLine 3\n```\n</think>\nDone",
+            false,
+        );
+        assert!(rendered.contains("txt"));
+        assert!(rendered.contains("This is the overwritten content using overwrite mode."));
+        assert!(!rendered.contains("```"));
+    }
+
+    #[test]
+    fn stream_renderer_reports_phase_transitions() {
+        let mut renderer = StreamRenderer::new(false);
+        let rendered = renderer.push("<think>\nplan\n</think>\nanswer");
+        let phases = renderer.drain_phase_transitions();
+        assert_eq!(phases, vec![StreamPhase::Thinking, StreamPhase::Answering]);
+        assert!(rendered.contains("plan"));
+        assert!(!rendered.contains("Thinking"));
+    }
+}
