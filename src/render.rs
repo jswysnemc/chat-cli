@@ -685,3 +685,70 @@ fn could_be_partial_tag(text: &str, tag: &str) -> usize {
     }
     0
 }
+
+// ─── Spinner + Status Bar ───
+
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Print a status bar line to stderr.
+pub fn print_status_bar(provider: &str, model: &str, session_id: &str) {
+    let short_session = if session_id.len() > 8 {
+        &session_id[..8]
+    } else {
+        session_id
+    };
+    eprintln!(
+        "{DIM}{provider} {RESET}{BOLD}{CYAN}{model}{RESET} {DIM}{short_session}{RESET}"
+    );
+}
+
+/// A loading spinner that runs on a background thread.
+/// Call `stop()` when the first token arrives.
+pub struct Spinner {
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    pub fn start(message: &str) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let msg = message.to_string();
+        let handle = std::thread::spawn(move || {
+            let mut i = 0;
+            let mut stderr = io::stderr();
+            while r.load(Ordering::Relaxed) {
+                let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
+                let _ = write!(stderr, "\r{DIM}{frame} {msg}{RESET}  ");
+                let _ = stderr.flush();
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            // Clear spinner line
+            let _ = write!(stderr, "\r{CLEAR_LINE}");
+            let _ = stderr.flush();
+        });
+        Self {
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+

@@ -21,7 +21,7 @@ use crate::session::{
     set_current_session, short_id,
 };
 use crate::tool::{execute_tool, parse_tool_call, tool_definitions};
-use crate::render::{StreamRenderer, render_markdown};
+use crate::render::{StreamRenderer, Spinner, print_status_bar, render_markdown};
 use clap::CommandFactory;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -844,8 +844,24 @@ async fn execute_ask_with_tools(
         let mut stdout = io::stdout();
         let mut renderer = StreamRenderer::new();
 
+        // Status bar on first round
+        if round == 0 {
+            print_status_bar(
+                &prepared.request.provider_id,
+                &prepared.request.model_id,
+                &prepared.session_id,
+            );
+        }
+
         let response = if use_stream {
+            let mut spinner = Some(Spinner::start("thinking..."));
             stream_chat(prepared.request.clone(), |chunk| {
+                // Stop spinner on first content
+                if spinner.is_some() {
+                    if let Some(mut s) = spinner.take() {
+                        s.stop();
+                    }
+                }
                 if !chunk.delta.is_empty() {
                     let rendered = renderer.push(&chunk.delta);
                     if !rendered.is_empty() {
@@ -982,9 +998,29 @@ async fn execute_ask_stream(
         )?;
     }
 
+    // Status bar
+    if format == OutputFormat::Text {
+        print_status_bar(
+            &prepared.request.provider_id,
+            &prepared.request.model_id,
+            &session_id,
+        );
+    }
+
     let mut renderer = StreamRenderer::new();
+    let mut spinner = if format == OutputFormat::Text {
+        Some(Spinner::start("thinking..."))
+    } else {
+        None
+    };
 
     let response = match stream_chat(prepared.request.clone(), |chunk| {
+        // Stop spinner on first content
+        if spinner.is_some() {
+            if let Some(mut s) = spinner.take() {
+                s.stop();
+            }
+        }
         match format {
             OutputFormat::Text => {
                 if !chunk.delta.is_empty() {
@@ -1174,7 +1210,25 @@ fn prepare_ask(
         }
     }
     if messages.is_empty() {
-        if let Some(system) = read_system_prompt(&args.system)? {
+        // Build system prompt from CLI args and config file
+        let cli_system = read_system_prompt(&args.system)?;
+        let file_system = config.defaults.system_prompt_file.as_ref().and_then(|path| {
+            let expanded = crate::config::expand_tilde(path);
+            std::fs::read_to_string(&expanded).ok()
+        });
+        let mode = config.defaults.system_prompt_mode
+            .as_deref()
+            .unwrap_or("append");
+
+        let final_system = match (cli_system, file_system, mode) {
+            (Some(cli), Some(file), "override") => Some(file),
+            (Some(cli), Some(file), _) => Some(format!("{cli}\n\n{file}")), // append
+            (Some(cli), None, _) => Some(cli),
+            (None, Some(file), _) => Some(file),
+            (None, None, _) => None,
+        };
+
+        if let Some(system) = final_system {
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: system,

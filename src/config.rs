@@ -94,6 +94,8 @@ pub struct DefaultsConfig {
     pub auto_save_session: Option<bool>,
     pub session_id_kind: Option<String>,
     pub tools: Option<bool>,
+    pub system_prompt_file: Option<String>,
+    pub system_prompt_mode: Option<String>,
 }
 
 impl Default for DefaultsConfig {
@@ -107,6 +109,8 @@ impl Default for DefaultsConfig {
             auto_save_session: Some(true),
             session_id_kind: Some("ulid".to_string()),
             tools: None,
+            system_prompt_file: None,
+            system_prompt_mode: Some("append".to_string()),
         }
     }
 }
@@ -297,6 +301,16 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .tools
             .unwrap_or(false)
             .to_string()),
+        "defaults.system_prompt_file" => Ok(config
+            .defaults
+            .system_prompt_file
+            .clone()
+            .unwrap_or_default()),
+        "defaults.system_prompt_mode" => Ok(config
+            .defaults
+            .system_prompt_mode
+            .clone()
+            .unwrap_or_else(|| "append".to_string())),
         "session.store_format" => Ok(config
             .session
             .store_format
@@ -326,6 +340,17 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         }
         "defaults.tools" => {
             config.defaults.tools = Some(parse_bool(value)?);
+        }
+        "defaults.system_prompt_file" => {
+            config.defaults.system_prompt_file = Some(value.to_string());
+        }
+        "defaults.system_prompt_mode" => {
+            match value {
+                "append" | "override" => {
+                    config.defaults.system_prompt_mode = Some(value.to_string());
+                }
+                _ => return Err(AppError::new(EXIT_CONFIG, "system_prompt_mode must be 'append' or 'override'")),
+            }
         }
         "session.store_format" => config.session.store_format = Some(value.to_string()),
         "session.dir" => config.session.dir = Some(value.to_string()),
