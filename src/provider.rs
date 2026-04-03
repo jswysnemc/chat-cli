@@ -188,7 +188,11 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
             format!("failed to parse provider response: {err}"),
         )
     })?;
-    let content = extract_openai_content(&raw).unwrap_or_default();
+    let content = combine_reasoning_and_content(
+        extract_openai_reasoning_content(&raw),
+        extract_openai_content(&raw),
+    )
+    .unwrap_or_default();
     let finish_reason = raw["choices"][0]["finish_reason"]
         .as_str()
         .unwrap_or("stop")
@@ -248,6 +252,7 @@ where
     let mut raw_events = Vec::new();
 
     let mut tool_calls_acc: Vec<Value> = Vec::new();
+    let mut in_reasoning = false;
 
     let mut byte_stream = response.bytes_stream();
     while let Some(chunk_result) = byte_stream.next().await {
@@ -258,7 +263,13 @@ where
             )
         })?;
         for payload in parser.push_bytes(&chunk)? {
-            if let Some(event) = parse_openai_stream_payload(&payload)? {
+            if let Some(mut event) = parse_openai_stream_payload(&payload)? {
+                event.delta = decorate_openai_stream_delta(
+                    &mut in_reasoning,
+                    &extract_openai_reasoning_delta(&event.raw),
+                    &event.delta,
+                    event.finish_reason.as_deref(),
+                );
                 accumulate_stream_event(
                     &mut content,
                     &mut finish_reason,
@@ -273,7 +284,13 @@ where
     }
 
     for payload in parser.finish()? {
-        if let Some(event) = parse_openai_stream_payload(&payload)? {
+        if let Some(mut event) = parse_openai_stream_payload(&payload)? {
+            event.delta = decorate_openai_stream_delta(
+                &mut in_reasoning,
+                &extract_openai_reasoning_delta(&event.raw),
+                &event.delta,
+                event.finish_reason.as_deref(),
+            );
             accumulate_stream_event(
                 &mut content,
                 &mut finish_reason,
@@ -831,24 +848,12 @@ fn provider_base_url(provider: &ProviderConfig) -> AppResult<String> {
 }
 
 fn extract_openai_content(raw: &Value) -> Option<String> {
-    let content = &raw["choices"][0]["message"]["content"];
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-    let parts = content.as_array()?;
-    let mut merged = String::new();
-    for part in parts {
-        if let Some(text) = part["text"].as_str() {
-            merged.push_str(text);
-        } else if let Some(text) = part["content"].as_str() {
-            merged.push_str(text);
-        }
-    }
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
+    extract_openai_text_value(&raw["choices"][0]["message"]["content"])
+}
+
+fn extract_openai_reasoning_content(raw: &Value) -> Option<String> {
+    extract_openai_text_value(&raw["choices"][0]["message"]["reasoning_content"])
+        .or_else(|| extract_openai_text_value(&raw["choices"][0]["message"]["reasoning"]))
 }
 
 fn extract_anthropic_content(raw: &Value) -> Option<String> {
@@ -875,13 +880,20 @@ fn extract_ollama_content(raw: &Value) -> Option<String> {
 }
 
 fn extract_openai_delta(raw: &Value) -> String {
-    let content = &raw["choices"][0]["delta"]["content"];
-    if let Some(text) = content.as_str() {
-        return text.to_string();
+    extract_openai_text_value(&raw["choices"][0]["delta"]["content"]).unwrap_or_default()
+}
+
+fn extract_openai_reasoning_delta(raw: &Value) -> String {
+    extract_openai_text_value(&raw["choices"][0]["delta"]["reasoning_content"])
+        .or_else(|| extract_openai_text_value(&raw["choices"][0]["delta"]["reasoning"]))
+        .unwrap_or_default()
+}
+
+fn extract_openai_text_value(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
     }
-    let Some(parts) = content.as_array() else {
-        return String::new();
-    };
+    let parts = value.as_array()?;
     let mut merged = String::new();
     for part in parts {
         if let Some(text) = part["text"].as_str() {
@@ -890,7 +902,58 @@ fn extract_openai_delta(raw: &Value) -> String {
             merged.push_str(text);
         }
     }
-    merged
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+fn combine_reasoning_and_content(
+    reasoning: Option<String>,
+    content: Option<String>,
+) -> Option<String> {
+    let reasoning = reasoning.filter(|value| !value.trim().is_empty());
+    let content = content.filter(|value| !value.trim().is_empty());
+    match (reasoning, content) {
+        (Some(reasoning), Some(content)) => {
+            Some(format!("<think>\n{reasoning}\n</think>\n\n{content}"))
+        }
+        (Some(reasoning), None) => Some(format!("<think>\n{reasoning}\n</think>")),
+        (None, Some(content)) => Some(content),
+        (None, None) => None,
+    }
+}
+
+fn decorate_openai_stream_delta(
+    in_reasoning: &mut bool,
+    reasoning_delta: &str,
+    answer_delta: &str,
+    finish_reason: Option<&str>,
+) -> String {
+    let answer_delta = if is_openai_control_content_delta(answer_delta) {
+        ""
+    } else {
+        answer_delta
+    };
+    let mut output = String::new();
+    if !reasoning_delta.is_empty() {
+        if !*in_reasoning {
+            output.push_str("<think>\n");
+            *in_reasoning = true;
+        }
+        output.push_str(reasoning_delta);
+    }
+    if *in_reasoning && (!answer_delta.is_empty() || finish_reason.is_some()) {
+        output.push_str("</think>\n\n");
+        *in_reasoning = false;
+    }
+    output.push_str(answer_delta);
+    output
+}
+
+fn is_openai_control_content_delta(delta: &str) -> bool {
+    matches!(delta.trim(), "FINISHED")
 }
 
 fn extract_ollama_usage(raw: &Value) -> Option<Usage> {
@@ -973,6 +1036,9 @@ fn accumulate_tool_calls(acc: &mut Vec<Value>, deltas: &[Value]) {
 }
 
 fn parse_openai_stream_payload(payload: &str) -> AppResult<Option<ChatStreamChunk>> {
+    if payload.trim().is_empty() {
+        return Ok(None);
+    }
     if payload.trim() == "[DONE]" {
         return Ok(None);
     }
@@ -1188,7 +1254,12 @@ impl SseParser {
                 data_lines.push(data.trim_start().to_string());
             }
         }
-        Some(data_lines.join("\n"))
+        let payload = data_lines.join("\n");
+        if payload.trim().is_empty() {
+            None
+        } else {
+            Some(payload)
+        }
     }
 }
 
@@ -1300,6 +1371,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_openai_stream_ignores_empty_payload() {
+        assert!(parse_openai_stream_payload("").unwrap().is_none());
+        assert!(parse_openai_stream_payload("   ").unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_openai_reasoning_content_from_message() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "content": "2",
+                    "reasoning_content": "先做加法。"
+                }
+            }]
+        });
+        let combined = combine_reasoning_and_content(
+            extract_openai_reasoning_content(&raw),
+            extract_openai_content(&raw),
+        )
+        .unwrap();
+        assert!(combined.contains("<think>"));
+        assert!(combined.contains("先做加法。"));
+        assert!(combined.ends_with("2"));
+    }
+
+    #[test]
+    fn decorate_openai_stream_delta_wraps_reasoning_before_answer() {
+        let mut in_reasoning = false;
+        let first = decorate_openai_stream_delta(&mut in_reasoning, "先分析", "", None);
+        assert_eq!(first, "<think>\n先分析");
+        assert!(in_reasoning);
+
+        let second = decorate_openai_stream_delta(&mut in_reasoning, "", "结论", None);
+        assert_eq!(second, "</think>\n\n结论");
+        assert!(!in_reasoning);
+    }
+
+    #[test]
+    fn decorate_openai_stream_delta_ignores_finished_control_tokens() {
+        let mut in_reasoning = false;
+        let first = decorate_openai_stream_delta(&mut in_reasoning, "先搜索", "", None);
+        assert_eq!(first, "<think>\n先搜索");
+        assert!(in_reasoning);
+
+        let middle = decorate_openai_stream_delta(&mut in_reasoning, "", "FINISHED", None);
+        assert!(middle.is_empty());
+        assert!(in_reasoning);
+
+        let more_reasoning = decorate_openai_stream_delta(&mut in_reasoning, "继续搜索", "", None);
+        assert_eq!(more_reasoning, "继续搜索");
+        assert!(in_reasoning);
+
+        let answer = decorate_openai_stream_delta(&mut in_reasoning, "", "最终答案", None);
+        assert_eq!(answer, "</think>\n\n最终答案");
+        assert!(!in_reasoning);
+    }
+
+    #[test]
     fn parse_anthropic_stream_delta() {
         let event = parse_anthropic_stream_payload(
             "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}",
@@ -1320,5 +1449,15 @@ mod tests {
         assert_eq!(second.len(), 1);
         let event = parse_ollama_stream_payload(&second[0]).unwrap().unwrap();
         assert_eq!(event.delta, "he");
+    }
+
+    #[test]
+    fn sse_parser_ignores_event_without_data_lines() {
+        let mut parser = SseParser::default();
+        let events = parser.push_bytes(b"event: ping\n\n").unwrap();
+        assert!(events.is_empty());
+
+        let events = parser.push_bytes(b": keep-alive\n\n").unwrap();
+        assert!(events.is_empty());
     }
 }

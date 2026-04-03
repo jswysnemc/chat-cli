@@ -250,14 +250,11 @@ fn handle_model_command(
             Ok(())
         }
         ModelCommand::List { provider } => {
-            for (id, model) in &config.models {
+            for model in config.models.values() {
                 if provider.as_ref().is_some_and(|p| p != &model.provider) {
                     continue;
                 }
-                println!(
-                    "{} provider={} remote_name={}",
-                    id, model.provider, model.remote_name
-                );
+                println!("{}", format_model_list_entry(model));
             }
             Ok(())
         }
@@ -608,11 +605,7 @@ async fn handle_ask(
         };
         let result = execute_ask_with_tools(cli, paths, config, secrets, &args, output_fmt).await?;
         if !args.stream {
-            let rendered = render_ask_output(
-                result.format.clone(),
-                &result.output,
-                args.raw_provider_response,
-            )?;
+            let rendered = format_final_ask_output(config, &result, args.raw_provider_response)?;
             println!("{rendered}");
         }
         return Ok(());
@@ -622,13 +615,23 @@ async fn handle_ask(
         return Ok(());
     }
     let result = execute_ask(cli, paths, config, secrets, &args, cli.output.clone()).await?;
-    let rendered = render_ask_output(
-        result.format.clone(),
-        &result.output,
-        args.raw_provider_response,
-    )?;
+    let rendered = format_final_ask_output(config, &result, args.raw_provider_response)?;
     println!("{rendered}");
     Ok(())
+}
+
+fn format_final_ask_output(
+    config: &AppConfig,
+    result: &AskExecution,
+    raw_provider_response: bool,
+) -> AppResult<String> {
+    if result.format == OutputFormat::Text && !raw_provider_response {
+        return Ok(render_markdown(
+            &result.output.message.content,
+            config.defaults.collapse_thinking.unwrap_or(false),
+        ));
+    }
+    render_ask_output(result.format.clone(), &result.output, raw_provider_response)
 }
 
 fn select_session_id(
@@ -1509,6 +1512,10 @@ fn resolve_model_use_target(config: &AppConfig, target: &str) -> AppResult<(Stri
     Ok((model.provider.clone(), target.to_string()))
 }
 
+fn format_model_list_entry(model: &ModelConfig) -> String {
+    format!("{}/{}", model.provider, model.remote_name)
+}
+
 fn read_stdin_all() -> AppResult<String> {
     let mut buffer = String::new();
     io::stdin()
@@ -1520,10 +1527,51 @@ fn read_stdin_all() -> AppResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Usage;
 
     #[test]
     fn requested_session_id_prefers_temp_over_new_session() {
         let session_id = requested_session_id(true, true, false).unwrap();
         assert!(session_id.starts_with("tmp_"));
+    }
+
+    #[test]
+    fn model_list_entry_uses_provider_and_remote_name() {
+        let model = ModelConfig {
+            provider: "minimax".to_string(),
+            remote_name: "MiniMax-M2.7".to_string(),
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: Vec::new(),
+            temperature: None,
+        };
+        assert_eq!(format_model_list_entry(&model), "minimax/MiniMax-M2.7");
+    }
+
+    #[test]
+    fn format_final_ask_output_renders_think_blocks_for_text_output() {
+        let config = AppConfig::default();
+        let result = AskExecution {
+            format: OutputFormat::Text,
+            output: AskOutput {
+                ok: true,
+                provider: "deepseek".to_string(),
+                model: "deepseek-reasoner-search".to_string(),
+                session_id: "sess_test".to_string(),
+                message: AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: "<think>\n先分析\n</think>\n\n答案".to_string(),
+                },
+                usage: Usage::default(),
+                finish_reason: "stop".to_string(),
+                latency_ms: 1,
+                raw_provider_response: None,
+            },
+        };
+        let rendered = format_final_ask_output(&config, &result, false).unwrap();
+        assert!(rendered.contains("先分析"));
+        assert!(rendered.contains("答案"));
+        assert!(!rendered.contains("<think>"));
     }
 }

@@ -155,6 +155,13 @@ fn render_markdown_inner(input: &str) -> String {
             continue;
         }
 
+        if let Some(rendered) = render_list_item(line) {
+            output.push_str(&rendered);
+            output.push('\n');
+            i += 1;
+            continue;
+        }
+
         // Normal line
         output.push_str(&render_inline(line));
         output.push('\n');
@@ -220,6 +227,34 @@ fn render_inline(text: &str) -> String {
     }
 
     result
+}
+
+fn render_list_item(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    if let Some(content) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return Some(format!("{indent}{DIM}•{RESET} {}", render_inline(content)));
+    }
+
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count > 0
+        && trimmed.as_bytes().get(digit_count) == Some(&b'.')
+        && trimmed.as_bytes().get(digit_count + 1) == Some(&b' ')
+    {
+        let marker = &trimmed[..digit_count + 1];
+        let content = &trimmed[digit_count + 2..];
+        return Some(format!(
+            "{indent}{DIM}{marker}{RESET} {}",
+            render_inline(content)
+        ));
+    }
+
+    None
 }
 
 fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
@@ -481,6 +516,9 @@ impl LineRenderer {
             return format!("{DIM}{}{RESET}\n", "─".repeat(48));
         }
         if let Some(rendered) = render_header(line) {
+            return format!("{rendered}\n");
+        }
+        if let Some(rendered) = render_list_item(line) {
             return format!("{rendered}\n");
         }
         format!("{}\n", render_inline(line))
@@ -886,6 +924,15 @@ mod tests {
         assert!(rendered.contains("txt"));
         assert!(rendered.contains("This is the overwritten content using overwrite mode."));
         assert!(!rendered.contains("```"));
+    }
+
+    #[test]
+    fn render_markdown_renders_markdown_list_items() {
+        let rendered = render_markdown("- *第一项*\n1. 第二项", false);
+        assert!(rendered.contains("•"));
+        assert!(rendered.contains("第一项"));
+        assert!(rendered.contains("1."));
+        assert!(!rendered.contains("- *"));
     }
 
     #[test]
