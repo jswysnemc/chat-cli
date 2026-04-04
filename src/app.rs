@@ -14,9 +14,7 @@ use crate::output::{AskOutput, AssistantMessage, render_ask_output};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, send_chat, stream_chat, test_provider,
 };
-use crate::render::{
-    Spinner, StreamRenderer, print_status_bar, print_stream_phase, render_markdown,
-};
+use crate::render::{StreamPhase, StreamRenderer, StreamStatus, print_status_bar, render_markdown};
 use crate::session::{
     SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions, delete_session,
     gc_sessions, generate_session_id, generate_temp_session_id, is_temp_session,
@@ -636,19 +634,50 @@ fn format_final_ask_output(
     render_ask_output(result.format.clone(), &result.output, raw_provider_response)
 }
 
-fn should_stream_tool_round(request: &ChatRequest, requested_stream: bool, round: usize) -> bool {
-    if !requested_stream {
-        return false;
-    }
-    if round == 0 {
-        return true;
-    }
-    !(request.provider.kind == "openai_compatible"
-        && request.model.remote_name.starts_with("claude-"))
+fn should_stream_tool_round(_request: &ChatRequest, requested_stream: bool, _round: usize) -> bool {
+    requested_stream
 }
 
-fn should_buffer_tool_execution(request: &ChatRequest) -> bool {
-    request.provider.kind == "openai_compatible" && request.model.remote_name.starts_with("claude-")
+fn update_stream_status(status: &Option<StreamStatus>, phase: StreamPhase) -> AppResult<()> {
+    if let Some(status) = status {
+        status.set_phase(phase).map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to update status line: {err}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn write_stream_output(
+    stdout: &mut io::Stdout,
+    status: &Option<StreamStatus>,
+    text: &str,
+) -> AppResult<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(status) = status {
+        status
+            .write_output(text)
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}")))?;
+    } else {
+        write!(stdout, "{text}")
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}")))?;
+        stdout
+            .flush()
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}")))?;
+    }
+
+    Ok(())
+}
+
+fn stop_stream_status(status: &mut Option<StreamStatus>) -> AppResult<()> {
+    if let Some(mut status_bar) = status.take() {
+        status_bar.stop().map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to clear status line: {err}"))
+        })?;
+    }
+    Ok(())
 }
 
 fn execute_tool_as_message(
@@ -954,18 +983,17 @@ async fn execute_ask_with_tools(
 ) -> AppResult<AskExecution> {
     let mut prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     prepared.request.tools = tool_definitions();
-    let buffer_tool_execution = should_buffer_tool_execution(&prepared.request);
     let max_rounds = config.tools.max_rounds.unwrap_or(20) as usize;
     let turn_start_index = prepared.request.messages.len().saturating_sub(1);
     let response_result: AppResult<ChatResponse> = async {
         let mut final_response: Option<ChatResponse> = None;
 
         for round in 0..max_rounds {
-            let use_stream = !buffer_tool_execution
-                && should_stream_tool_round(&prepared.request, args.stream, round);
+            let use_stream = should_stream_tool_round(&prepared.request, args.stream, round);
             let mut stdout = io::stdout();
             let collapse = config.defaults.collapse_thinking.unwrap_or(false);
             let mut renderer = StreamRenderer::new(collapse);
+            let mut status = None;
 
             // Status bar on first round
             if round == 0 && use_stream {
@@ -973,30 +1001,22 @@ async fn execute_ask_with_tools(
                     &prepared.request.provider_id,
                     &prepared.request.model_id,
                     &prepared.session_id,
-                );
+                )
+                .map_err(|err| {
+                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                })?;
+                status = Some(StreamStatus::start(StreamPhase::Waiting));
             }
 
             let response = if use_stream {
-                let mut spinner = Some(Spinner::start("waiting"));
                 stream_chat(prepared.request.clone(), |chunk| {
-                    // Stop spinner on first content
-                    if spinner.is_some() {
-                        if let Some(mut s) = spinner.take() {
-                            s.stop();
-                        }
-                    }
                     if !chunk.delta.is_empty() {
                         let rendered = renderer.push(&chunk.delta);
                         for phase in renderer.drain_phase_transitions() {
-                            print_stream_phase(phase);
+                            update_stream_status(&status, phase)?;
                         }
                         if !rendered.is_empty() {
-                            write!(stdout, "{}", rendered).map_err(|err| {
-                                AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                            })?;
-                            stdout.flush().map_err(|err| {
-                                AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
-                            })?;
+                            write_stream_output(&mut stdout, &status, &rendered)?;
                         }
                     }
                     Ok(())
@@ -1010,18 +1030,13 @@ async fn execute_ask_with_tools(
                 if use_stream {
                     let remaining = renderer.flush();
                     for phase in renderer.drain_phase_transitions() {
-                        print_stream_phase(phase);
+                        update_stream_status(&status, phase)?;
                     }
-                    if !remaining.is_empty() {
-                        write!(stdout, "{}", remaining).map_err(|err| {
-                            AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                        })?;
-                    }
+                    write_stream_output(&mut stdout, &status, &remaining)?;
                     if !remaining.is_empty() && !remaining.ends_with('\n') {
-                        writeln!(stdout).map_err(|err| {
-                            AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                        })?;
+                        write_stream_output(&mut stdout, &status, "\n")?;
                     }
+                    stop_stream_status(&mut status)?;
                 } else if args.stream {
                     let rendered = render_markdown(&response.content, collapse);
                     if !rendered.is_empty() {
@@ -1038,18 +1053,13 @@ async fn execute_ask_with_tools(
             if use_stream {
                 let remaining = renderer.flush();
                 for phase in renderer.drain_phase_transitions() {
-                    print_stream_phase(phase);
+                    update_stream_status(&status, phase)?;
                 }
-                if !remaining.is_empty() {
-                    write!(stdout, "{}", remaining).map_err(|err| {
-                        AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                    })?;
-                }
+                write_stream_output(&mut stdout, &status, &remaining)?;
                 if !remaining.is_empty() && !remaining.ends_with('\n') {
-                    writeln!(stdout).map_err(|err| {
-                        AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                    })?;
+                    write_stream_output(&mut stdout, &status, "\n")?;
                 }
+                stop_stream_status(&mut status)?;
             } else if args.stream && !response.content.is_empty() {
                 let rendered = render_markdown(&response.content, collapse);
                 if !rendered.is_empty() {
@@ -1168,38 +1178,28 @@ async fn execute_ask_stream(
             &prepared.request.provider_id,
             &prepared.request.model_id,
             &session_id,
-        );
+        )
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}")))?;
     }
 
     let collapse = config.defaults.collapse_thinking.unwrap_or(false);
     let mut renderer = StreamRenderer::new(collapse);
-    let mut spinner = if format == OutputFormat::Text {
-        Some(Spinner::start("waiting"))
+    let mut status = if format == OutputFormat::Text {
+        Some(StreamStatus::start(StreamPhase::Waiting))
     } else {
         None
     };
 
     let response = match stream_chat(prepared.request.clone(), |chunk| {
-        // Stop spinner on first content
-        if spinner.is_some() {
-            if let Some(mut s) = spinner.take() {
-                s.stop();
-            }
-        }
         match format {
             OutputFormat::Text => {
                 if !chunk.delta.is_empty() {
                     let rendered = renderer.push(&chunk.delta);
                     for phase in renderer.drain_phase_transitions() {
-                        print_stream_phase(phase);
+                        update_stream_status(&status, phase)?;
                     }
                     if !rendered.is_empty() {
-                        write!(stdout, "{}", rendered).map_err(|err| {
-                            AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                        })?;
-                        stdout.flush().map_err(|err| {
-                            AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
-                        })?;
+                        write_stream_output(&mut stdout, &status, &rendered)?;
                     }
                 }
             }
@@ -1239,21 +1239,13 @@ async fn execute_ask_stream(
         OutputFormat::Text => {
             let remaining = renderer.flush();
             for phase in renderer.drain_phase_transitions() {
-                print_stream_phase(phase);
+                update_stream_status(&status, phase)?;
             }
-            if !remaining.is_empty() {
-                write!(stdout, "{}", remaining).map_err(|err| {
-                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                })?;
-            }
+            write_stream_output(&mut stdout, &status, &remaining)?;
             if !remaining.is_empty() && !remaining.ends_with('\n') {
-                writeln!(stdout).map_err(|err| {
-                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                })?;
+                write_stream_output(&mut stdout, &status, "\n")?;
             }
-            stdout.flush().map_err(|err| {
-                AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
-            })?;
+            stop_stream_status(&mut status)?;
         }
         OutputFormat::Ndjson => {
             write_stream_json(
@@ -1699,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_is_buffered_for_openai_claude_models() {
+    fn tool_rounds_stream_when_requested() {
         let request = ChatRequest {
             provider_id: "openclawbs".to_string(),
             provider: ProviderConfig {
@@ -1725,7 +1717,9 @@ mod tests {
             timeout_secs: None,
             tools: Vec::new(),
         };
-        assert!(should_buffer_tool_execution(&request));
+        assert!(should_stream_tool_round(&request, true, 0));
+        assert!(should_stream_tool_round(&request, true, 1));
+        assert!(!should_stream_tool_round(&request, false, 0));
     }
 
     #[test]

@@ -679,9 +679,6 @@ fn resolved_openai_reasoning_effort(request: &ChatRequest) -> Option<String> {
     {
         return None;
     }
-    if request.model.remote_name.starts_with("claude-") {
-        return Some("medium".to_string());
-    }
     None
 }
 
@@ -1464,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn build_openai_body_enables_reasoning_for_claude_reasoning_models() {
+    fn build_openai_body_does_not_infer_reasoning_effort_without_config() {
         let request = ChatRequest {
             provider_id: "openclawbs".to_string(),
             provider: ProviderConfig {
@@ -1497,7 +1494,7 @@ mod tests {
             tools: Vec::new(),
         };
         let body = build_openai_body(&request, false);
-        assert_eq!(body["reasoning_effort"].as_str(), Some("medium"));
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

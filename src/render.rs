@@ -26,6 +26,9 @@ const MAGENTA: &str = "\x1b[35m";
 // ANSI cursor control
 const CLEAR_LINE: &str = "\x1b[2K";
 const CURSOR_UP: &str = "\x1b[A";
+const SAVE_CURSOR: &str = "\x1b7";
+const RESTORE_CURSOR: &str = "\x1b8";
+const DELETE_LINE: &str = "\x1b[M";
 
 /// Path to store the last thinking content.
 pub fn thinking_file_path() -> PathBuf {
@@ -511,6 +514,10 @@ impl LineRenderer {
         result
     }
 
+    fn can_render_partial_inline(&self, partial: &str) -> bool {
+        !self.in_code_block && !self.in_table && !partial.trim_start().starts_with("```")
+    }
+
     fn render_single_line(&self, line: &str) -> String {
         if is_horizontal_rule(line) {
             return format!("{DIM}{}{RESET}\n", "─".repeat(48));
@@ -540,13 +547,15 @@ fn render_thinking_content(content: &str) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamPhase {
+    Waiting,
     Thinking,
     Answering,
 }
 
 impl StreamPhase {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
+            Self::Waiting => "waiting",
             Self::Thinking => "thinking",
             Self::Answering => "answering",
         }
@@ -636,6 +645,7 @@ impl StreamRenderer {
                     self.in_thinking = false;
                     self.thinking_lines_shown = 0;
                     self.thinking_renderer = LineRenderer::default();
+                    self.note_phase(StreamPhase::Answering);
                     // Skip newline right after </think>
                     if self.tag_buffer.starts_with('\n') {
                         self.tag_buffer = self.tag_buffer[1..].to_string();
@@ -663,6 +673,8 @@ impl StreamRenderer {
                         self.thinking_content.push('\n');
                         self.push_thinking_line(&mut output, &line);
                     }
+                    // Don't output partial lines — wait for complete lines
+                    // so markdown markers like **bold** aren't fragmented across chunks
                     break;
                 }
             } else {
@@ -727,6 +739,8 @@ impl StreamRenderer {
                             output.push_str(&rendered);
                         }
                     }
+                    // Don't output partial lines — wait for complete lines
+                    // so markdown markers like **bold** aren't fragmented across chunks
                     break;
                 }
             }
@@ -765,6 +779,7 @@ impl StreamRenderer {
             self.in_thinking = false;
             self.thinking_lines_shown = 0;
             self.thinking_renderer = LineRenderer::default();
+            self.note_phase(StreamPhase::Answering);
         }
 
         // Flush table if pending
@@ -790,6 +805,37 @@ impl StreamRenderer {
     fn push_thinking_line(&mut self, output: &mut String, line: &str) {
         let rendered = self.thinking_renderer.process_line(line);
         self.push_thinking_rendered(output, &rendered);
+    }
+
+    fn push_partial_thinking_inline(&mut self, output: &mut String) {
+        if self.collapse_thinking
+            || self.buffer.is_empty()
+            || !self
+                .thinking_renderer
+                .can_render_partial_inline(&self.buffer)
+        {
+            return;
+        }
+
+        let partial = std::mem::take(&mut self.buffer);
+        self.thinking_content.push_str(&partial);
+        let rendered = render_inline(&partial);
+        if !rendered.is_empty() {
+            output.push_str(&sticky_style(DIM, &rendered));
+        }
+    }
+
+    fn push_partial_normal_inline(&mut self, output: &mut String) {
+        if self.buffer.is_empty() || !self.normal_renderer.can_render_partial_inline(&self.buffer) {
+            return;
+        }
+
+        let partial = std::mem::take(&mut self.buffer);
+        let rendered = render_inline(&partial);
+        if !rendered.is_empty() {
+            self.note_phase(StreamPhase::Answering);
+            output.push_str(&rendered);
+        }
     }
 
     fn flush_thinking_renderer(&mut self) -> String {
@@ -831,74 +877,237 @@ fn could_be_partial_tag(text: &str, tag: &str) -> usize {
     0
 }
 
-// ─── Spinner + Status Bar ───
+// ─── Stream Status Bar ───
 
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const WHITE: &str = "\x1b[37m";
+const BRIGHT_WHITE: &str = "\x1b[97m";
 
-/// Print a status bar line to stderr.
-pub fn print_status_bar(provider: &str, model: &str, session_id: &str) {
+pub fn format_status_bar(provider: &str, model: &str, session_id: &str) -> String {
     let badge = if is_temp_session(session_id) {
         format!("{YELLOW}[temp]{RESET}")
     } else {
         format!("{DIM}[saved]{RESET}")
     };
-    eprintln!(
+    format!(
         "{DIM}{provider}{RESET} {BOLD}{CYAN}{model}{RESET} {badge} {DIM}{}{RESET}",
         short_id(session_id)
-    );
+    )
 }
 
-pub fn print_stream_phase(phase: StreamPhase) {
-    eprintln!("{DIM}{}{RESET}", phase.label());
+/// Print the static message bar shown above streaming output.
+pub fn print_status_bar(provider: &str, model: &str, session_id: &str) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    writeln!(stdout, "{}", format_status_bar(provider, model, session_id))?;
+    stdout.flush()
 }
 
-/// A loading spinner that runs on a background thread.
-/// Call `stop()` when the first token arrives.
-pub struct Spinner {
+#[derive(Debug, Clone, Copy)]
+struct StatusFrame {
+    phase: StreamPhase,
+    tick: usize,
+    inline: bool,
+}
+
+#[derive(Debug)]
+struct StreamStatusState {
+    phase: StreamPhase,
+    tick: usize,
+    has_output: bool,
+}
+
+fn status_frame(state: &StreamStatusState) -> StatusFrame {
+    StatusFrame {
+        phase: state.phase,
+        tick: state.tick,
+        inline: !state.has_output,
+    }
+}
+
+fn animated_phase_label(phase: StreamPhase, tick: usize) -> String {
+    let chars: Vec<char> = phase.label().chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+
+    let lead = tick % chars.len();
+    let trail = if lead == 0 { chars.len() - 1 } else { lead - 1 };
+
+    let mut output = String::new();
+    for (idx, ch) in chars.iter().enumerate() {
+        if idx == lead {
+            output.push_str(BRIGHT_WHITE);
+            output.push_str(BOLD);
+        } else if idx == trail {
+            output.push_str(WHITE);
+        } else {
+            output.push_str(DIM);
+        }
+        output.push(*ch);
+        output.push_str(RESET);
+    }
+
+    output
+}
+
+fn draw_status_footer<W: Write>(writer: &mut W, frame: StatusFrame) -> io::Result<()> {
+    if frame.inline {
+        write!(
+            writer,
+            "{SAVE_CURSOR}\r{CLEAR_LINE}\r{}{RESTORE_CURSOR}",
+            animated_phase_label(frame.phase, frame.tick)
+        )
+    } else {
+        write!(
+            writer,
+            "{SAVE_CURSOR}\r\n{CLEAR_LINE}\r{}{RESTORE_CURSOR}",
+            animated_phase_label(frame.phase, frame.tick)
+        )
+    }
+}
+
+fn clear_status_footer<W: Write>(writer: &mut W, frame: StatusFrame) -> io::Result<()> {
+    if frame.inline {
+        write!(writer, "{SAVE_CURSOR}\r{CLEAR_LINE}\r{RESTORE_CURSOR}")
+    } else {
+        write!(
+            writer,
+            "{SAVE_CURSOR}\r\n{CLEAR_LINE}\r{DELETE_LINE}{RESTORE_CURSOR}"
+        )
+    }
+}
+
+/// Animated footer fixed to the last terminal line while streaming.
+pub struct StreamStatus {
+    state: Arc<Mutex<StreamStatusState>>,
+    write_lock: Arc<Mutex<()>>,
     running: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Spinner {
-    pub fn start(message: &str) -> Self {
+impl StreamStatus {
+    pub fn start(initial_phase: StreamPhase) -> Self {
+        let state = Arc::new(Mutex::new(StreamStatusState {
+            phase: initial_phase,
+            tick: 0,
+            has_output: false,
+        }));
+        let write_lock = Arc::new(Mutex::new(()));
         let running = Arc::new(AtomicBool::new(true));
-        let r = running.clone();
-        let msg = message.to_string();
+        let thread_state = state.clone();
+        let thread_write_lock = write_lock.clone();
+        let thread_running = running.clone();
         let handle = std::thread::spawn(move || {
-            let mut i = 0;
-            let mut stderr = io::stderr();
-            while r.load(Ordering::Relaxed) {
-                let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
-                let _ = write!(stderr, "\r{DIM}{frame} {msg}{RESET}  ");
-                let _ = stderr.flush();
-                i += 1;
-                std::thread::sleep(std::time::Duration::from_millis(80));
+            while thread_running.load(Ordering::Relaxed) {
+                let frame = {
+                    let mut state = thread_state.lock().unwrap();
+                    state.tick = state.tick.wrapping_add(1);
+                    status_frame(&state)
+                };
+
+                // Only draw when inline (no content output yet).
+                // Non-inline footer uses \r\n which breaks with terminal scrolling.
+                if frame.inline {
+                    let _guard = thread_write_lock.lock().unwrap();
+                    let mut stdout = io::stdout();
+                    let _ = draw_status_footer(&mut stdout, frame);
+                    let _ = stdout.flush();
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(90));
             }
-            // Clear spinner line
-            let _ = write!(stderr, "\r{CLEAR_LINE}");
-            let _ = stderr.flush();
         });
-        Self {
+
+        let status = Self {
+            state,
+            write_lock,
             running,
             handle: Some(handle),
+        };
+        let _ = status.redraw();
+        status
+    }
+
+    pub fn set_phase(&self, phase: StreamPhase) -> io::Result<()> {
+        let frame = {
+            let mut state = self.state.lock().unwrap();
+            if state.phase != phase {
+                state.phase = phase;
+                state.tick = 0;
+            }
+            status_frame(&state)
+        };
+        // Only redraw inline; once content is flowing, skip to avoid scroll artifacts
+        if frame.inline {
+            self.redraw_frame(frame)
+        } else {
+            Ok(())
         }
     }
 
-    pub fn stop(&mut self) {
+    pub fn write_output(&self, text: &str) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let previous = self.snapshot();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.has_output = true;
+        }
+
+        let _guard = self.write_lock.lock().unwrap();
+        let mut stdout = io::stdout();
+        // Only clear inline footer; non-inline was never drawn
+        if previous.inline {
+            clear_status_footer(&mut stdout, previous)?;
+        }
+        write!(stdout, "{text}")?;
+        // Don't redraw footer — content itself is the visual feedback
+        stdout.flush()
+    }
+
+    pub fn stop(&mut self) -> io::Result<()> {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        let frame = self.snapshot();
+        // Only clear inline footer; non-inline was never drawn
+        if frame.inline {
+            let _guard = self.write_lock.lock().unwrap();
+            let mut stdout = io::stdout();
+            clear_status_footer(&mut stdout, frame)?;
+            stdout.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn redraw(&self) -> io::Result<()> {
+        self.redraw_frame(self.snapshot())
+    }
+
+    fn redraw_frame(&self, frame: StatusFrame) -> io::Result<()> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut stdout = io::stdout();
+        draw_status_footer(&mut stdout, frame)?;
+        stdout.flush()
+    }
+
+    fn snapshot(&self) -> StatusFrame {
+        let state = self.state.lock().unwrap();
+        status_frame(&state)
     }
 }
 
-impl Drop for Spinner {
+impl Drop for StreamStatus {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -943,5 +1152,54 @@ mod tests {
         assert_eq!(phases, vec![StreamPhase::Thinking, StreamPhase::Answering]);
         assert!(rendered.contains("plan"));
         assert!(!rendered.contains("Thinking"));
+    }
+
+    #[test]
+    fn stream_renderer_buffers_partial_answer_without_newline() {
+        let mut renderer = StreamRenderer::new(false);
+        let rendered = renderer.push("hello");
+        assert!(rendered.is_empty(), "partial line should be buffered");
+        let flushed = renderer.flush();
+        assert!(flushed.contains("hello"), "flush should output buffered content");
+    }
+
+    #[test]
+    fn stream_renderer_buffers_partial_thinking_without_newline() {
+        let mut renderer = StreamRenderer::new(false);
+        let rendered = renderer.push("<think>plan");
+        assert!(rendered.is_empty(), "partial thinking should be buffered");
+        let flushed = renderer.flush();
+        assert!(flushed.contains("plan"), "flush should output thinking content");
+    }
+
+    #[test]
+    fn format_status_bar_marks_temp_and_saved_sessions() {
+        let saved = format_status_bar("deepseek", "deepseek-chat", "sess_01ABCDEF12345678");
+        let temp = format_status_bar("deepseek", "deepseek-chat", "tmp_01ABCDEF12345678");
+        assert!(saved.contains("[saved]"));
+        assert!(temp.contains("[temp]"));
+        assert!(saved.contains("01ABCDEF"));
+        assert!(temp.contains("tmp_01ABCDEF"));
+    }
+
+    #[test]
+    fn animated_phase_label_moves_highlight() {
+        let first = animated_phase_label(StreamPhase::Thinking, 0);
+        let second = animated_phase_label(StreamPhase::Thinking, 1);
+        assert_ne!(first, second);
+        let plain_first = first
+            .replace(BRIGHT_WHITE, "")
+            .replace(WHITE, "")
+            .replace(BOLD, "")
+            .replace(DIM, "")
+            .replace(RESET, "");
+        let plain_second = second
+            .replace(BRIGHT_WHITE, "")
+            .replace(WHITE, "")
+            .replace(BOLD, "")
+            .replace(DIM, "")
+            .replace(RESET, "");
+        assert_eq!(plain_first, "thinking");
+        assert_eq!(plain_second, "thinking");
     }
 }
