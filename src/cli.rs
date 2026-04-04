@@ -79,6 +79,12 @@ pub struct AskArgs {
     #[arg(short = 'a', long = "attach")]
     pub attachments: Vec<PathBuf>,
 
+    #[arg(long = "image")]
+    pub images: Vec<PathBuf>,
+
+    #[arg(long)]
+    pub clipboard_image: bool,
+
     #[arg(long)]
     pub session: Option<String>,
 

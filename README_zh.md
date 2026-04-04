@@ -30,6 +30,12 @@ chat ask "解释这个报错"
 # 管道输入
 git diff | chat ask --stdin -P review
 
+# 指定图片
+chat ask --image screenshot.png "描述这个界面"
+
+# 从剪贴板读取图片
+chat ask --clipboard-image "这张图片里有什么？"
+
 # 查看会话列表
 chat session list
 
@@ -128,11 +134,10 @@ remote_name = "gpt-4o"
 display_name = "GPT-4o"
 context_window = 128000
 
-[model.claude-sonnet-4-6]
-provider = "openclawbs"
-remote_name = "claude-sonnet-4-6"
-capabilities = ["chat", "reasoning"]
-reasoning_effort = "medium"
+[model.qw-coder-model]
+provider = "cpap"
+remote_name = "qw/coder-model"
+capabilities = ["chat", "reasoning", "vision", "image_generation"]
 
 [profile.default]
 provider = "openai"

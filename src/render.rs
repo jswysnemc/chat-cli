@@ -1160,7 +1160,10 @@ mod tests {
         let rendered = renderer.push("hello");
         assert!(rendered.is_empty(), "partial line should be buffered");
         let flushed = renderer.flush();
-        assert!(flushed.contains("hello"), "flush should output buffered content");
+        assert!(
+            flushed.contains("hello"),
+            "flush should output buffered content"
+        );
     }
 
     #[test]
@@ -1169,7 +1172,10 @@ mod tests {
         let rendered = renderer.push("<think>plan");
         assert!(rendered.is_empty(), "partial thinking should be buffered");
         let flushed = renderer.flush();
-        assert!(flushed.contains("plan"), "flush should output thinking content");
+        assert!(
+            flushed.contains("plan"),
+            "flush should output thinking content"
+        );
     }
 
     #[test]

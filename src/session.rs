@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, AppPaths};
 use crate::error::{AppError, AppResult, EXIT_SESSION, ResultCodeExt};
+use crate::media::MessageImage;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -31,6 +32,8 @@ pub struct SessionMeta {
 pub struct SessionMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<MessageImage>,
     pub created_at: String,
 }
 

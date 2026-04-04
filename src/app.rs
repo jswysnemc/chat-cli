@@ -10,6 +10,7 @@ use crate::config::{
 use crate::error::{
     AppError, AppResult, EXIT_ARGS, EXIT_AUTH, EXIT_CONFIG, EXIT_MODEL, EXIT_PROVIDER,
 };
+use crate::media::{MessageImage, read_image_inputs};
 use crate::output::{AskOutput, AssistantMessage, render_ask_output};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, send_chat, stream_chat, test_provider,
@@ -699,6 +700,7 @@ fn execute_tool_as_message(
             Ok(result) => ChatMessage {
                 role: "tool".to_string(),
                 content: result.content,
+                images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id),
                 name: Some(call.name),
@@ -706,6 +708,7 @@ fn execute_tool_as_message(
             Err(err) => ChatMessage {
                 role: "tool".to_string(),
                 content: format!("tool execution error: {}", err.message),
+                images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: Some(call.id),
                 name: Some(call.name),
@@ -714,6 +717,7 @@ fn execute_tool_as_message(
         Err(err) => ChatMessage {
             role: "tool".to_string(),
             content: format!("tool invocation error: {}", err.message),
+            images: Vec::new(),
             tool_calls: None,
             tool_call_id: Some(fallback_id),
             name: Some(fallback_name),
@@ -735,11 +739,12 @@ fn persist_partial_tool_turn(
 
     let events = messages
         .iter()
-        .filter(|message| !message.content.is_empty())
+        .filter(|message| !message.content.is_empty() || !message.images.is_empty())
         .map(|message| {
             SessionEvent::Message(SessionMessage {
                 role: message.role.clone(),
                 content: message.content.clone(),
+                images: message.images.clone(),
                 created_at: now_rfc3339(),
             })
         })
@@ -824,6 +829,8 @@ async fn handle_repl(
                 None
             },
             attachments: Vec::new(),
+            images: Vec::new(),
+            clipboard_image: false,
             session: Some(session_id.clone()),
             new_session: false,
             ephemeral: args.ephemeral,
@@ -924,9 +931,16 @@ struct AskExecution {
 }
 
 #[derive(Clone)]
+struct BuiltInput {
+    prompt: String,
+    images: Vec<MessageImage>,
+}
+
+#[derive(Clone)]
 struct PreparedAsk {
     format: OutputFormat,
     prompt: String,
+    user_images: Vec<MessageImage>,
     session_id: String,
     request: ChatRequest,
 }
@@ -946,6 +960,7 @@ async fn execute_ask(
         config,
         args,
         &prepared.prompt,
+        &prepared.user_images,
         &prepared.session_id,
         &response,
     )?;
@@ -1078,6 +1093,7 @@ async fn execute_ask_with_tools(
             prepared.request.messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: response.content.clone(),
+                images: Vec::new(),
                 tool_calls: Some(response.tool_calls.clone()),
                 tool_call_id: None,
                 name: None,
@@ -1119,6 +1135,7 @@ async fn execute_ask_with_tools(
         config,
         args,
         &prepared.prompt,
+        &prepared.user_images,
         &prepared.session_id,
         &response,
     )?;
@@ -1264,7 +1281,15 @@ async fn execute_ask_stream(
         _ => {}
     }
 
-    persist_session(paths, config, args, &prompt, &session_id, &response)?;
+    persist_session(
+        paths,
+        config,
+        args,
+        &prompt,
+        &prepared.user_images,
+        &session_id,
+        &response,
+    )?;
     Ok(())
 }
 
@@ -1289,7 +1314,7 @@ fn prepare_ask(
         ));
     }
 
-    let prompt = build_prompt(args)?;
+    let input = build_input(args)?;
     let provider_id = cli
         .provider
         .clone()
@@ -1320,7 +1345,6 @@ fn prepare_ask(
             ),
         ));
     }
-
     let mut format = output_override
         .or(cli.output.clone())
         .or_else(|| config.defaults.output.clone())
@@ -1356,12 +1380,13 @@ fn prepare_ask(
     if let Ok(history) = read_events(paths, config, &session_id) {
         for event in history {
             if let SessionEvent::Message(message) = event {
-                if message.content.is_empty() {
+                if message.content.is_empty() && message.images.is_empty() {
                     continue;
                 }
                 messages.push(ChatMessage {
                     role: message.role,
                     content: message.content,
+                    images: message.images,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -1398,6 +1423,7 @@ fn prepare_ask(
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: system,
+                images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1406,11 +1432,31 @@ fn prepare_ask(
     }
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: prompt.clone(),
+        content: input.prompt.clone(),
+        images: input.images.clone(),
         tool_calls: None,
         tool_call_id: None,
         name: None,
     });
+    if messages.iter().any(|message| !message.images.is_empty()) {
+        if !model_supports_capability(model, "vision") {
+            return Err(AppError::new(
+                EXIT_MODEL,
+                format!(
+                    "model `{model_id}` does not support image input; add capability `vision` or select a vision-capable model"
+                ),
+            ));
+        }
+        match provider.kind.as_str() {
+            "openai_compatible" | "anthropic" => {}
+            other => {
+                return Err(AppError::new(
+                    EXIT_PROVIDER,
+                    format!("provider kind `{other}` does not support image input yet"),
+                ));
+            }
+        }
+    }
 
     let temperature = args.temperature.or(model.temperature);
     let max_output_tokens = args.max_output_tokens.or(model.max_output_tokens);
@@ -1419,7 +1465,8 @@ fn prepare_ask(
 
     Ok(PreparedAsk {
         format,
-        prompt,
+        prompt: input.prompt,
+        user_images: input.images,
         session_id,
         request: ChatRequest {
             provider_id,
@@ -1442,6 +1489,7 @@ fn persist_session(
     config: &AppConfig,
     args: &AskArgs,
     prompt: &str,
+    user_images: &[MessageImage],
     session_id: &str,
     response: &ChatResponse,
 ) -> AppResult<()> {
@@ -1453,12 +1501,14 @@ fn persist_session(
     let mut events = vec![SessionEvent::Message(SessionMessage {
         role: "user".to_string(),
         content: prompt.to_string(),
+        images: user_images.to_vec(),
         created_at: now_rfc3339(),
     })];
     if !response.content.is_empty() {
         events.push(SessionEvent::Message(SessionMessage {
             role: "assistant".to_string(),
             content: response.content.clone(),
+            images: Vec::new(),
             created_at: now_rfc3339(),
         }));
     }
@@ -1486,7 +1536,7 @@ fn write_stream_json(stdout: &mut io::Stdout, value: &Value) -> AppResult<()> {
     Ok(())
 }
 
-fn build_prompt(args: &AskArgs) -> AppResult<String> {
+fn build_input(args: &AskArgs) -> AppResult<BuiltInput> {
     let mut parts = Vec::new();
     if let Some(prompt) = &args.prompt {
         parts.push(prompt.clone());
@@ -1510,13 +1560,21 @@ fn build_prompt(args: &AskArgs) -> AppResult<String> {
         })?;
         parts.push(format!("File: {}\n{}", attachment.display(), content));
     }
-    if parts.is_empty() {
+    let images = read_image_inputs(&args.images, args.clipboard_image)?;
+    if parts.is_empty() && images.is_empty() {
         return Err(AppError::new(
             EXIT_ARGS,
-            "chat ask requires PROMPT, --stdin, or --attach",
+            "chat ask requires PROMPT, --stdin, --attach, --image, or --clipboard-image",
         ));
     }
-    Ok(parts.join("\n\n"))
+    Ok(BuiltInput {
+        prompt: parts.join("\n\n"),
+        images,
+    })
+}
+
+fn model_supports_capability(model: &ModelConfig, capability: &str) -> bool {
+    model.capabilities.iter().any(|item| item == capability)
 }
 
 fn resolve_api_key(

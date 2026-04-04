@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod error;
+mod media;
 mod output;
 mod provider;
 mod render;

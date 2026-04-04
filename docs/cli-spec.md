@@ -62,6 +62,8 @@ chat ask [PROMPT]
 - `--stdin`：从 stdin 读取用户输入
 - `-s, --system <TEXT|@FILE>`：系统提示词
 - `-a, --attach <PATH>`：将文件内容注入 prompt，可重复
+- `--image <PATH>`：附加图片输入，可重复
+- `--clipboard-image`：从系统剪贴板读取一张图片
 - `--session <ID>`：切换到指定会话并继续
 - `--new-session`：显式创建新会话
 - `--ephemeral`：生成 `session_id` 但不落盘
@@ -408,11 +410,10 @@ capabilities = ["chat", "json", "reasoning"]
 context_window = 1048576
 max_output_tokens = 32768
 
-[models.claude_sonnet_4_6]
-provider = "openclawbs"
-remote_name = "claude-sonnet-4-6"
-capabilities = ["chat", "reasoning"]
-reasoning_effort = "medium"
+[models.qw_coder_model]
+provider = "cpap"
+remote_name = "qw/coder-model"
+capabilities = ["chat", "reasoning", "vision", "image_generation"]
 
 ```
 

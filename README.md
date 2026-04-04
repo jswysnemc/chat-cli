@@ -53,6 +53,8 @@ chat ask --new-session           # create new session
 chat ask --output json           # JSON output mode
 chat ask --stream                # streaming output
 chat ask --tools                 # enable tool calling
+chat ask --image screenshot.png "Describe this UI"
+chat ask --clipboard-image "What's in the clipboard image?"
 ```
 
 ### `chat repl`
@@ -130,11 +132,10 @@ remote_name = "gpt-4o"
 display_name = "GPT-4o"
 context_window = 128000
 
-[model.claude-sonnet-4-6]
-provider = "openclawbs"
-remote_name = "claude-sonnet-4-6"
-capabilities = ["chat", "reasoning"]
-reasoning_effort = "medium"
+[model.qw-coder-model]
+provider = "cpap"
+remote_name = "qw/coder-model"
+capabilities = ["chat", "reasoning", "vision", "image_generation"]
 
 [profile.default]
 provider = "openai"

@@ -1,5 +1,6 @@
 use crate::config::{ModelConfig, ProviderConfig};
 use crate::error::{AppError, AppResult, EXIT_AUTH, EXIT_NETWORK, EXIT_PROVIDER, EXIT_RATE_LIMIT};
+use crate::media::MessageImage;
 use crate::session::Usage;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -11,6 +12,7 @@ use std::time::Instant;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    pub images: Vec<MessageImage>,
     #[allow(dead_code)]
     pub tool_calls: Option<Vec<Value>>,
     pub tool_call_id: Option<String>,
@@ -626,10 +628,16 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
                                 m.insert("content".to_string(), json!(msg.content));
                             }
                         } else {
-                            m.insert("content".to_string(), json!(msg.content));
+                            m.insert(
+                                "content".to_string(),
+                                build_openai_message_content_value(msg),
+                            );
                         }
                     } else {
-                        m.insert("content".to_string(), json!(msg.content));
+                        m.insert(
+                            "content".to_string(),
+                            build_openai_message_content_value(msg),
+                        );
                     }
                     Value::Object(m)
                 })
@@ -680,6 +688,29 @@ fn resolved_openai_reasoning_effort(request: &ChatRequest) -> Option<String> {
         return None;
     }
     None
+}
+
+fn build_openai_message_content_value(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image.data_url(),
+            }
+        }));
+    }
+    Value::Array(parts)
 }
 
 fn build_anthropic_body(request: &ChatRequest, stream: bool) -> Value {
@@ -746,7 +777,7 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
         } else {
             result.push(json!({
                 "role": message.role,
-                "content": message.content,
+                "content": build_anthropic_message_content_value(message),
             }));
         }
     }
@@ -756,6 +787,31 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
         Some(system_parts.join("\n\n"))
     };
     (system, result)
+}
+
+fn build_anthropic_message_content_value(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data,
+            }
+        }));
+    }
+    Value::Array(parts)
 }
 
 fn build_openai_headers(provider: &ProviderConfig, api_key: &str) -> AppResult<HeaderMap> {
@@ -1483,6 +1539,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1522,6 +1579,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1559,6 +1617,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
+                images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1571,6 +1630,54 @@ mod tests {
         };
         let body = build_openai_body(&request, false);
         assert_eq!(body["reasoning_effort"].as_str(), Some("high"));
+    }
+
+    #[test]
+    fn build_openai_body_serializes_image_parts_for_user_messages() {
+        let request = ChatRequest {
+            provider_id: "cpap".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "qw-coder-model".to_string(),
+            model: ModelConfig {
+                provider: "cpap".to_string(),
+                remote_name: "qw/coder-model".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "vision".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "describe".to_string(),
+                images: vec![MessageImage {
+                    media_type: "image/png".to_string(),
+                    data: "YWJj".to_string(),
+                }],
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+        let body = build_openai_body(&request, false);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
+        assert_eq!(content[0]["text"].as_str(), Some("describe"));
+        assert_eq!(content[1]["type"].as_str(), Some("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"].as_str(),
+            Some("data:image/png;base64,YWJj")
+        );
     }
 
     #[test]
