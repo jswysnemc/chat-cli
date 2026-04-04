@@ -599,6 +599,7 @@ async fn send_request_with_retry(
 }
 
 fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
+    let messages = patched_messages(request);
     let mut body = Map::new();
     body.insert(
         "model".to_string(),
@@ -607,8 +608,7 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
     body.insert(
         "messages".to_string(),
         Value::Array(
-            request
-                .messages
+            messages
                 .iter()
                 .map(|msg| {
                     let mut m = Map::new();
@@ -714,6 +714,7 @@ fn build_openai_message_content_value(message: &ChatMessage) -> Value {
 }
 
 fn build_anthropic_body(request: &ChatRequest, stream: bool) -> Value {
+    let messages = patched_messages(request);
     let mut body = Map::new();
     body.insert(
         "model".to_string(),
@@ -723,7 +724,7 @@ fn build_anthropic_body(request: &ChatRequest, stream: bool) -> Value {
         "max_tokens".to_string(),
         json!(request.max_output_tokens.unwrap_or(1024)),
     );
-    let (system, messages) = split_system_messages(&request.messages);
+    let (system, messages) = split_system_messages(&messages);
     if let Some(system) = system {
         body.insert("system".to_string(), Value::String(system));
     }
@@ -741,6 +742,7 @@ fn build_anthropic_body(request: &ChatRequest, stream: bool) -> Value {
 }
 
 fn build_ollama_body(request: &ChatRequest, stream: bool) -> Value {
+    let messages = patched_messages(request);
     let mut body = Map::new();
     body.insert(
         "model".to_string(),
@@ -749,8 +751,7 @@ fn build_ollama_body(request: &ChatRequest, stream: bool) -> Value {
     body.insert(
         "messages".to_string(),
         Value::Array(
-            request
-                .messages
+            messages
                 .iter()
                 .map(|msg| json!({ "role": msg.role, "content": msg.content }))
                 .collect(),
@@ -766,6 +767,18 @@ fn build_ollama_body(request: &ChatRequest, stream: bool) -> Value {
         body.insert(key.clone(), value.clone());
     }
     Value::Object(body)
+}
+
+fn patched_messages(request: &ChatRequest) -> Vec<ChatMessage> {
+    let mut messages = request.messages.clone();
+    if request.model.patches.system_to_user.unwrap_or(false) {
+        for message in &mut messages {
+            if message.role == "system" {
+                message.role = "user".to_string();
+            }
+        }
+    }
+    messages
 }
 
 fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
@@ -1431,6 +1444,7 @@ fn map_http_error(status: u16, text: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelPatchConfig;
 
     #[test]
     fn sse_parser_handles_chunk_boundaries() {
@@ -1534,6 +1548,7 @@ mod tests {
                 capabilities: vec!["chat".to_string(), "reasoning".to_string()],
                 temperature: None,
                 reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
             },
             api_key: String::new(),
             messages: vec![ChatMessage {
@@ -1574,6 +1589,7 @@ mod tests {
                 capabilities: vec!["reasoning".to_string()],
                 temperature: None,
                 reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
             },
             api_key: String::new(),
             messages: vec![ChatMessage {
@@ -1612,6 +1628,7 @@ mod tests {
                 capabilities: vec!["reasoning".to_string()],
                 temperature: None,
                 reasoning_effort: Some("high".to_string()),
+                patches: ModelPatchConfig::default(),
             },
             api_key: String::new(),
             messages: vec![ChatMessage {
@@ -1650,6 +1667,7 @@ mod tests {
                 capabilities: vec!["chat".to_string(), "vision".to_string()],
                 temperature: None,
                 reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
             },
             api_key: String::new(),
             messages: vec![ChatMessage {
@@ -1677,6 +1695,61 @@ mod tests {
         assert_eq!(
             content[1]["image_url"]["url"].as_str(),
             Some("data:image/png;base64,YWJj")
+        );
+    }
+
+    #[test]
+    fn build_openai_body_applies_system_to_user_patch() {
+        let request = ChatRequest {
+            provider_id: "cpap".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "team-gpt-5-4".to_string(),
+            model: ModelConfig {
+                provider: "cpap".to_string(),
+                remote_name: "team/gpt-5.4".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig {
+                    system_to_user: Some(true),
+                },
+            },
+            api_key: String::new(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "follow the rules".to_string(),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+        let body = build_openai_body(&request, false);
+        assert_eq!(body["messages"][0]["role"].as_str(), Some("user"));
+        assert_eq!(
+            body["messages"][0]["content"].as_str(),
+            Some("follow the rules")
         );
     }
 

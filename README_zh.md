@@ -31,10 +31,10 @@ chat ask "解释这个报错"
 git diff | chat ask --stdin -P review
 
 # 指定图片
-chat ask --image screenshot.png "描述这个界面"
+chat ask -i screenshot.png "描述这个界面"
 
 # 从剪贴板读取图片
-chat ask --clipboard-image "这张图片里有什么？"
+chat ask -I "这张图片里有什么？"
 
 # 查看会话列表
 chat session list
@@ -138,6 +138,14 @@ context_window = 128000
 provider = "cpap"
 remote_name = "qw/coder-model"
 capabilities = ["chat", "reasoning", "vision", "image_generation"]
+
+[model.team-gpt-5-4]
+provider = "cpap"
+remote_name = "team/gpt-5.4"
+capabilities = ["chat", "reasoning", "vision"]
+
+[model.team-gpt-5-4.patches]
+system_to_user = true
 
 [profile.default]
 provider = "openai"

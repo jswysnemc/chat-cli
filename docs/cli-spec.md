@@ -62,8 +62,8 @@ chat ask [PROMPT]
 - `--stdin`：从 stdin 读取用户输入
 - `-s, --system <TEXT|@FILE>`：系统提示词
 - `-a, --attach <PATH>`：将文件内容注入 prompt，可重复
-- `--image <PATH>`：附加图片输入，可重复
-- `--clipboard-image`：从系统剪贴板读取一张图片
+- `-i, --image <PATH>`：附加图片输入，可重复
+- `-I, --clipboard-image`：从系统剪贴板读取一张图片
 - `--session <ID>`：切换到指定会话并继续
 - `--new-session`：显式创建新会话
 - `--ephemeral`：生成 `session_id` 但不落盘
@@ -223,6 +223,7 @@ chat config model set <ID> --provider <PROVIDER_ID> --remote-name <NAME> [OPTION
 - `--capability <chat|vision|json|tools|reasoning>`：可重复
 - `--temperature <FLOAT>`：默认参数
 - `--reasoning-effort <low|medium|high>`：模型默认思考等级
+- `--patch-system-to-user`：请求前把 `system` 消息改写为 `user`
 
 这里的 `Model` 是本地注册项，允许给远端模型起稳定别名。
 `set` 为 upsert 语义。
@@ -414,6 +415,14 @@ max_output_tokens = 32768
 provider = "cpap"
 remote_name = "qw/coder-model"
 capabilities = ["chat", "reasoning", "vision", "image_generation"]
+
+[models.team_gpt_5_4]
+provider = "cpap"
+remote_name = "team/gpt-5.4"
+capabilities = ["chat", "reasoning", "vision"]
+
+[models.team_gpt_5_4.patches]
+system_to_user = true
 
 ```
 

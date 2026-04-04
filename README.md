@@ -53,8 +53,8 @@ chat ask --new-session           # create new session
 chat ask --output json           # JSON output mode
 chat ask --stream                # streaming output
 chat ask --tools                 # enable tool calling
-chat ask --image screenshot.png "Describe this UI"
-chat ask --clipboard-image "What's in the clipboard image?"
+chat ask -i screenshot.png "Describe this UI"
+chat ask -I "What's in the clipboard image?"
 ```
 
 ### `chat repl`
@@ -136,6 +136,14 @@ context_window = 128000
 provider = "cpap"
 remote_name = "qw/coder-model"
 capabilities = ["chat", "reasoning", "vision", "image_generation"]
+
+[model.team-gpt-5-4]
+provider = "cpap"
+remote_name = "team/gpt-5.4"
+capabilities = ["chat", "reasoning", "vision"]
+
+[model.team-gpt-5-4.patches]
+system_to_user = true
 
 [profile.default]
 provider = "openai"

@@ -3,9 +3,10 @@ use crate::cli::{
     OutputFormat, ProviderCommand, ReplArgs, SessionCommand,
 };
 use crate::config::{
-    AppConfig, AppPaths, ModelConfig, ProviderConfig, ProviderSecret, SecretsConfig, ensure_dirs,
-    init_config_files, load_config, load_secrets, parse_headers, read_system_prompt,
-    render_config_value, save_config, save_secrets, set_config_value, validate_config,
+    AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderSecret,
+    SecretsConfig, ensure_dirs, init_config_files, load_config, load_secrets, parse_headers,
+    read_system_prompt, render_config_value, save_config, save_secrets, set_config_value,
+    validate_config,
 };
 use crate::error::{
     AppError, AppResult, EXIT_ARGS, EXIT_AUTH, EXIT_CONFIG, EXIT_MODEL, EXIT_PROVIDER,
@@ -226,6 +227,7 @@ fn handle_model_command(
             capabilities,
             temperature,
             reasoning_effort,
+            patch_system_to_user,
         }) => {
             if !config.providers.contains_key(&provider) {
                 return Err(AppError::new(
@@ -244,6 +246,9 @@ fn handle_model_command(
                     capabilities,
                     temperature,
                     reasoning_effort,
+                    patches: ModelPatchConfig {
+                        system_to_user: patch_system_to_user.then_some(true),
+                    },
                 },
             );
             save_config(paths, config)?;
@@ -730,6 +735,7 @@ fn persist_partial_tool_turn(
     config: &AppConfig,
     args: &AskArgs,
     session_id: &str,
+    session_preamble: &[ChatMessage],
     messages: &[ChatMessage],
 ) -> AppResult<()> {
     let auto_save = config.defaults.auto_save_session.unwrap_or(true);
@@ -737,8 +743,9 @@ fn persist_partial_tool_turn(
         return Ok(());
     }
 
-    let events = messages
+    let events = session_preamble
         .iter()
+        .chain(messages.iter())
         .filter(|message| !message.content.is_empty() || !message.images.is_empty())
         .map(|message| {
             SessionEvent::Message(SessionMessage {
@@ -942,6 +949,7 @@ struct PreparedAsk {
     prompt: String,
     user_images: Vec<MessageImage>,
     session_id: String,
+    session_preamble: Vec<ChatMessage>,
     request: ChatRequest,
 }
 
@@ -959,6 +967,7 @@ async fn execute_ask(
         paths,
         config,
         args,
+        &prepared.session_preamble,
         &prepared.prompt,
         &prepared.user_images,
         &prepared.session_id,
@@ -1124,6 +1133,7 @@ async fn execute_ask_with_tools(
                 config,
                 args,
                 &prepared.session_id,
+                &prepared.session_preamble,
                 &prepared.request.messages[turn_start_index..],
             )?;
             return Err(err);
@@ -1134,6 +1144,7 @@ async fn execute_ask_with_tools(
         paths,
         config,
         args,
+        &prepared.session_preamble,
         &prepared.prompt,
         &prepared.user_images,
         &prepared.session_id,
@@ -1285,6 +1296,7 @@ async fn execute_ask_stream(
         paths,
         config,
         args,
+        &prepared.session_preamble,
         &prompt,
         &prepared.user_images,
         &session_id,
@@ -1377,6 +1389,7 @@ fn prepare_ask(
         args.ephemeral,
     )?;
     let mut messages = Vec::new();
+    let mut session_preamble = Vec::new();
     if let Ok(history) = read_events(paths, config, &session_id) {
         for event in history {
             if let SessionEvent::Message(message) = event {
@@ -1420,14 +1433,16 @@ fn prepare_ask(
         };
 
         if let Some(system) = final_system {
-            messages.push(ChatMessage {
+            let system_message = ChatMessage {
                 role: "system".to_string(),
                 content: system,
                 images: Vec::new(),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-            });
+            };
+            session_preamble.push(system_message.clone());
+            messages.push(system_message);
         }
     }
     messages.push(ChatMessage {
@@ -1468,6 +1483,7 @@ fn prepare_ask(
         prompt: input.prompt,
         user_images: input.images,
         session_id,
+        session_preamble,
         request: ChatRequest {
             provider_id,
             provider: provider.clone(),
@@ -1488,6 +1504,7 @@ fn persist_session(
     paths: &AppPaths,
     config: &AppConfig,
     args: &AskArgs,
+    session_preamble: &[ChatMessage],
     prompt: &str,
     user_images: &[MessageImage],
     session_id: &str,
@@ -1498,12 +1515,24 @@ fn persist_session(
         return Ok(());
     }
 
-    let mut events = vec![SessionEvent::Message(SessionMessage {
+    let mut events = session_preamble
+        .iter()
+        .filter(|message| !message.content.is_empty() || !message.images.is_empty())
+        .map(|message| {
+            SessionEvent::Message(SessionMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+                images: message.images.clone(),
+                created_at: now_rfc3339(),
+            })
+        })
+        .collect::<Vec<_>>();
+    events.push(SessionEvent::Message(SessionMessage {
         role: "user".to_string(),
         content: prompt.to_string(),
         images: user_images.to_vec(),
         created_at: now_rfc3339(),
-    })];
+    }));
     if !response.content.is_empty() {
         events.push(SessionEvent::Message(SessionMessage {
             role: "assistant".to_string(),
@@ -1700,6 +1729,82 @@ fn read_stdin_all() -> AppResult<String> {
 mod tests {
     use super::*;
     use crate::session::Usage;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn test_paths() -> (AppPaths, PathBuf) {
+        let base = std::env::temp_dir().join(format!("chat-cli-test-{}", ulid::Ulid::new()));
+        let config_dir = base.join("config");
+        let data_dir = base.join("data");
+        let paths = AppPaths::from_overrides(Some(config_dir), Some(data_dir)).unwrap();
+        (paths, base)
+    }
+
+    fn test_cli() -> Cli {
+        Cli {
+            provider: Some("cpap".to_string()),
+            model: Some("team-gpt-5-4".to_string()),
+            mode: "auto".to_string(),
+            output: None,
+            config_dir: None,
+            data_dir: None,
+            no_color: false,
+            verbose: false,
+            quiet: false,
+            command: Commands::Thinking,
+        }
+    }
+
+    fn test_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.providers.insert(
+            "cpap".to_string(),
+            ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+        );
+        config.models.insert(
+            "team-gpt-5-4".to_string(),
+            ModelConfig {
+                provider: "cpap".to_string(),
+                remote_name: "team/gpt-5.4".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig {
+                    system_to_user: Some(true),
+                },
+            },
+        );
+        config
+    }
+
+    fn ask_args(prompt: &str) -> AskArgs {
+        AskArgs {
+            prompt: Some(prompt.to_string()),
+            stdin: false,
+            system: None,
+            attachments: Vec::new(),
+            images: Vec::new(),
+            clipboard_image: false,
+            session: None,
+            new_session: false,
+            ephemeral: false,
+            temp: false,
+            tools: false,
+            yes: false,
+            stream: false,
+            temperature: None,
+            max_output_tokens: None,
+            params: Vec::new(),
+            timeout: None,
+            raw_provider_response: false,
+        }
+    }
 
     #[test]
     fn requested_session_id_prefers_temp_over_new_session() {
@@ -1718,6 +1823,7 @@ mod tests {
             capabilities: Vec::new(),
             temperature: None,
             reasoning_effort: None,
+            patches: ModelPatchConfig::default(),
         };
         assert_eq!(format_model_list_entry(&model), "minimax/MiniMax-M2.7");
     }
@@ -1766,6 +1872,7 @@ mod tests {
                 capabilities: vec!["reasoning".to_string()],
                 temperature: None,
                 reasoning_effort: Some("medium".to_string()),
+                patches: ModelPatchConfig::default(),
             },
             api_key: String::new(),
             messages: Vec::new(),
@@ -1809,5 +1916,76 @@ mod tests {
         assert_eq!(message.role, "tool");
         assert_eq!(message.tool_call_id.as_deref(), Some("call_bad"));
         assert!(message.content.contains("tool invocation error:"));
+    }
+
+    #[test]
+    fn prepare_ask_reuses_persisted_system_prompt_across_turns() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+
+        let mut first_args = ask_args("第一条消息是啥");
+        first_args.system = Some("回答时保持简洁".to_string());
+        first_args.new_session = true;
+
+        let first = prepare_ask(&cli, &paths, &config, &secrets, &first_args, None).unwrap();
+        assert_eq!(first.session_preamble.len(), 1);
+        assert_eq!(first.request.messages[0].role, "system");
+        assert_eq!(first.request.messages[0].content, "回答时保持简洁");
+
+        let response = ChatResponse {
+            provider_id: "cpap".to_string(),
+            model_id: "team-gpt-5-4".to_string(),
+            content: "第一条消息是用户问题。".to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+        persist_session(
+            &paths,
+            &config,
+            &first_args,
+            &first.session_preamble,
+            &first.prompt,
+            &first.user_images,
+            &first.session_id,
+            &response,
+        )
+        .unwrap();
+
+        let stored_events = read_events(&paths, &config, &first.session_id).unwrap();
+        let stored_roles = stored_events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Message(message) => Some(message.role.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stored_roles, vec!["system", "user", "assistant"]);
+
+        let mut second_args = ask_args("再说一遍");
+        second_args.session = Some(first.session_id.clone());
+        let second = prepare_ask(&cli, &paths, &config, &secrets, &second_args, None).unwrap();
+
+        let second_roles = second
+            .request
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(second_roles, vec!["system", "user", "assistant", "user"]);
+        assert_eq!(second.request.messages[0].content, "回答时保持简洁");
+        assert!(second.session_preamble.is_empty());
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 }

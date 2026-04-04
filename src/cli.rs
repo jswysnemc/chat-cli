@@ -79,10 +79,10 @@ pub struct AskArgs {
     #[arg(short = 'a', long = "attach")]
     pub attachments: Vec<PathBuf>,
 
-    #[arg(long = "image")]
+    #[arg(short = 'i', long = "image")]
     pub images: Vec<PathBuf>,
 
-    #[arg(long)]
+    #[arg(short = 'I', long)]
     pub clipboard_image: bool,
 
     #[arg(long)]
@@ -289,6 +289,9 @@ pub struct ModelSetArgs {
 
     #[arg(long)]
     pub reasoning_effort: Option<String>,
+
+    #[arg(long)]
+    pub patch_system_to_user: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -310,4 +313,38 @@ pub struct AuthSetArgs {
 
     #[arg(long)]
     pub env: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn ask_parses_image_short_flags() {
+        let cli = Cli::try_parse_from([
+            "chat",
+            "ask",
+            "-i",
+            "first.png",
+            "-i",
+            "second.jpg",
+            "-I",
+            "describe",
+        ])
+        .expect("cli should parse image short flags");
+
+        match cli.command {
+            Commands::Ask(args) => {
+                assert_eq!(
+                    args.images,
+                    vec![PathBuf::from("first.png"), PathBuf::from("second.jpg")]
+                );
+                assert!(args.clipboard_image);
+                assert_eq!(args.prompt.as_deref(), Some("describe"));
+            }
+            other => panic!("expected ask command, got {other:?}"),
+        }
+    }
 }

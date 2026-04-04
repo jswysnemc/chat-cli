@@ -179,6 +179,17 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelPatchConfig {
+    pub system_to_user: Option<bool>,
+}
+
+impl ModelPatchConfig {
+    fn is_empty(&self) -> bool {
+        self.system_to_user.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelConfig {
     pub provider: String,
     pub remote_name: String,
@@ -189,6 +200,8 @@ pub struct ModelConfig {
     pub capabilities: Vec<String>,
     pub temperature: Option<f64>,
     pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "ModelPatchConfig::is_empty")]
+    pub patches: ModelPatchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
