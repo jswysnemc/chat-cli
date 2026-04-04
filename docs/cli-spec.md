@@ -220,6 +220,7 @@ chat config model set <ID> --provider <PROVIDER_ID> --remote-name <NAME> [OPTION
 - `--max-output-tokens <N>`
 - `--capability <chat|vision|json|tools|reasoning>`：可重复
 - `--temperature <FLOAT>`：默认参数
+- `--reasoning-effort <low|medium|high>`：模型默认思考等级
 
 这里的 `Model` 是本地注册项，允许给远端模型起稳定别名。
 `set` 为 upsert 语义。
@@ -393,6 +394,12 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 default_model = "gpt4"
 
+[tools]
+max_rounds = 20
+
+[skills]
+paths = [".claude/skills", "~/.claude/skills"]
+
 [models.gpt4]
 provider = "openai"
 remote_name = "gpt-4.1"
@@ -400,6 +407,12 @@ display_name = "GPT-4.1"
 capabilities = ["chat", "json", "reasoning"]
 context_window = 1048576
 max_output_tokens = 32768
+
+[models.claude_sonnet_4_6]
+provider = "openclawbs"
+remote_name = "claude-sonnet-4-6"
+capabilities = ["chat", "reasoning"]
+reasoning_effort = "medium"
 
 ```
 

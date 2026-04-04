@@ -64,6 +64,10 @@ pub struct AppConfig {
     pub defaults: DefaultsConfig,
     #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -77,6 +81,8 @@ impl Default for AppConfig {
         Self {
             defaults: DefaultsConfig::default(),
             session: SessionConfig::default(),
+            tools: ToolsConfig::default(),
+            skills: SkillsConfig::default(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
             profiles: BTreeMap::new(),
@@ -132,6 +138,33 @@ impl Default for SessionConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolsConfig {
+    pub max_rounds: Option<u32>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: Some(20),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            paths: vec![".claude/skills".to_string(), "~/.claude/skills".to_string()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     pub kind: String,
@@ -155,6 +188,7 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
     pub temperature: Option<f64>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -320,6 +354,10 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .clone()
             .unwrap_or_else(|| "jsonl".to_string())),
         "session.dir" => Ok(config.session.dir.clone().unwrap_or_default()),
+        "tools.max_rounds" => Ok(config.tools.max_rounds.unwrap_or(20).to_string()),
+        "skills.paths" => serde_json::to_string(&config.skills.paths).map_err(|err| {
+            AppError::new(EXIT_CONFIG, format!("failed to render skills.paths: {err}"))
+        }),
         _ => Err(AppError::new(
             EXIT_CONFIG,
             format!("unsupported config key `{key}`"),
@@ -363,6 +401,12 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         }
         "session.store_format" => config.session.store_format = Some(value.to_string()),
         "session.dir" => config.session.dir = Some(value.to_string()),
+        "tools.max_rounds" => {
+            config.tools.max_rounds = Some(parse_u32(value, "tools.max_rounds")?);
+        }
+        "skills.paths" => {
+            config.skills.paths = parse_string_array(value, "skills.paths")?;
+        }
         _ => {
             return Err(AppError::new(
                 EXIT_CONFIG,
@@ -432,6 +476,57 @@ fn parse_bool(value: &str) -> AppResult<bool> {
             EXIT_CONFIG,
             format!("invalid boolean value `{value}`"),
         )),
+    }
+}
+
+fn parse_u32(value: &str, key: &str) -> AppResult<u32> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| AppError::new(EXIT_CONFIG, format!("{key} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(AppError::new(
+            EXIT_CONFIG,
+            format!("{key} must be greater than 0"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_string_array(value: &str, key: &str) -> AppResult<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(value).map_err(|err| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!("{key} must be a JSON string array: {err}"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_skills_paths_are_populated() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.skills.paths,
+            vec![".claude/skills", "~/.claude/skills"]
+        );
+        assert_eq!(config.tools.max_rounds, Some(20));
+    }
+
+    #[test]
+    fn set_config_value_parses_skills_paths_array() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "skills.paths", "[\"a\",\"b\"]").unwrap();
+        assert_eq!(config.skills.paths, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn set_config_value_parses_tools_max_rounds() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "tools.max_rounds", "12").unwrap();
+        assert_eq!(config.tools.max_rounds, Some(12));
     }
 }
 

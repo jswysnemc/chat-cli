@@ -142,12 +142,8 @@ pub async fn test_provider(
 }
 
 async fn execute_healthcheck(request: reqwest::RequestBuilder, provider_id: &str) -> AppResult<()> {
-    let response = request.send().await.map_err(|err| {
-        AppError::new(
-            EXIT_NETWORK,
-            format!("provider `{provider_id}` request failed: {err}"),
-        )
-    })?;
+    let response =
+        send_request_with_retry(request, format!("provider `{provider_id}` request")).await?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -165,13 +161,11 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
     let body = build_openai_body(&request, false);
 
     let started = Instant::now();
-    let response = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| AppError::new(EXIT_NETWORK, format!("chat request failed: {err}")))?;
+    let response = send_request_with_retry(
+        client.post(url).headers(headers).json(&body),
+        "chat request".to_string(),
+    )
+    .await?;
     let status = response.status();
     let text = response.text().await.map_err(|err| {
         AppError::new(
@@ -232,13 +226,11 @@ where
     let body = build_openai_body(&request, true);
 
     let started = Instant::now();
-    let mut response = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| AppError::new(EXIT_NETWORK, format!("chat request failed: {err}")))?;
+    let mut response = send_request_with_retry(
+        client.post(url).headers(headers).json(&body),
+        "chat request".to_string(),
+    )
+    .await?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -323,13 +315,11 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
     let body = build_anthropic_body(&request, false);
 
     let started = Instant::now();
-    let response = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| AppError::new(EXIT_NETWORK, format!("chat request failed: {err}")))?;
+    let response = send_request_with_retry(
+        client.post(url).headers(headers).json(&body),
+        "chat request".to_string(),
+    )
+    .await?;
     let status = response.status();
     let text = response.text().await.map_err(|err| {
         AppError::new(
@@ -387,13 +377,11 @@ where
     let body = build_anthropic_body(&request, true);
 
     let started = Instant::now();
-    let mut response = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| AppError::new(EXIT_NETWORK, format!("chat request failed: {err}")))?;
+    let mut response = send_request_with_retry(
+        client.post(url).headers(headers).json(&body),
+        "chat request".to_string(),
+    )
+    .await?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -461,13 +449,11 @@ async fn send_ollama(request: ChatRequest) -> AppResult<ChatResponse> {
     let body = build_ollama_body(&request, false);
 
     let started = Instant::now();
-    let response = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| AppError::new(EXIT_NETWORK, format!("chat request failed: {err}")))?;
+    let response = send_request_with_retry(
+        client.post(url).headers(headers).json(&body),
+        "chat request".to_string(),
+    )
+    .await?;
     let status = response.status();
     let text = response.text().await.map_err(|err| {
         AppError::new(
@@ -514,13 +500,11 @@ where
     let body = build_ollama_body(&request, true);
 
     let started = Instant::now();
-    let mut response = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|err| AppError::new(EXIT_NETWORK, format!("chat request failed: {err}")))?;
+    let mut response = send_request_with_retry(
+        client.post(url).headers(headers).json(&body),
+        "chat request".to_string(),
+    )
+    .await?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -588,6 +572,30 @@ fn build_client(timeout_secs: Option<u64>) -> AppResult<reqwest::Client> {
         .map_err(|err| AppError::new(EXIT_NETWORK, format!("failed to build HTTP client: {err}")))
 }
 
+async fn send_request_with_retry(
+    request: reqwest::RequestBuilder,
+    context: String,
+) -> AppResult<reqwest::Response> {
+    let retry_request = request.try_clone();
+    match request.send().await {
+        Ok(response) => Ok(response),
+        Err(first_err) => {
+            let Some(retry_request) = retry_request else {
+                return Err(AppError::new(
+                    EXIT_NETWORK,
+                    format!("{context} failed: {first_err}"),
+                ));
+            };
+            retry_request.send().await.map_err(|retry_err| {
+                AppError::new(
+                    EXIT_NETWORK,
+                    format!("{context} failed after retry: {retry_err}"),
+                )
+            })
+        }
+    }
+}
+
 fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
     let mut body = Map::new();
     body.insert(
@@ -644,10 +652,37 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
     if let Some(max_tokens) = request.max_output_tokens {
         body.insert("max_tokens".to_string(), json!(max_tokens));
     }
+    if let Some(reasoning_effort) = resolved_openai_reasoning_effort(request) {
+        body.insert("reasoning_effort".to_string(), json!(reasoning_effort));
+    }
     for (key, value) in &request.params {
         body.insert(key.clone(), value.clone());
     }
     Value::Object(body)
+}
+
+fn resolved_openai_reasoning_effort(request: &ChatRequest) -> Option<String> {
+    if request.params.contains_key("reasoning_effort") || request.params.contains_key("thinking") {
+        return None;
+    }
+    if let Some(reasoning_effort) = request.model.reasoning_effort.clone() {
+        let trimmed = reasoning_effort.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if !request
+        .model
+        .capabilities
+        .iter()
+        .any(|capability| capability == "reasoning")
+    {
+        return None;
+    }
+    if request.model.remote_name.starts_with("claude-") {
+        return Some("medium".to_string());
+    }
+    None
 }
 
 fn build_anthropic_body(request: &ChatRequest, stream: bool) -> Value {
@@ -1426,6 +1461,119 @@ mod tests {
         let answer = decorate_openai_stream_delta(&mut in_reasoning, "", "最终答案", None);
         assert_eq!(answer, "</think>\n\n最终答案");
         assert!(!in_reasoning);
+    }
+
+    #[test]
+    fn build_openai_body_enables_reasoning_for_claude_reasoning_models() {
+        let request = ChatRequest {
+            provider_id: "openclawbs".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-sonnet-4-6".to_string(),
+            model: ModelConfig {
+                provider: "openclawbs".to_string(),
+                remote_name: "claude-sonnet-4-6".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+        let body = build_openai_body(&request, false);
+        assert_eq!(body["reasoning_effort"].as_str(), Some("medium"));
+    }
+
+    #[test]
+    fn build_openai_body_respects_explicit_reasoning_effort_param() {
+        let mut params = BTreeMap::new();
+        params.insert("reasoning_effort".to_string(), json!("high"));
+        let request = ChatRequest {
+            provider_id: "openclawbs".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-sonnet-4-6".to_string(),
+            model: ModelConfig {
+                provider: "openclawbs".to_string(),
+                remote_name: "claude-sonnet-4-6".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params,
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+        let body = build_openai_body(&request, false);
+        assert_eq!(body["reasoning_effort"].as_str(), Some("high"));
+    }
+
+    #[test]
+    fn build_openai_body_uses_model_reasoning_effort_from_config() {
+        let request = ChatRequest {
+            provider_id: "openclawbs".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-sonnet-4-6".to_string(),
+            model: ModelConfig {
+                provider: "openclawbs".to_string(),
+                remote_name: "claude-sonnet-4-6".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("high".to_string()),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+        let body = build_openai_body(&request, false);
+        assert_eq!(body["reasoning_effort"].as_str(), Some("high"));
     }
 
     #[test]

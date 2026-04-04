@@ -280,6 +280,9 @@ pub struct ModelSetArgs {
 
     #[arg(long)]
     pub temperature: Option<f64>,
+
+    #[arg(long)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]

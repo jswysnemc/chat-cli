@@ -226,6 +226,7 @@ fn handle_model_command(
             max_output_tokens,
             capabilities,
             temperature,
+            reasoning_effort,
         }) => {
             if !config.providers.contains_key(&provider) {
                 return Err(AppError::new(
@@ -243,6 +244,7 @@ fn handle_model_command(
                     max_output_tokens,
                     capabilities,
                     temperature,
+                    reasoning_effort,
                 },
             );
             save_config(paths, config)?;
@@ -634,6 +636,93 @@ fn format_final_ask_output(
     render_ask_output(result.format.clone(), &result.output, raw_provider_response)
 }
 
+fn should_stream_tool_round(request: &ChatRequest, requested_stream: bool, round: usize) -> bool {
+    if !requested_stream {
+        return false;
+    }
+    if round == 0 {
+        return true;
+    }
+    !(request.provider.kind == "openai_compatible"
+        && request.model.remote_name.starts_with("claude-"))
+}
+
+fn should_buffer_tool_execution(request: &ChatRequest) -> bool {
+    request.provider.kind == "openai_compatible" && request.model.remote_name.starts_with("claude-")
+}
+
+fn execute_tool_as_message(
+    raw_call: &Value,
+    auto_confirm: bool,
+    config: &AppConfig,
+) -> ChatMessage {
+    let fallback_id = raw_call["id"]
+        .as_str()
+        .unwrap_or("invalid_tool_call")
+        .to_string();
+    let fallback_name = raw_call["function"]["name"]
+        .as_str()
+        .unwrap_or("unknown_tool")
+        .to_string();
+
+    match parse_tool_call(raw_call) {
+        Ok(call) => match execute_tool(&call, auto_confirm, config) {
+            Ok(result) => ChatMessage {
+                role: "tool".to_string(),
+                content: result.content,
+                tool_calls: None,
+                tool_call_id: Some(result.tool_call_id),
+                name: Some(call.name),
+            },
+            Err(err) => ChatMessage {
+                role: "tool".to_string(),
+                content: format!("tool execution error: {}", err.message),
+                tool_calls: None,
+                tool_call_id: Some(call.id),
+                name: Some(call.name),
+            },
+        },
+        Err(err) => ChatMessage {
+            role: "tool".to_string(),
+            content: format!("tool invocation error: {}", err.message),
+            tool_calls: None,
+            tool_call_id: Some(fallback_id),
+            name: Some(fallback_name),
+        },
+    }
+}
+
+fn persist_partial_tool_turn(
+    paths: &AppPaths,
+    config: &AppConfig,
+    args: &AskArgs,
+    session_id: &str,
+    messages: &[ChatMessage],
+) -> AppResult<()> {
+    let auto_save = config.defaults.auto_save_session.unwrap_or(true);
+    if args.ephemeral || !auto_save {
+        return Ok(());
+    }
+
+    let events = messages
+        .iter()
+        .filter(|message| !message.content.is_empty())
+        .map(|message| {
+            SessionEvent::Message(SessionMessage {
+                role: message.role.clone(),
+                content: message.content.clone(),
+                created_at: now_rfc3339(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !events.is_empty() {
+        append_events(paths, config, session_id, &events)?;
+    }
+    let temp = is_temp_session(session_id) || args.temp;
+    set_current_session(paths, config, Some(session_id), temp)
+}
+
 fn select_session_id(
     paths: &AppPaths,
     config: &AppConfig,
@@ -865,55 +954,87 @@ async fn execute_ask_with_tools(
 ) -> AppResult<AskExecution> {
     let mut prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     prepared.request.tools = tool_definitions();
-    let max_rounds = 20;
-    let mut final_response: Option<ChatResponse> = None;
+    let buffer_tool_execution = should_buffer_tool_execution(&prepared.request);
+    let max_rounds = config.tools.max_rounds.unwrap_or(20) as usize;
+    let turn_start_index = prepared.request.messages.len().saturating_sub(1);
+    let response_result: AppResult<ChatResponse> = async {
+        let mut final_response: Option<ChatResponse> = None;
 
-    for round in 0..max_rounds {
-        let use_stream = args.stream;
-        let mut stdout = io::stdout();
-        let collapse = config.defaults.collapse_thinking.unwrap_or(false);
-        let mut renderer = StreamRenderer::new(collapse);
+        for round in 0..max_rounds {
+            let use_stream = !buffer_tool_execution
+                && should_stream_tool_round(&prepared.request, args.stream, round);
+            let mut stdout = io::stdout();
+            let collapse = config.defaults.collapse_thinking.unwrap_or(false);
+            let mut renderer = StreamRenderer::new(collapse);
 
-        // Status bar on first round
-        if round == 0 && use_stream {
-            print_status_bar(
-                &prepared.request.provider_id,
-                &prepared.request.model_id,
-                &prepared.session_id,
-            );
-        }
+            // Status bar on first round
+            if round == 0 && use_stream {
+                print_status_bar(
+                    &prepared.request.provider_id,
+                    &prepared.request.model_id,
+                    &prepared.session_id,
+                );
+            }
 
-        let response = if use_stream {
-            let mut spinner = Some(Spinner::start("waiting"));
-            stream_chat(prepared.request.clone(), |chunk| {
-                // Stop spinner on first content
-                if spinner.is_some() {
-                    if let Some(mut s) = spinner.take() {
-                        s.stop();
+            let response = if use_stream {
+                let mut spinner = Some(Spinner::start("waiting"));
+                stream_chat(prepared.request.clone(), |chunk| {
+                    // Stop spinner on first content
+                    if spinner.is_some() {
+                        if let Some(mut s) = spinner.take() {
+                            s.stop();
+                        }
                     }
-                }
-                if !chunk.delta.is_empty() {
-                    let rendered = renderer.push(&chunk.delta);
+                    if !chunk.delta.is_empty() {
+                        let rendered = renderer.push(&chunk.delta);
+                        for phase in renderer.drain_phase_transitions() {
+                            print_stream_phase(phase);
+                        }
+                        if !rendered.is_empty() {
+                            write!(stdout, "{}", rendered).map_err(|err| {
+                                AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                            })?;
+                            stdout.flush().map_err(|err| {
+                                AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
+                            })?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?
+            } else {
+                send_chat(prepared.request.clone()).await?
+            };
+
+            if response.tool_calls.is_empty() {
+                if use_stream {
+                    let remaining = renderer.flush();
                     for phase in renderer.drain_phase_transitions() {
                         print_stream_phase(phase);
                     }
-                    if !rendered.is_empty() {
-                        write!(stdout, "{}", rendered).map_err(|err| {
+                    if !remaining.is_empty() {
+                        write!(stdout, "{}", remaining).map_err(|err| {
                             AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                         })?;
-                        stdout.flush().map_err(|err| {
-                            AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}"))
+                    }
+                    if !remaining.is_empty() && !remaining.ends_with('\n') {
+                        writeln!(stdout).map_err(|err| {
+                            AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                        })?;
+                    }
+                } else if args.stream {
+                    let rendered = render_markdown(&response.content, collapse);
+                    if !rendered.is_empty() {
+                        writeln!(stdout, "{rendered}").map_err(|err| {
+                            AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                         })?;
                     }
                 }
-                Ok(())
-            })
-            .await?
-        } else {
-            send_chat(prepared.request.clone()).await?
-        };
+                final_response = Some(response);
+                break;
+            }
 
-        if response.tool_calls.is_empty() {
+            // Model wants to call tools — flush renderer and newline
             if use_stream {
                 let remaining = renderer.flush();
                 for phase in renderer.drain_phase_transitions() {
@@ -929,58 +1050,59 @@ async fn execute_ask_with_tools(
                         AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                     })?;
                 }
+            } else if args.stream && !response.content.is_empty() {
+                let rendered = render_markdown(&response.content, collapse);
+                if !rendered.is_empty() {
+                    writeln!(stdout, "{rendered}").map_err(|err| {
+                        AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
+                    })?;
+                }
             }
-            final_response = Some(response);
-            break;
-        }
 
-        // Model wants to call tools — flush renderer and newline
-        if use_stream {
-            let remaining = renderer.flush();
-            for phase in renderer.drain_phase_transitions() {
-                print_stream_phase(phase);
-            }
-            if !remaining.is_empty() {
-                write!(stdout, "{}", remaining).map_err(|err| {
-                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                })?;
-            }
-            if !remaining.is_empty() && !remaining.ends_with('\n') {
-                writeln!(stdout).map_err(|err| {
-                    AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
-                })?;
-            }
-        }
+            eprintln!(
+                "[round {}] model requested {} tool call(s)",
+                round + 1,
+                response.tool_calls.len()
+            );
 
-        eprintln!(
-            "[round {}] model requested {} tool call(s)",
-            round + 1,
-            response.tool_calls.len()
-        );
-
-        prepared.request.messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: response.content.clone(),
-            tool_calls: Some(response.tool_calls.clone()),
-            tool_call_id: None,
-            name: None,
-        });
-
-        for raw_call in &response.tool_calls {
-            let call = parse_tool_call(raw_call)?;
-            let result = execute_tool(&call, args.yes)?;
             prepared.request.messages.push(ChatMessage {
-                role: "tool".to_string(),
-                content: result.content,
-                tool_calls: None,
-                tool_call_id: Some(result.tool_call_id),
-                name: Some(call.name),
+                role: "assistant".to_string(),
+                content: response.content.clone(),
+                tool_calls: Some(response.tool_calls.clone()),
+                tool_call_id: None,
+                name: None,
             });
-        }
-    }
 
-    let response = final_response
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "max tool calling rounds (20) exceeded"))?;
+            for raw_call in &response.tool_calls {
+                prepared
+                    .request
+                    .messages
+                    .push(execute_tool_as_message(raw_call, args.yes, config));
+            }
+        }
+
+        final_response.ok_or_else(|| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("max tool calling rounds ({max_rounds}) exceeded"),
+            )
+        })
+    }
+    .await;
+
+    let response = match response_result {
+        Ok(response) => response,
+        Err(err) => {
+            persist_partial_tool_turn(
+                paths,
+                config,
+                args,
+                &prepared.session_id,
+                &prepared.request.messages[turn_start_index..],
+            )?;
+            return Err(err);
+        }
+    };
 
     persist_session(
         paths,
@@ -1545,6 +1667,7 @@ mod tests {
             max_output_tokens: None,
             capabilities: Vec::new(),
             temperature: None,
+            reasoning_effort: None,
         };
         assert_eq!(format_model_list_entry(&model), "minimax/MiniMax-M2.7");
     }
@@ -1573,5 +1696,66 @@ mod tests {
         assert!(rendered.contains("先分析"));
         assert!(rendered.contains("答案"));
         assert!(!rendered.contains("<think>"));
+    }
+
+    #[test]
+    fn tool_execution_is_buffered_for_openai_claude_models() {
+        let request = ChatRequest {
+            provider_id: "openclawbs".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-sonnet-4-6".to_string(),
+            model: ModelConfig {
+                provider: "openclawbs".to_string(),
+                remote_name: "claude-sonnet-4-6".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("medium".to_string()),
+            },
+            api_key: String::new(),
+            messages: Vec::new(),
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+        assert!(should_buffer_tool_execution(&request));
+    }
+
+    #[test]
+    fn execute_tool_as_message_returns_tool_error_content() {
+        let config = AppConfig::default();
+        let raw_call = json!({
+            "id": "call_1",
+            "function": {
+                "name": "read",
+                "arguments": "{\"path\":\"/definitely/missing/file.txt\"}"
+            }
+        });
+        let message = execute_tool_as_message(&raw_call, true, &config);
+        assert_eq!(message.role, "tool");
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_1"));
+        assert!(message.content.contains("tool execution error:"));
+    }
+
+    #[test]
+    fn execute_tool_as_message_handles_invalid_tool_call_payload() {
+        let config = AppConfig::default();
+        let raw_call = json!({
+            "id": "call_bad",
+            "function": {
+                "arguments": "{\"path\":\"foo\"}"
+            }
+        });
+        let message = execute_tool_as_message(&raw_call, true, &config);
+        assert_eq!(message.role, "tool");
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_bad"));
+        assert!(message.content.contains("tool invocation error:"));
     }
 }

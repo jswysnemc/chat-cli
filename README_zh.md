@@ -116,11 +116,23 @@ kind = "ollama"
 base_url = "http://localhost:11434"
 default_model = "llama3"
 
+[tools]
+max_rounds = 20
+
+[skills]
+paths = [".claude/skills", "~/.claude/skills"]
+
 [model.gpt-4o]
 provider = "openai"
 remote_name = "gpt-4o"
 display_name = "GPT-4o"
 context_window = 128000
+
+[model.claude-sonnet-4-6]
+provider = "openclawbs"
+remote_name = "claude-sonnet-4-6"
+capabilities = ["chat", "reasoning"]
+reasoning_effort = "medium"
 
 [profile.default]
 provider = "openai"
