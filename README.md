@@ -11,6 +11,7 @@ A configurable LLM chat CLI written in Rust, supporting multiple providers, sess
 - **Session persistence**: Automatic session saving with JSONL format
 - **Machine-friendly output**: JSON, NDJSON, and line-based output for scripting
 - **Tool calling**: Support for function calling with confirmation
+- **Tool transcript persistence**: Sessions retain assistant `tool_calls` and tool results for replay and debugging
 - **Configuration management**: TOML-based config with provider, model, and auth management
 
 ## Installation
@@ -160,14 +161,23 @@ temperature = 0.7
 | `json`   | JSON object with metadata                |
 | `ndjson` | Newline-delimited JSON for streaming     |
 
+## Architecture Notes
+
+- Tool architecture comparison and project-specific optimizations: [`docs/tool-architecture-study.md`](./docs/tool-architecture-study.md)
+
 ## Session Management
 
-Sessions are automatically created with a ULID identifier and persisted to `sessions/<session_id>.jsonl`. Each message includes:
+Sessions are automatically created with a ULID identifier and persisted to `sessions/<session_id>.jsonl`. Regular messages include:
 
-- `id`: ULID
 - `role`: user/assistant
 - `content`: message text
-- `timestamp`: ISO 8601
+- `created_at`: timestamp
+
+When tools are enabled, session files also retain:
+
+- `tool_calls`: assistant-emitted tool call payloads
+- `tool_call_id`: tool result linkage back to the originating call
+- `name`: tool name for tool-result messages
 
 ## License
 

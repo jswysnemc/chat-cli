@@ -9,6 +9,7 @@
 - **会话持久化**：自动保存会话为 JSONL 格式
 - **机器友好输出**：JSON、NDJSON 和单行文本输出，方便脚本调用
 - **工具调用**：支持函数调用和确认机制
+- **工具链路落盘**：会话可持久化 assistant `tool_calls` 和 tool result，便于回放与调试
 - **配置管理**：基于 TOML 的配置，支持 provider、model、auth 管理
 
 ## 安装
@@ -162,14 +163,23 @@ temperature = 0.7
 | `json`  | 带元数据的 JSON 对象      |
 | `ndjson`| 流式输出的换行分隔 JSON    |
 
+## 架构学习
+
+- 工具架构对照与本项目优化说明：[`docs/tool-architecture-study.md`](./docs/tool-architecture-study.md)
+
 ## 会话管理
 
-会话自动使用 ULID 标识符创建，并保存到 `sessions/<session_id>.jsonl`。每条消息包含：
+会话自动使用 ULID 标识符创建，并保存到 `sessions/<session_id>.jsonl`。普通消息会包含：
 
-- `id`：ULID 标识符
 - `role`：user/assistant
 - `content`：消息内容
-- `timestamp`：ISO 8601 时间戳
+- `created_at`：时间戳
+
+启用工具后，还会额外记录：
+
+- `tool_calls`：assistant 发出的 tool call 列表
+- `tool_call_id`：tool result 对应的调用 ID
+- `name`：tool 名称
 
 ## 许可
 

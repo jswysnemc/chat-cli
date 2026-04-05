@@ -2,6 +2,7 @@ use crate::config::{AppConfig, AppPaths};
 use crate::error::{AppError, AppResult, EXIT_SESSION, ResultCodeExt};
 use crate::media::MessageImage;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -34,6 +35,12 @@ pub struct SessionMessage {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<MessageImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub created_at: String,
 }
 

@@ -475,9 +475,15 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
                     ),
                     SessionEvent::Message(message) => {
                         messages += 1;
+                        let tool_call_count = message.tool_calls.len();
+                        let tool_call_id = message.tool_call_id.clone().unwrap_or_default();
+                        let name = message.name.clone().unwrap_or_default();
                         println!(
-                            "message role={} content={}",
+                            "message role={} tool_calls={} tool_call_id={} name={} content={}",
                             message.role,
+                            tool_call_count,
+                            serde_json::to_string(&tool_call_id).unwrap_or_default(),
+                            serde_json::to_string(&name).unwrap_or_default(),
                             serde_json::to_string(&message.content).unwrap_or_default()
                         );
                     }
@@ -730,6 +736,37 @@ fn execute_tool_as_message(
     }
 }
 
+fn chat_message_has_payload(message: &ChatMessage) -> bool {
+    !message.content.is_empty()
+        || !message.images.is_empty()
+        || message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        || message.tool_call_id.is_some()
+}
+
+fn session_message_from_chat_message(message: &ChatMessage) -> SessionMessage {
+    SessionMessage {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        images: message.images.clone(),
+        tool_calls: message.tool_calls.clone().unwrap_or_default(),
+        tool_call_id: message.tool_call_id.clone(),
+        name: message.name.clone(),
+        created_at: now_rfc3339(),
+    }
+}
+
+fn append_session_message_events(events: &mut Vec<SessionEvent>, messages: &[ChatMessage]) {
+    events.extend(
+        messages
+            .iter()
+            .filter(|message| chat_message_has_payload(message))
+            .map(|message| SessionEvent::Message(session_message_from_chat_message(message))),
+    );
+}
+
 fn persist_partial_tool_turn(
     paths: &AppPaths,
     config: &AppConfig,
@@ -743,19 +780,9 @@ fn persist_partial_tool_turn(
         return Ok(());
     }
 
-    let events = session_preamble
-        .iter()
-        .chain(messages.iter())
-        .filter(|message| !message.content.is_empty() || !message.images.is_empty())
-        .map(|message| {
-            SessionEvent::Message(SessionMessage {
-                role: message.role.clone(),
-                content: message.content.clone(),
-                images: message.images.clone(),
-                created_at: now_rfc3339(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    append_session_message_events(&mut events, session_preamble);
+    append_session_message_events(&mut events, messages);
 
     if !events.is_empty() {
         append_events(paths, config, session_id, &events)?;
@@ -1140,14 +1167,13 @@ async fn execute_ask_with_tools(
         }
     };
 
-    persist_session(
+    persist_tool_session(
         paths,
         config,
         args,
         &prepared.session_preamble,
-        &prepared.prompt,
-        &prepared.user_images,
         &prepared.session_id,
+        &prepared.request.messages[turn_start_index..],
         &response,
     )?;
 
@@ -1393,16 +1419,20 @@ fn prepare_ask(
     if let Ok(history) = read_events(paths, config, &session_id) {
         for event in history {
             if let SessionEvent::Message(message) = event {
-                if message.content.is_empty() && message.images.is_empty() {
+                let has_payload = !message.content.is_empty()
+                    || !message.images.is_empty()
+                    || !message.tool_calls.is_empty()
+                    || message.tool_call_id.is_some();
+                if !has_payload {
                     continue;
                 }
                 messages.push(ChatMessage {
                     role: message.role,
                     content: message.content,
                     images: message.images,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
+                    tool_calls: (!message.tool_calls.is_empty()).then_some(message.tool_calls),
+                    tool_call_id: message.tool_call_id,
+                    name: message.name,
                 });
             }
         }
@@ -1425,7 +1455,7 @@ fn prepare_ask(
             .unwrap_or("append");
 
         let final_system = match (cli_system, file_system, mode) {
-            (Some(cli), Some(file), "override") => Some(file),
+            (Some(_cli), Some(file), "override") => Some(file),
             (Some(cli), Some(file), _) => Some(format!("{cli}\n\n{file}")), // append
             (Some(cli), None, _) => Some(cli),
             (None, Some(file), _) => Some(file),
@@ -1515,22 +1545,15 @@ fn persist_session(
         return Ok(());
     }
 
-    let mut events = session_preamble
-        .iter()
-        .filter(|message| !message.content.is_empty() || !message.images.is_empty())
-        .map(|message| {
-            SessionEvent::Message(SessionMessage {
-                role: message.role.clone(),
-                content: message.content.clone(),
-                images: message.images.clone(),
-                created_at: now_rfc3339(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    append_session_message_events(&mut events, session_preamble);
     events.push(SessionEvent::Message(SessionMessage {
         role: "user".to_string(),
         content: prompt.to_string(),
         images: user_images.to_vec(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
         created_at: now_rfc3339(),
     }));
     if !response.content.is_empty() {
@@ -1538,6 +1561,50 @@ fn persist_session(
             role: "assistant".to_string(),
             content: response.content.clone(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            created_at: now_rfc3339(),
+        }));
+    }
+    events.push(SessionEvent::Response(SessionResponse {
+        provider: response.provider_id.clone(),
+        model: response.model_id.clone(),
+        finish_reason: response.finish_reason.clone(),
+        latency_ms: response.latency_ms,
+        usage: response.usage.clone(),
+        created_at: now_rfc3339(),
+    }));
+    append_events(paths, config, session_id, &events)?;
+    let temp = is_temp_session(session_id) || args.temp;
+    set_current_session(paths, config, Some(session_id), temp)
+}
+
+fn persist_tool_session(
+    paths: &AppPaths,
+    config: &AppConfig,
+    args: &AskArgs,
+    session_preamble: &[ChatMessage],
+    session_id: &str,
+    turn_messages: &[ChatMessage],
+    response: &ChatResponse,
+) -> AppResult<()> {
+    let auto_save = config.defaults.auto_save_session.unwrap_or(true);
+    if args.ephemeral || !auto_save {
+        return Ok(());
+    }
+
+    let mut events = Vec::new();
+    append_session_message_events(&mut events, session_preamble);
+    append_session_message_events(&mut events, turn_messages);
+    if !response.content.is_empty() {
+        events.push(SessionEvent::Message(SessionMessage {
+            role: "assistant".to_string(),
+            content: response.content.clone(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
             created_at: now_rfc3339(),
         }));
     }
@@ -1916,6 +1983,104 @@ mod tests {
         assert_eq!(message.role, "tool");
         assert_eq!(message.tool_call_id.as_deref(), Some("call_bad"));
         assert!(message.content.contains("tool invocation error:"));
+    }
+
+    #[test]
+    fn persist_tool_session_replays_tool_messages_on_next_turn() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+
+        let mut first_args = ask_args("读取 Cargo.toml");
+        first_args.new_session = true;
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &first_args, None).unwrap();
+        let tool_call = json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read",
+                "arguments": "{\"path\":\"Cargo.toml\"}"
+            }
+        });
+        let mut turn_messages = prepared.request.messages.clone();
+        turn_messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            images: Vec::new(),
+            tool_calls: Some(vec![tool_call.clone()]),
+            tool_call_id: None,
+            name: None,
+        });
+        turn_messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: "[package]\nname = \"chat-cli\"".to_string(),
+            images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            name: Some("read".to_string()),
+        });
+
+        let response = ChatResponse {
+            provider_id: "cpap".to_string(),
+            model_id: "team-gpt-5-4".to_string(),
+            content: "这是 Cargo 配置文件。".to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+        persist_tool_session(
+            &paths,
+            &config,
+            &first_args,
+            &prepared.session_preamble,
+            &prepared.session_id,
+            &turn_messages,
+            &response,
+        )
+        .unwrap();
+
+        let stored_events = read_events(&paths, &config, &prepared.session_id).unwrap();
+        let stored_messages = stored_events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Message(message) => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stored_messages.len(), 4);
+        assert_eq!(stored_messages[1].role, "assistant");
+        assert_eq!(stored_messages[1].tool_calls.len(), 1);
+        assert_eq!(stored_messages[2].role, "tool");
+        assert_eq!(stored_messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(stored_messages[2].name.as_deref(), Some("read"));
+
+        let mut second_args = ask_args("继续总结");
+        second_args.session = Some(prepared.session_id.clone());
+        let second = prepare_ask(&cli, &paths, &config, &secrets, &second_args, None).unwrap();
+        assert_eq!(second.request.messages[0].role, "user");
+        assert_eq!(second.request.messages[1].role, "assistant");
+        assert_eq!(
+            second.request.messages[1].tool_calls.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(second.request.messages[2].role, "tool");
+        assert_eq!(
+            second.request.messages[2].tool_call_id.as_deref(),
+            Some("call_1")
+        );
+        assert_eq!(second.request.messages[4].role, "user");
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

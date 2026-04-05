@@ -30,6 +30,48 @@ pub struct ToolResult {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSideEffects {
+    ReadOnly,
+    Mutating,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolParallelism {
+    ParallelSafe,
+    SequentialOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolSpec {
+    pub name: &'static str,
+    #[allow(dead_code)]
+    pub description: &'static str,
+    pub side_effects: ToolSideEffects,
+    pub parallelism: ToolParallelism,
+    pub requires_confirmation: bool,
+    pub definition: fn() -> Value,
+}
+
+impl ToolSpec {
+    pub fn is_parallel_safe(&self) -> bool {
+        self.parallelism == ToolParallelism::ParallelSafe
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolRuntimeContext<'a> {
+    auto_confirm: bool,
+    config: &'a AppConfig,
+}
+
+#[derive(Clone, Copy)]
+struct ToolHandler {
+    spec: ToolSpec,
+    execute: fn(&ToolCall, &ToolRuntimeContext<'_>) -> AppResult<String>,
+}
+
 /// Confirmation result from the user.
 #[derive(Debug)]
 enum ConfirmResult {
@@ -46,149 +88,266 @@ struct SkillEntry {
     summary: Option<String>,
 }
 
-/// Returns OpenAI-compatible tool definitions.
-pub fn tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read the contents of a file at the given path.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute or relative file path to read."
-                        }
-                    },
-                    "required": ["path"]
-                }
+const BUILTIN_TOOL_HANDLERS: [ToolHandler; 7] = [
+    ToolHandler {
+        spec: ToolSpec {
+            name: "read",
+            description: "Read the contents of a file at the given path.",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            definition: define_read_tool,
+        },
+        execute: execute_read_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "write",
+            description: "Write content to a file via overwrite or unified diff patch.",
+            side_effects: ToolSideEffects::Mutating,
+            parallelism: ToolParallelism::SequentialOnly,
+            requires_confirmation: true,
+            definition: define_write_tool,
+        },
+        execute: execute_write_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "bash",
+            description: "Execute a bash command and return stdout and stderr.",
+            side_effects: ToolSideEffects::Mutating,
+            parallelism: ToolParallelism::SequentialOnly,
+            requires_confirmation: true,
+            definition: define_bash_tool,
+        },
+        execute: execute_bash_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "grep",
+            description: "Search for a regex pattern in files with ripgrep.",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            definition: define_grep_tool,
+        },
+        execute: execute_grep_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "fetch",
+            description: "Fetch content from a URL via HTTP GET.",
+            side_effects: ToolSideEffects::External,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: true,
+            definition: define_fetch_tool,
+        },
+        execute: execute_fetch_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "skills_list",
+            description: "List available project and global skills.",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            definition: define_skills_list_tool,
+        },
+        execute: execute_skills_list_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "skill_read",
+            description: "Read the SKILL.md content for a named skill.",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            definition: define_skill_read_tool,
+        },
+        execute: execute_skill_read_tool,
+    },
+];
+
+fn define_read_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read the contents of a file at the given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative file path to read."
+                    }
+                },
+                "required": ["path"]
             }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "write",
-                "description": "Write content to a file. Supports two modes: 'overwrite' (default) replaces the entire file, 'diff' applies a unified diff patch to the existing file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute or relative file path to write."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "The content to write. In 'overwrite' mode: full file content. In 'diff' mode: unified diff format."
-                        },
-                        "mode": {
-                            "type": "string",
-                            "enum": ["overwrite", "diff"],
-                            "description": "Write mode. 'overwrite' replaces the file entirely (default). 'diff' applies a unified diff patch."
-                        }
+        }
+    })
+}
+
+fn define_write_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Write content to a file. Supports two modes: 'overwrite' (default) replaces the entire file, 'diff' applies a unified diff patch to the existing file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative file path to write."
                     },
-                    "required": ["path", "content"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Execute a bash command and return its stdout and stderr output.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The bash command to execute."
-                        }
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write. In 'overwrite' mode: full file content. In 'diff' mode: unified diff format."
                     },
-                    "required": ["command"]
-                }
+                    "mode": {
+                        "type": "string",
+                        "enum": ["overwrite", "diff"],
+                        "description": "Write mode. 'overwrite' replaces the file entirely (default). 'diff' applies a unified diff patch."
+                    }
+                },
+                "required": ["path", "content"]
             }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "grep",
-                "description": "Search for a regex pattern in files. Returns matching lines with file paths and line numbers. Max 50 results.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Regex pattern to search for."
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "File or directory to search in."
-                        },
-                        "include": {
-                            "type": "string",
-                            "description": "Optional glob pattern to filter files, e.g. '*.rs', '*.py'."
-                        }
+        }
+    })
+}
+
+fn define_bash_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command and return its stdout and stderr output.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute."
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    })
+}
+
+fn define_grep_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for a regex pattern in files. Returns matching lines with file paths and line numbers. Max 50 results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for."
                     },
-                    "required": ["pattern", "path"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "fetch",
-                "description": "Fetch content from a URL via HTTP GET. Returns the response body as text (max 32KB).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to fetch."
-                        }
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search in."
                     },
-                    "required": ["url"]
-                }
+                    "include": {
+                        "type": "string",
+                        "description": "Optional glob pattern to filter files, e.g. '*.rs', '*.py'."
+                    }
+                },
+                "required": ["pattern", "path"]
             }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "skills_list",
-                "description": "List available skills from the current project's .claude/skills directory and ~/.claude/skills.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Optional substring filter for the skill name."
-                        }
+        }
+    })
+}
+
+fn define_fetch_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "fetch",
+            "description": "Fetch content from a URL via HTTP GET. Returns the response body as text (max 32KB).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    })
+}
+
+fn define_skills_list_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "skills_list",
+            "description": "List available skills from the current project's .claude/skills directory and ~/.claude/skills.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional substring filter for the skill name."
                     }
                 }
             }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "skill_read",
-                "description": "Read the SKILL.md content for a named skill.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Skill name, for example 'agent-browser', 'ui-ux-pro-max', or '.system/openai-docs'. You can also use 'project:name' or 'global:name' to disambiguate."
-                        },
-                        "scope": {
-                            "type": "string",
-                            "description": "Optional skill scope filter, e.g. 'project', 'global', or 'path:./.claude/skills'."
-                        }
+        }
+    })
+}
+
+fn define_skill_read_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "skill_read",
+            "description": "Read the SKILL.md content for a named skill.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name, for example 'agent-browser', 'ui-ux-pro-max', or '.system/openai-docs'. You can also use 'project:name' or 'global:name' to disambiguate."
                     },
-                    "required": ["name"]
-                }
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional skill scope filter, e.g. 'project', 'global', or 'path:./.claude/skills'."
+                    }
+                },
+                "required": ["name"]
             }
-        }),
-    ]
+        }
+    })
+}
+
+fn builtin_tool_handlers() -> &'static [ToolHandler] {
+    &BUILTIN_TOOL_HANDLERS
+}
+
+fn find_tool_handler(name: &str) -> Option<&'static ToolHandler> {
+    builtin_tool_handlers()
+        .iter()
+        .find(|handler| handler.spec.name == name)
+}
+
+pub fn lookup_tool_spec(name: &str) -> Option<&'static ToolSpec> {
+    find_tool_handler(name).map(|handler| &handler.spec)
+}
+
+/// Returns OpenAI-compatible tool definitions.
+pub fn tool_definitions() -> Vec<Value> {
+    builtin_tool_handlers()
+        .iter()
+        .map(|handler| (handler.spec.definition)())
+        .collect()
 }
 
 /// Parse a tool call from raw API JSON.
@@ -216,119 +375,136 @@ pub fn execute_tool(
     auto_confirm: bool,
     config: &AppConfig,
 ) -> AppResult<ToolResult> {
-    let content = match call.name.as_str() {
-        "read" => {
-            let path = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| AppError::new(EXIT_ARGS, "read tool: missing 'path' argument"))?;
-            print_tool_header("read", path);
-            tool_read(path)?
-        }
-        "write" => {
-            let path = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| AppError::new(EXIT_ARGS, "write tool: missing 'path' argument"))?;
-            let content = call.arguments["content"].as_str().ok_or_else(|| {
-                AppError::new(EXIT_ARGS, "write tool: missing 'content' argument")
-            })?;
-            let mode = call.arguments["mode"].as_str().unwrap_or("overwrite");
-
-            match mode {
-                "diff" => {
-                    let (additions, deletions) = count_diff_changes(content);
-                    print_tool_header_detail(
-                        "write",
-                        &format!("{path} {GREEN}+{additions}{RESET} {RED}-{deletions}{RESET}"),
-                        "diff",
-                    );
-                    print_tool_preview(&render_diff_preview(path, content));
-                    match confirm_tool_action(
-                        &format!("apply diff to {YELLOW}{path}{RESET}"),
-                        Some(content),
-                        auto_confirm,
-                    )? {
-                        ConfirmResult::Yes => tool_write_diff(path, content)?,
-                        ConfirmResult::No => "user declined the write operation".to_string(),
-                        ConfirmResult::Edit(new_diff) => tool_write_diff(path, &new_diff)?,
-                    }
-                }
-                _ => {
-                    print_tool_header_detail(
-                        "write",
-                        &format!("{path} ({} bytes)", content.len()),
-                        "overwrite",
-                    );
-                    print_tool_preview(&render_write_preview(path, content));
-                    match confirm_tool_action(
-                        &format!("write to {YELLOW}{path}{RESET}"),
-                        None,
-                        auto_confirm,
-                    )? {
-                        ConfirmResult::Yes => tool_write(path, content)?,
-                        ConfirmResult::No => "user declined the write operation".to_string(),
-                        ConfirmResult::Edit(new_content) => tool_write(path, &new_content)?,
-                    }
-                }
-            }
-        }
-        "bash" => {
-            let command = call.arguments["command"]
-                .as_str()
-                .ok_or_else(|| AppError::new(EXIT_ARGS, "bash tool: missing 'command' argument"))?;
-            print_tool_header("bash", command);
-            match confirm_tool_action(
-                &format!("execute: {YELLOW}{command}{RESET}"),
-                Some(command),
-                auto_confirm,
-            )? {
-                ConfirmResult::Yes => tool_bash(command)?,
-                ConfirmResult::No => "user declined the bash execution".to_string(),
-                ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd)?,
-            }
-        }
-        "grep" => {
-            let pattern = call.arguments["pattern"]
-                .as_str()
-                .ok_or_else(|| AppError::new(EXIT_ARGS, "grep tool: missing 'pattern' argument"))?;
-            let path = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| AppError::new(EXIT_ARGS, "grep tool: missing 'path' argument"))?;
-            let include = call.arguments["include"].as_str();
-            print_tool_header("grep", &format!("/{pattern}/ in {path}"));
-            tool_grep(pattern, path, include)?
-        }
-        "fetch" => {
-            let url = call.arguments["url"]
-                .as_str()
-                .ok_or_else(|| AppError::new(EXIT_ARGS, "fetch tool: missing 'url' argument"))?;
-            print_tool_header("fetch", url);
-            match confirm_tool_action(&format!("fetch {YELLOW}{url}{RESET}"), None, auto_confirm)? {
-                ConfirmResult::Yes => tool_fetch(url)?,
-                ConfirmResult::No => "user declined the fetch operation".to_string(),
-                ConfirmResult::Edit(new_url) => tool_fetch(&new_url)?,
-            }
-        }
-        "skills_list" => {
-            let query = call.arguments["query"].as_str();
-            print_tool_header("skills_list", query.unwrap_or("all skills"));
-            tool_skills_list(query, config)?
-        }
-        "skill_read" => {
-            let name = call.arguments["name"].as_str().ok_or_else(|| {
-                AppError::new(EXIT_ARGS, "skill_read tool: missing 'name' argument")
-            })?;
-            let scope = call.arguments["scope"].as_str();
-            print_tool_header("skill_read", name);
-            tool_skill_read(name, scope, config)?
-        }
-        other => {
-            format!("error: unknown tool '{other}'")
-        }
+    let context = ToolRuntimeContext {
+        auto_confirm,
+        config,
+    };
+    let content = match find_tool_handler(&call.name) {
+        Some(handler) => (handler.execute)(call, &context)?,
+        None => format!("error: unknown tool '{}'", call.name),
     };
     Ok(ToolResult {
         tool_call_id: call.id.clone(),
         content,
     })
+}
+
+fn execute_read_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let path = call.arguments["path"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "read tool: missing 'path' argument"))?;
+    print_tool_header("read", path);
+    tool_read(path)
+}
+
+fn execute_write_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let path = call.arguments["path"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "write tool: missing 'path' argument"))?;
+    let content = call.arguments["content"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "write tool: missing 'content' argument"))?;
+    let mode = call.arguments["mode"].as_str().unwrap_or("overwrite");
+
+    match mode {
+        "diff" => {
+            let (additions, deletions) = count_diff_changes(content);
+            print_tool_header_detail(
+                "write",
+                &format!("{path} {GREEN}+{additions}{RESET} {RED}-{deletions}{RESET}"),
+                "diff",
+            );
+            print_tool_preview(&render_diff_preview(path, content));
+            match confirm_tool_action(
+                &format!("apply diff to {YELLOW}{path}{RESET}"),
+                Some(content),
+                context.auto_confirm,
+            )? {
+                ConfirmResult::Yes => tool_write_diff(path, content),
+                ConfirmResult::No => Ok("user declined the write operation".to_string()),
+                ConfirmResult::Edit(new_diff) => tool_write_diff(path, &new_diff),
+            }
+        }
+        _ => {
+            print_tool_header_detail(
+                "write",
+                &format!("{path} ({} bytes)", content.len()),
+                "overwrite",
+            );
+            print_tool_preview(&render_write_preview(path, content));
+            match confirm_tool_action(
+                &format!("write to {YELLOW}{path}{RESET}"),
+                None,
+                context.auto_confirm,
+            )? {
+                ConfirmResult::Yes => tool_write(path, content),
+                ConfirmResult::No => Ok("user declined the write operation".to_string()),
+                ConfirmResult::Edit(new_content) => tool_write(path, &new_content),
+            }
+        }
+    }
+}
+
+fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let command = call.arguments["command"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "bash tool: missing 'command' argument"))?;
+    print_tool_header("bash", command);
+    match confirm_tool_action(
+        &format!("execute: {YELLOW}{command}{RESET}"),
+        Some(command),
+        context.auto_confirm,
+    )? {
+        ConfirmResult::Yes => tool_bash(command),
+        ConfirmResult::No => Ok("user declined the bash execution".to_string()),
+        ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd),
+    }
+}
+
+fn execute_grep_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let pattern = call.arguments["pattern"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "grep tool: missing 'pattern' argument"))?;
+    let path = call.arguments["path"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "grep tool: missing 'path' argument"))?;
+    let include = call.arguments["include"].as_str();
+    print_tool_header("grep", &format!("/{pattern}/ in {path}"));
+    tool_grep(pattern, path, include)
+}
+
+fn execute_fetch_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let url = call.arguments["url"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "fetch tool: missing 'url' argument"))?;
+    print_tool_header("fetch", url);
+    match confirm_tool_action(
+        &format!("fetch {YELLOW}{url}{RESET}"),
+        None,
+        context.auto_confirm,
+    )? {
+        ConfirmResult::Yes => tool_fetch(url),
+        ConfirmResult::No => Ok("user declined the fetch operation".to_string()),
+        ConfirmResult::Edit(new_url) => tool_fetch(&new_url),
+    }
+}
+
+fn execute_skills_list_tool(
+    call: &ToolCall,
+    context: &ToolRuntimeContext<'_>,
+) -> AppResult<String> {
+    let query = call.arguments["query"].as_str();
+    print_tool_header("skills_list", query.unwrap_or("all skills"));
+    tool_skills_list(query, context.config)
+}
+
+fn execute_skill_read_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let name = call.arguments["name"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "skill_read tool: missing 'name' argument"))?;
+    let scope = call.arguments["scope"].as_str();
+    print_tool_header("skill_read", name);
+    tool_skill_read(name, scope, context.config)
 }
 
 // ─── Tool Implementations ───
@@ -1151,6 +1327,18 @@ mod tests {
 
         let err = resolve_skill_entry(&entries, "dup", None).unwrap_err();
         assert!(err.message.contains("ambiguous"));
+    }
+
+    #[test]
+    fn lookup_tool_spec_exposes_registry_metadata() {
+        let grep = lookup_tool_spec("grep").unwrap();
+        assert_eq!(grep.side_effects, ToolSideEffects::ReadOnly);
+        assert!(grep.is_parallel_safe());
+        assert!(!grep.requires_confirmation);
+
+        let fetch = lookup_tool_spec("fetch").unwrap();
+        assert_eq!(fetch.side_effects, ToolSideEffects::External);
+        assert!(fetch.requires_confirmation);
     }
 
     fn make_temp_dir(label: &str) -> PathBuf {
