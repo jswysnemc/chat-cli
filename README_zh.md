@@ -198,12 +198,6 @@ api_key = "<redacted>"
 api_key = "<redacted>"
 ```
 
-### 当前本地清单
-
-- 当前默认项：`provider=deepseek`、`model=deepseek-reasoner-search`、`tools=true`、`audit.model=minimax-m2-7`
-- 已配置 provider：`cpap`、`deepseek`、`gb`、`grok2api`、`minimax`、`openclawbs`、`replit`
-- 已配置 model：`claude-opus-4-6-rep`、`claude-sonnet-4-6`、`deepseek-reasoner-search`、`gemini-3-1-pro-preview`、`grok-4-1-fast`、`grok-4-1-thinking`、`grok-4-20-beta`、`grok-imagine-1-0`、`grok-imagine-1-0-edit`、`grok-imagine-1-0-video`、`minimax-m2-7`、`minimax-m2-7-highspeed`、`minimax-m2-her`、`qw-coder-model`
-- 当前本地尚未定义任何 `[profiles.*]`
 
 ## 输出格式
 

@@ -196,13 +196,6 @@ api_key = "<redacted>"
 api_key = "<redacted>"
 ```
 
-### Current Local Inventory
-
-- Active defaults: `provider=deepseek`, `model=deepseek-reasoner-search`, `tools=true`, `audit.model=minimax-m2-7`
-- Configured providers: `cpap`, `deepseek`, `gb`, `grok2api`, `minimax`, `openclawbs`, `replit`
-- Configured models: `claude-opus-4-6-rep`, `claude-sonnet-4-6`, `deepseek-reasoner-search`, `gemini-3-1-pro-preview`, `grok-4-1-fast`, `grok-4-1-thinking`, `grok-4-20-beta`, `grok-imagine-1-0`, `grok-imagine-1-0-edit`, `grok-imagine-1-0-video`, `minimax-m2-7`, `minimax-m2-7-highspeed`, `minimax-m2-her`, `qw-coder-model`
-- No `[profiles.*]` entries are currently defined locally
-
 ## Output Formats
 
 | Format   | Description                              |
