@@ -11,11 +11,13 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const MAX_SKILL_READ_BYTES: usize = 64 * 1024;
+const TOOL_NAME_WIDTH: usize = 12;
+const PREVIEW_MAX_LINES: usize = 3;
+const PREVIEW_MAX_CHARS: usize = 120;
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -139,7 +141,7 @@ const BUILTIN_TOOL_HANDLERS: [ToolHandler; 7] = [
             description: "Fetch content from a URL via HTTP GET.",
             side_effects: ToolSideEffects::External,
             parallelism: ToolParallelism::ParallelSafe,
-            requires_confirmation: true,
+            requires_confirmation: false,
             definition: define_fetch_tool,
         },
         execute: execute_fetch_tool,
@@ -411,15 +413,11 @@ fn execute_write_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppR
             let (additions, deletions) = count_diff_changes(content);
             print_tool_header_detail(
                 "write",
-                &format!("{path} {GREEN}+{additions}{RESET} {RED}-{deletions}{RESET}"),
+                &format!("{path} · +{additions} -{deletions}"),
                 "diff",
             );
             print_tool_preview(&render_diff_preview(path, content));
-            match confirm_tool_action(
-                &format!("apply diff to {YELLOW}{path}{RESET}"),
-                Some(content),
-                context.auto_confirm,
-            )? {
+            match confirm_tool_action("apply", Some(content), context.auto_confirm)? {
                 ConfirmResult::Yes => tool_write_diff(path, content),
                 ConfirmResult::No => Ok("user declined the write operation".to_string()),
                 ConfirmResult::Edit(new_diff) => tool_write_diff(path, &new_diff),
@@ -428,15 +426,15 @@ fn execute_write_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppR
         _ => {
             print_tool_header_detail(
                 "write",
-                &format!("{path} ({} bytes)", content.len()),
+                &format!(
+                    "{path} · {} lines · {} bytes",
+                    preview_line_count(content),
+                    content.len()
+                ),
                 "overwrite",
             );
             print_tool_preview(&render_write_preview(path, content));
-            match confirm_tool_action(
-                &format!("write to {YELLOW}{path}{RESET}"),
-                None,
-                context.auto_confirm,
-            )? {
+            match confirm_tool_action("write", None, context.auto_confirm)? {
                 ConfirmResult::Yes => tool_write(path, content),
                 ConfirmResult::No => Ok("user declined the write operation".to_string()),
                 ConfirmResult::Edit(new_content) => tool_write(path, &new_content),
@@ -449,12 +447,8 @@ fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
     let command = call.arguments["command"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "bash tool: missing 'command' argument"))?;
-    print_tool_header("bash", command);
-    match confirm_tool_action(
-        &format!("execute: {YELLOW}{command}{RESET}"),
-        Some(command),
-        context.auto_confirm,
-    )? {
+    print_tool_header("bash", &truncate_preview(command, 120));
+    match confirm_tool_action("run", Some(command), context.auto_confirm)? {
         ConfirmResult::Yes => tool_bash(command),
         ConfirmResult::No => Ok("user declined the bash execution".to_string()),
         ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd),
@@ -473,20 +467,12 @@ fn execute_grep_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppR
     tool_grep(pattern, path, include)
 }
 
-fn execute_fetch_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_fetch_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
     let url = call.arguments["url"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "fetch tool: missing 'url' argument"))?;
     print_tool_header("fetch", url);
-    match confirm_tool_action(
-        &format!("fetch {YELLOW}{url}{RESET}"),
-        None,
-        context.auto_confirm,
-    )? {
-        ConfirmResult::Yes => tool_fetch(url),
-        ConfirmResult::No => Ok("user declined the fetch operation".to_string()),
-        ConfirmResult::Edit(new_url) => tool_fetch(&new_url),
-    }
+    tool_fetch(url)
 }
 
 fn execute_skills_list_tool(
@@ -891,76 +877,91 @@ fn count_diff_changes(diff: &str) -> (usize, usize) {
 // ─── UI Helpers ───
 
 fn print_tool_header(name: &str, detail: &str) {
-    eprintln!("  {BOLD}{CYAN}{name}{RESET} {YELLOW}{detail}{RESET}");
+    let label = format_tool_label(name, None);
+    eprintln!("  {BOLD}{CYAN}{label}{RESET}{detail}");
 }
 
 fn print_tool_header_detail(name: &str, detail: &str, mode: &str) {
-    eprintln!("  {BOLD}{CYAN}{name}{RESET} {DIM}({mode}){RESET} {detail}");
+    let label = format_tool_label(name, Some(mode));
+    eprintln!("  {BOLD}{CYAN}{label}{RESET}{detail}");
 }
 
 fn print_tool_preview(rendered: &str) {
     for line in rendered.lines() {
-        eprintln!("  {line}");
+        eprintln!("    {line}");
     }
 }
 
 fn render_write_preview(path: &str, content: &str) -> String {
-    let mut output = String::new();
-    output.push_str(&format!("{DIM}{CYAN}╭─ Preview {path}{RESET}\n"));
-    if content.is_empty() {
-        output.push_str(&format!("{DIM}{CYAN}│{RESET} {DIM}(empty file){RESET}\n"));
+    let mut lines = Vec::new();
+    if let Some(lang) = preview_language(path) {
+        lines.push(format!(
+            "{DIM}{lang} · {} lines · {} bytes{RESET}",
+            preview_line_count(content),
+            content.len()
+        ));
     } else {
-        if let Some(lang) = preview_language(path) {
-            output.push_str(&format!("{DIM}{CYAN}│{RESET} {DIM}{lang}{RESET}\n"));
-        }
-        for line in content.split('\n') {
-            output.push_str(&format!("{DIM}{CYAN}│{RESET} {DIM}{line}{RESET}\n"));
-        }
+        lines.push(format!(
+            "{DIM}{} lines · {} bytes{RESET}",
+            preview_line_count(content),
+            content.len()
+        ));
     }
-    output.push_str(&format!(
-        "{DIM}{CYAN}╰─ {} lines · {} bytes{RESET}",
-        preview_line_count(content),
-        content.len()
-    ));
-    output
+
+    if content.is_empty() {
+        lines.push(format!("{DIM}· (empty file){RESET}"));
+        return lines.join("\n");
+    }
+
+    let content_lines = content.lines().collect::<Vec<_>>();
+    for line in content_lines.iter().take(PREVIEW_MAX_LINES) {
+        lines.push(format!(
+            "{DIM}· {}{RESET}",
+            truncate_preview(line, PREVIEW_MAX_CHARS)
+        ));
+    }
+    if content_lines.len() > PREVIEW_MAX_LINES {
+        lines.push(format!("{DIM}· ...{RESET}"));
+    }
+    lines.join("\n")
 }
 
 fn render_diff_preview(path: &str, diff: &str) -> String {
-    let mut output = String::new();
-    output.push_str(&format!("{DIM}{CYAN}╭─ Diff Preview {path}{RESET}\n"));
-    if diff.is_empty() {
-        output.push_str(&format!("{DIM}{CYAN}│{RESET} {DIM}(empty diff){RESET}\n"));
-    } else {
-        for line in diff.split('\n') {
-            let styled = if line.starts_with('+') && !line.starts_with("+++") {
-                format!("{GREEN}{line}{RESET}")
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                format!("{RED}{line}{RESET}")
-            } else if line.starts_with("@@")
-                || line.starts_with("diff ")
-                || line.starts_with("index ")
-                || line.starts_with("---")
-                || line.starts_with("+++")
-            {
-                format!("{CYAN}{line}{RESET}")
-            } else {
-                format!("{DIM}{line}{RESET}")
-            };
-            output.push_str(&format!("{DIM}{CYAN}│{RESET} {styled}\n"));
-        }
-    }
+    let mut output = Vec::new();
     let (additions, deletions) = count_diff_changes(diff);
-    output.push_str(&format!(
-        "{DIM}{CYAN}╰─ +{additions} -{deletions} · {} lines{RESET}",
+    output.push(format!(
+        "{DIM}{path} · +{additions} -{deletions} · {} lines{RESET}",
         preview_line_count(diff)
     ));
-    output
+    let mut shown = 0usize;
+    for line in diff.lines() {
+        if shown >= PREVIEW_MAX_LINES {
+            break;
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            output.push(format!(
+                "{GREEN}· {}{RESET}",
+                truncate_preview(line, PREVIEW_MAX_CHARS)
+            ));
+            shown += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            output.push(format!(
+                "{RED}· {}{RESET}",
+                truncate_preview(line, PREVIEW_MAX_CHARS)
+            ));
+            shown += 1;
+        }
+    }
+    if additions + deletions > shown {
+        output.push(format!("{DIM}· ...{RESET}"));
+    }
+    output.join("\n")
 }
 
 /// Interactive tool confirmation with y/n/e(dit) options.
 /// `editable_content` is shown to the user when they choose to edit.
 fn confirm_tool_action(
-    description: &str,
+    action: &str,
     editable_content: Option<&str>,
     auto_confirm: bool,
 ) -> AppResult<ConfirmResult> {
@@ -970,11 +971,9 @@ fn confirm_tool_action(
 
     loop {
         if editable_content.is_some() {
-            eprint!(
-                "  {DIM}{description} {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}/or type replacement:{RESET} "
-            );
+            eprint!("    {DIM}{action}? {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}/edit:{RESET} ");
         } else {
-            eprint!("  {DIM}{description} {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}:{RESET} ");
+            eprint!("    {DIM}{action}? {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}:{RESET} ");
         }
         io::stderr()
             .flush()
@@ -995,7 +994,7 @@ fn confirm_tool_action(
                     // Any other input is treated as replacement content
                     return Ok(ConfirmResult::Edit(trimmed.to_string()));
                 } else {
-                    eprintln!("  {DIM}please enter y or n{RESET}");
+                    eprintln!("    {DIM}please enter y or n{RESET}");
                 }
             }
         }
@@ -1210,6 +1209,23 @@ fn preview_line_count(content: &str) -> usize {
     }
 }
 
+fn format_tool_label(name: &str, mode: Option<&str>) -> String {
+    let label = mode.map_or_else(|| name.to_string(), |mode| format!("{name}:{mode}"));
+    format!("{label:<TOOL_NAME_WIDTH$}")
+}
+
+fn truncate_preview(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        format!(
+            "{}...",
+            normalized.chars().take(max_chars).collect::<String>()
+        )
+    }
+}
+
 fn preview_language(path: &str) -> Option<&'static str> {
     let ext = Path::new(path).extension()?.to_str()?;
     match ext {
@@ -1338,7 +1354,7 @@ mod tests {
 
         let fetch = lookup_tool_spec("fetch").unwrap();
         assert_eq!(fetch.side_effects, ToolSideEffects::External);
-        assert!(fetch.requires_confirmation);
+        assert!(!fetch.requires_confirmation);
     }
 
     fn make_temp_dir(label: &str) -> PathBuf {

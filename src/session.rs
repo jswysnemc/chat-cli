@@ -21,6 +21,7 @@ pub enum SessionEvent {
     Meta(SessionMeta),
     Message(SessionMessage),
     Response(SessionResponse),
+    Audit(SessionAudit),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +50,25 @@ pub struct SessionResponse {
     pub provider: String,
     pub model: String,
     pub finish_reason: String,
+    pub latency_ms: u64,
+    pub usage: Usage,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAudit {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub verdict: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommendations: Vec<String>,
     pub latency_ms: u64,
     pub usage: Usage,
     pub created_at: String,
@@ -430,6 +450,12 @@ fn build_session_summary(
             }
             SessionEvent::Response(response) => {
                 let ts = parse_timestamp(&response.created_at);
+                if ts.is_some() {
+                    updated_at = ts;
+                }
+            }
+            SessionEvent::Audit(audit) => {
+                let ts = parse_timestamp(&audit.created_at);
                 if ts.is_some() {
                     updated_at = ts;
                 }

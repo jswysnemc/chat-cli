@@ -10,6 +10,7 @@
 - **机器友好输出**：JSON、NDJSON 和单行文本输出，方便脚本调用
 - **工具调用**：支持函数调用和确认机制
 - **工具链路落盘**：会话可持久化 assistant `tool_calls` 和 tool result，便于回放与调试
+- **自动审核子 agent**：可对发生 tool 操作的回合做二次安全审核，支持配置开关和审核模型
 - **配置管理**：基于 TOML 的配置，支持 provider、model、auth 管理
 
 ## 安装
@@ -126,6 +127,10 @@ default_model = "llama3"
 [tools]
 max_rounds = 20
 
+[audit]
+enabled = true
+model = "team-gpt-5-4"
+
 [skills]
 paths = [".claude/skills", "~/.claude/skills"]
 
@@ -166,6 +171,18 @@ temperature = 0.7
 ## 架构学习
 
 - 工具架构对照与本项目优化说明：[`docs/tool-architecture-study.md`](./docs/tool-architecture-study.md)
+- Agent 安全机制与操作审计学习：[`docs/agent-security-audit-study.md`](./docs/agent-security-audit-study.md)
+
+## 自动审核
+
+当 `[audit].enabled = true` 时，`chat ask --tools` 和 `chat repl --tools` 会在危险 tool 执行前触发一个审核子 agent。
+
+- 当前实现里，`write`、`bash` 这类 `mutating` tool 会进入审核链路
+- `read`、`grep`、`fetch` 这类只读或只取回内容的 tool 会直接通过，不进审核
+- `audit.model`：审核使用的模型 ID；未配置时回退到当前对话模型
+- 审核 `pass`：自动放行，不再询问人工
+- 审核 `warning` / `block` / `unavailable`：先打印红色告警，再进入人工确认
+- 审核结果会以独立 `audit` 事件写入 session，便于事后复盘
 
 ## 会话管理
 

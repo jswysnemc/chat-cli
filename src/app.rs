@@ -18,17 +18,24 @@ use crate::provider::{
 };
 use crate::render::{StreamPhase, StreamRenderer, StreamStatus, print_status_bar, render_markdown};
 use crate::session::{
-    SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions, delete_session,
-    gc_sessions, generate_session_id, generate_temp_session_id, is_temp_session,
+    SessionAudit, SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions,
+    delete_session, gc_sessions, generate_session_id, generate_temp_session_id, is_temp_session,
     list_session_summaries, load_state, now_rfc3339, read_events, resolve_session_id,
     set_current_session, short_id,
 };
-use crate::tool::{execute_tool, parse_tool_call, tool_definitions};
+use crate::tool::{execute_tool, lookup_tool_spec, parse_tool_call, tool_definitions};
 use clap::CommandFactory;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
+
+const CYAN: &str = "\x1b[36m";
+const DIM: &str = "\x1b[2m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
 
 pub async fn run(cli: Cli) -> AppResult<()> {
     let root = cli.clone();
@@ -467,6 +474,7 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             let events = read_events(paths, config, &resolved)?;
             let mut messages = 0;
             let mut responses = 0;
+            let mut audits = 0;
             for event in &events {
                 match event {
                     SessionEvent::Meta(meta) => println!(
@@ -497,9 +505,28 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
                             response.latency_ms
                         );
                     }
+                    SessionEvent::Audit(audit) => {
+                        audits += 1;
+                        println!(
+                            "audit provider={} model={} tool_name={} tool_call_id={} verdict={} summary={}",
+                            audit.provider,
+                            audit.model,
+                            serde_json::to_string(audit.tool_name.as_deref().unwrap_or_default())
+                                .unwrap_or_default(),
+                            serde_json::to_string(
+                                audit.tool_call_id.as_deref().unwrap_or_default()
+                            )
+                            .unwrap_or_default(),
+                            serde_json::to_string(&audit.verdict).unwrap_or_default(),
+                            serde_json::to_string(&audit.summary).unwrap_or_default()
+                        );
+                    }
                 }
             }
-            println!("summary messages={} responses={}", messages, responses);
+            println!(
+                "summary messages={} responses={} audits={}",
+                messages, responses, audits
+            );
             Ok(())
         }
         SessionCommand::Export { id } => {
@@ -767,6 +794,460 @@ fn append_session_message_events(events: &mut Vec<SessionEvent>, messages: &[Cha
     );
 }
 
+fn audit_preview_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        format!(
+            "{}...",
+            normalized.chars().take(max_chars).collect::<String>()
+        )
+    }
+}
+
+fn audit_preview_value(value: &Value, max_chars: usize) -> String {
+    audit_preview_text(&serde_json::to_string(value).unwrap_or_default(), max_chars)
+}
+
+fn tool_side_effects_label(name: &str) -> &'static str {
+    match lookup_tool_spec(name).map(|spec| spec.side_effects) {
+        Some(crate::tool::ToolSideEffects::ReadOnly) => "read_only",
+        Some(crate::tool::ToolSideEffects::Mutating) => "mutating",
+        Some(crate::tool::ToolSideEffects::External) => "external",
+        None => "unknown",
+    }
+}
+
+fn tool_parallelism_label(name: &str) -> &'static str {
+    match lookup_tool_spec(name).map(|spec| spec.parallelism) {
+        Some(crate::tool::ToolParallelism::ParallelSafe) => "parallel_safe",
+        Some(crate::tool::ToolParallelism::SequentialOnly) => "sequential_only",
+        None => "unknown",
+    }
+}
+
+fn summarize_tool_call(raw_call: &Value) -> Value {
+    match parse_tool_call(raw_call) {
+        Ok(call) => {
+            let spec = lookup_tool_spec(&call.name);
+            json!({
+                "id": call.id,
+                "name": call.name,
+                "arguments_preview": audit_preview_value(&call.arguments, 600),
+                "side_effects": spec.map(|tool| tool_side_effects_label(tool.name)).unwrap_or("unknown"),
+                "parallelism": spec.map(|tool| tool_parallelism_label(tool.name)).unwrap_or("unknown"),
+                "requires_confirmation": spec.map(|tool| tool.requires_confirmation).unwrap_or(false),
+            })
+        }
+        Err(err) => json!({
+            "id": raw_call["id"].as_str().unwrap_or_default(),
+            "name": raw_call["function"]["name"].as_str().unwrap_or("unknown_tool"),
+            "parse_error": err.message,
+            "raw_preview": audit_preview_value(raw_call, 600),
+        }),
+    }
+}
+
+fn truncate_tool_call_id(id: &str) -> String {
+    let tail = id.rsplit('_').next().unwrap_or(id);
+    if tail.chars().count() <= 8 {
+        tail.to_string()
+    } else {
+        tail.chars().take(8).collect()
+    }
+}
+
+fn summarize_tool_call_activity(raw_call: &Value) -> String {
+    match parse_tool_call(raw_call) {
+        Ok(call) => match call.name.as_str() {
+            "bash" => format!(
+                "bash: {}",
+                audit_preview_text(call.arguments["command"].as_str().unwrap_or(""), 40)
+            ),
+            "write" => format!(
+                "write: {}",
+                audit_preview_text(call.arguments["path"].as_str().unwrap_or(""), 32)
+            ),
+            "read" => format!(
+                "read: {}",
+                audit_preview_text(call.arguments["path"].as_str().unwrap_or(""), 32)
+            ),
+            "fetch" => format!(
+                "fetch: {}",
+                audit_preview_text(call.arguments["url"].as_str().unwrap_or(""), 40)
+            ),
+            "grep" => format!(
+                "grep: {}",
+                audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
+            ),
+            "skill_read" => format!(
+                "skill_read: {}",
+                audit_preview_text(call.arguments["name"].as_str().unwrap_or(""), 24)
+            ),
+            "skills_list" => "skills_list".to_string(),
+            other => other.to_string(),
+        },
+        Err(_) => "unknown_tool".to_string(),
+    }
+}
+
+fn summarize_tool_call_names(raw_calls: &[Value]) -> String {
+    raw_calls
+        .iter()
+        .map(summarize_tool_call_activity)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn build_tool_review_payload(
+    session_id: &str,
+    transcript: &[ChatMessage],
+    calls: &[crate::tool::ToolCall],
+) -> Value {
+    let transcript = transcript
+        .iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            let mut item = serde_json::Map::new();
+            item.insert("role".to_string(), json!(message.role));
+            if let Some(name) = &message.name {
+                item.insert("name".to_string(), json!(name));
+                item.insert(
+                    "side_effects".to_string(),
+                    json!(tool_side_effects_label(name)),
+                );
+                item.insert(
+                    "parallelism".to_string(),
+                    json!(tool_parallelism_label(name)),
+                );
+            }
+            if let Some(tool_call_id) = &message.tool_call_id {
+                item.insert("tool_call_id".to_string(), json!(tool_call_id));
+            }
+            if let Some(tool_calls) = &message.tool_calls {
+                item.insert(
+                    "tool_calls".to_string(),
+                    Value::Array(tool_calls.iter().map(summarize_tool_call).collect()),
+                );
+            }
+            if !message.content.is_empty() {
+                let limit = if message.role == "tool" { 1200 } else { 2000 };
+                item.insert(
+                    "content_preview".to_string(),
+                    json!(audit_preview_text(&message.content, limit)),
+                );
+            }
+            Value::Object(item)
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "session_id": session_id,
+        "tool_calls": calls.iter().map(|call| {
+            json!({
+                "id": call.id,
+                "name": call.name,
+                "arguments": call.arguments,
+                "side_effects": tool_side_effects_label(&call.name),
+                "parallelism": tool_parallelism_label(&call.name),
+                "requires_confirmation": lookup_tool_spec(&call.name)
+                    .map(|tool| tool.requires_confirmation)
+                    .unwrap_or(false),
+            })
+        }).collect::<Vec<_>>(),
+        "transcript": transcript,
+    })
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end >= start).then_some(&text[start..=end])
+}
+
+fn normalize_audit_verdict(verdict: Option<&str>) -> String {
+    match verdict
+        .unwrap_or("warning")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pass" => "pass".to_string(),
+        "warning" => "warning".to_string(),
+        "block" => "block".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "warning".to_string(),
+    }
+}
+
+fn parse_batch_audit_report(
+    response: ChatResponse,
+    calls: &[crate::tool::ToolCall],
+) -> BatchAuditDecision {
+    let parsed = serde_json::from_str::<AuditAgentResponse>(&response.content)
+        .ok()
+        .or_else(|| {
+            extract_json_object(&response.content)
+                .and_then(|content| serde_json::from_str::<AuditAgentResponse>(content).ok())
+        });
+
+    let provider = response.provider_id;
+    let model = response.model_id;
+    let latency_ms = response.latency_ms;
+    let usage = response.usage;
+
+    let reports = match parsed {
+        Some(parsed) => calls
+            .iter()
+            .map(|call| {
+                let item = parsed.results.iter().find(|item| item.id == call.id);
+                let report = AuditReport {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    verdict: item
+                        .map(|item| normalize_audit_verdict(item.verdict.as_deref()))
+                        .unwrap_or_else(|| "warning".to_string()),
+                    message: item
+                        .and_then(|item| item.message.as_ref())
+                        .filter(|message| !message.trim().is_empty())
+                        .map(|message| audit_preview_text(message, 72))
+                        .unwrap_or_else(|| "需人工确认".to_string()),
+                    latency_ms,
+                    usage: usage.clone(),
+                };
+                (call.id.clone(), report)
+            })
+            .collect(),
+        None => calls
+            .iter()
+            .map(|call| {
+                (
+                    call.id.clone(),
+                    AuditReport {
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        verdict: "warning".to_string(),
+                        message: "审核返回异常".to_string(),
+                        latency_ms,
+                        usage: usage.clone(),
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    BatchAuditDecision { reports }
+}
+
+fn unavailable_batch_audit_decision(
+    provider: String,
+    model: String,
+    calls: &[crate::tool::ToolCall],
+    message: String,
+) -> BatchAuditDecision {
+    let reports = calls
+        .iter()
+        .map(|call| {
+            (
+                call.id.clone(),
+                AuditReport {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    verdict: "unavailable".to_string(),
+                    message: audit_preview_text(&message, 72),
+                    latency_ms: 0,
+                    usage: crate::session::Usage::default(),
+                },
+            )
+        })
+        .collect();
+    BatchAuditDecision { reports }
+}
+
+fn resolve_audit_target(
+    config: &AppConfig,
+    secrets: &SecretsConfig,
+    fallback_request: &ChatRequest,
+) -> AppResult<ResolvedChatTarget> {
+    let audit_model_id = config
+        .audit
+        .model
+        .as_deref()
+        .unwrap_or(&fallback_request.model_id);
+    if audit_model_id == fallback_request.model_id {
+        return Ok(ResolvedChatTarget {
+            provider_id: fallback_request.provider_id.clone(),
+            provider: fallback_request.provider.clone(),
+            model_id: fallback_request.model_id.clone(),
+            model: fallback_request.model.clone(),
+            api_key: fallback_request.api_key.clone(),
+        });
+    }
+
+    let model = config.models.get(audit_model_id).ok_or_else(|| {
+        AppError::new(
+            EXIT_MODEL,
+            format!("audit.model `{audit_model_id}` does not exist"),
+        )
+    })?;
+    let provider = config.providers.get(&model.provider).ok_or_else(|| {
+        AppError::new(
+            EXIT_PROVIDER,
+            format!(
+                "audit.model `{audit_model_id}` references missing provider `{}`",
+                model.provider
+            ),
+        )
+    })?;
+    let api_key = resolve_api_key(&model.provider, provider, secrets)?;
+    Ok(ResolvedChatTarget {
+        provider_id: model.provider.clone(),
+        provider: provider.clone(),
+        model_id: audit_model_id.to_string(),
+        model: model.clone(),
+        api_key,
+    })
+}
+
+fn tool_requires_agent_review(config: &AppConfig, call: &crate::tool::ToolCall) -> bool {
+    config.audit.enabled.unwrap_or(false)
+        && lookup_tool_spec(&call.name)
+            .is_some_and(|spec| spec.side_effects == crate::tool::ToolSideEffects::Mutating)
+}
+
+async fn maybe_review_tool_call(
+    config: &AppConfig,
+    secrets: &SecretsConfig,
+    fallback_request: &ChatRequest,
+    session_id: &str,
+    transcript: &[ChatMessage],
+    calls: &[crate::tool::ToolCall],
+) -> Option<BatchAuditDecision> {
+    if calls.is_empty() {
+        return None;
+    }
+
+    let target = match resolve_audit_target(config, secrets, fallback_request) {
+        Ok(target) => target,
+        Err(err) => {
+            return Some(unavailable_batch_audit_decision(
+                fallback_request.provider_id.clone(),
+                config
+                    .audit
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| fallback_request.model_id.clone()),
+                calls,
+                format!("audit agent could not be prepared: {}", err.message),
+            ));
+        }
+    };
+
+    let payload = build_tool_review_payload(session_id, transcript, calls);
+    let request = ChatRequest {
+        provider_id: target.provider_id.clone(),
+        provider: target.provider.clone(),
+        model_id: target.model_id.clone(),
+        model: target.model.clone(),
+        api_key: target.api_key.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "You are the approval-review subagent for a coding assistant. Review a batch of dangerous tool calls before execution. Return JSON only with this exact shape: {\"results\":[{\"id\":\"tool_call_id\",\"verdict\":\"pass|warning|block\",\"message\":\"short text\"}]}. You must return one result for each tool call id. The `message` must be plain text, no markdown, at most 12 Chinese characters or 24 English words. Use `pass` only when that tool should auto-run without human confirmation. Use `warning` when human confirmation is still needed. Use `block` when that tool is clearly unsafe.".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| payload.to_string()),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ],
+        temperature: Some(0.0),
+        max_output_tokens: Some(target.model.max_output_tokens.unwrap_or(800).min(800)),
+        params: BTreeMap::new(),
+        timeout_secs: fallback_request.timeout_secs,
+        tools: Vec::new(),
+    };
+
+    Some(match send_chat(request).await {
+        Ok(response) => parse_batch_audit_report(response, calls),
+        Err(err) => unavailable_batch_audit_decision(
+            target.provider_id,
+            target.model_id,
+            calls,
+            format!("audit agent failed: {}", err.message),
+        ),
+    })
+}
+
+fn print_audit_start(call_count: usize, model_id: &str) {
+    eprintln!(
+        "  {DIM}{CYAN}audit{RESET} {CYAN}{call_count} tool(s){RESET} {DIM}· {model_id}{RESET}"
+    );
+}
+
+fn append_audit_event(
+    paths: &AppPaths,
+    config: &AppConfig,
+    args: &AskArgs,
+    session_id: &str,
+    tool_name: Option<&str>,
+    tool_call_id: Option<&str>,
+    audit: &AuditReport,
+) -> AppResult<()> {
+    let auto_save = config.defaults.auto_save_session.unwrap_or(true);
+    if args.ephemeral || !auto_save {
+        return Ok(());
+    }
+
+    append_events(
+        paths,
+        config,
+        session_id,
+        &[SessionEvent::Audit(SessionAudit {
+            provider: audit.provider.clone(),
+            model: audit.model.clone(),
+            tool_name: tool_name.map(|value| value.to_string()),
+            tool_call_id: tool_call_id.map(|value| value.to_string()),
+            verdict: audit.verdict.clone(),
+            summary: audit.message.clone(),
+            findings: Vec::new(),
+            recommendations: Vec::new(),
+            latency_ms: audit.latency_ms,
+            usage: audit.usage.clone(),
+            created_at: now_rfc3339(),
+        })],
+    )
+}
+
+fn print_audit_warning(tool_name: &str, tool_call_id: &str, audit: &AuditReport) {
+    let short_id = truncate_tool_call_id(tool_call_id);
+    eprintln!(
+        "  {RED}audit{RESET} {RED}{tool_name}{RESET} {DIM}{short_id}{RESET} {RED}{}{RESET}",
+        audit.message
+    );
+}
+
+fn print_audit_pass(tool_name: &str, tool_call_id: &str, audit: &AuditReport) {
+    let short_id = truncate_tool_call_id(tool_call_id);
+    eprintln!(
+        "  {GREEN}audit{RESET} {GREEN}{tool_name}{RESET} {DIM}{short_id}{RESET} {GREEN}{}{RESET}",
+        audit.message
+    );
+}
+
 fn persist_partial_tool_turn(
     paths: &AppPaths,
     config: &AppConfig,
@@ -889,7 +1370,7 @@ async fn handle_repl(
                 Some(OutputFormat::Text),
             )
             .await?;
-            println!("{}", render_markdown(&result.output.message.content, false));
+            println!("{}", format_final_ask_output(config, &result, false)?);
         } else if args.stream {
             execute_ask_stream(
                 cli,
@@ -962,6 +1443,43 @@ fn read_single_repl_line(
 struct AskExecution {
     format: OutputFormat,
     output: AskOutput,
+}
+
+#[derive(Debug, Clone)]
+struct AuditReport {
+    provider: String,
+    model: String,
+    verdict: String,
+    message: String,
+    latency_ms: u64,
+    usage: crate::session::Usage,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditAgentItem {
+    id: String,
+    verdict: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditAgentResponse {
+    #[serde(default)]
+    results: Vec<AuditAgentItem>,
+}
+
+#[derive(Debug, Clone)]
+struct BatchAuditDecision {
+    reports: BTreeMap<String, AuditReport>,
+}
+
+#[derive(Clone)]
+struct ResolvedChatTarget {
+    provider_id: String,
+    provider: ProviderConfig,
+    model_id: String,
+    model: ModelConfig,
+    api_key: String,
 }
 
 #[derive(Clone)]
@@ -1121,9 +1639,9 @@ async fn execute_ask_with_tools(
             }
 
             eprintln!(
-                "[round {}] model requested {} tool call(s)",
+                "{DIM}[tools {}]{RESET} {}",
                 round + 1,
-                response.tool_calls.len()
+                summarize_tool_call_names(&response.tool_calls)
             );
 
             prepared.request.messages.push(ChatMessage {
@@ -1135,11 +1653,67 @@ async fn execute_ask_with_tools(
                 name: None,
             });
 
+            let dangerous_calls = response
+                .tool_calls
+                .iter()
+                .filter_map(|raw_call| parse_tool_call(raw_call).ok())
+                .filter(|call| tool_requires_agent_review(config, call))
+                .collect::<Vec<_>>();
+            let audit_batch = if dangerous_calls.is_empty() {
+                None
+            } else {
+                let audit_model_id = config
+                    .audit
+                    .model
+                    .as_deref()
+                    .unwrap_or(&prepared.request.model_id)
+                    .to_string();
+                print_audit_start(dangerous_calls.len(), &audit_model_id);
+                let batch = maybe_review_tool_call(
+                    config,
+                    secrets,
+                    &prepared.request,
+                    &prepared.session_id,
+                    &prepared.request.messages[turn_start_index..],
+                    &dangerous_calls,
+                )
+                .await;
+                if let Some(batch) = &batch {
+                    for call in &dangerous_calls {
+                        if let Some(report) = batch.reports.get(&call.id) {
+                            append_audit_event(
+                                paths,
+                                config,
+                                args,
+                                &prepared.session_id,
+                                Some(&call.name),
+                                Some(&call.id),
+                                report,
+                            )?;
+                            if report.verdict == "pass" {
+                                print_audit_pass(&call.name, &call.id, report);
+                            } else {
+                                print_audit_warning(&call.name, &call.id, report);
+                            }
+                        }
+                    }
+                }
+                batch
+            };
+
             for raw_call in &response.tool_calls {
-                prepared
-                    .request
-                    .messages
-                    .push(execute_tool_as_message(raw_call, args.yes, config));
+                let auto_confirm = parse_tool_call(raw_call)
+                    .ok()
+                    .and_then(|call| {
+                        audit_batch
+                            .as_ref()
+                            .and_then(|batch| batch.reports.get(&call.id))
+                            .map(|report| report.verdict == "pass")
+                    })
+                    .unwrap_or(false)
+                    || args.yes;
+                let tool_message = execute_tool_as_message(raw_call, auto_confirm, config);
+                prepared.request.messages.push(tool_message);
             }
         }
 
@@ -1919,6 +2493,33 @@ mod tests {
         assert!(rendered.contains("先分析"));
         assert!(rendered.contains("答案"));
         assert!(!rendered.contains("<think>"));
+    }
+
+    #[test]
+    fn parse_audit_report_extracts_json_from_wrapped_content() {
+        let calls = vec![crate::tool::ToolCall {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            arguments: json!({"command":"ls -la"}),
+        }];
+        let batch = parse_batch_audit_report(
+            ChatResponse {
+            provider_id: "cpap".to_string(),
+            model_id: "audit-model".to_string(),
+            content:
+                "<think>checking</think>\n{\"results\":[{\"id\":\"call_1\",\"verdict\":\"block\",\"message\":\"危险操作\"}]}"
+                    .to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+            },
+            &calls,
+        );
+        let report = batch.reports.get("call_1").unwrap();
+        assert_eq!(report.verdict, "block");
+        assert_eq!(report.message, "危险操作");
     }
 
     #[test]

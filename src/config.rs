@@ -67,6 +67,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub tools: ToolsConfig,
     #[serde(default)]
+    pub audit: AuditConfig,
+    #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, ProviderConfig>,
@@ -82,6 +84,7 @@ impl Default for AppConfig {
             defaults: DefaultsConfig::default(),
             session: SessionConfig::default(),
             tools: ToolsConfig::default(),
+            audit: AuditConfig::default(),
             skills: SkillsConfig::default(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
@@ -147,6 +150,21 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             max_rounds: Some(20),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    pub enabled: Option<bool>,
+    pub model: Option<String>,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: Some(false),
+            model: None,
         }
     }
 }
@@ -321,6 +339,15 @@ pub fn validate_config(config: &AppConfig) -> Vec<String> {
             ));
         }
     }
+    if let Some(model_id) = config
+        .audit
+        .model
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        && !config.models.contains_key(model_id)
+    {
+        issues.push(format!("audit.model references missing model `{model_id}`"));
+    }
     issues
 }
 
@@ -368,6 +395,8 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .unwrap_or_else(|| "jsonl".to_string())),
         "session.dir" => Ok(config.session.dir.clone().unwrap_or_default()),
         "tools.max_rounds" => Ok(config.tools.max_rounds.unwrap_or(20).to_string()),
+        "audit.enabled" => Ok(config.audit.enabled.unwrap_or(false).to_string()),
+        "audit.model" => Ok(config.audit.model.clone().unwrap_or_default()),
         "skills.paths" => serde_json::to_string(&config.skills.paths).map_err(|err| {
             AppError::new(EXIT_CONFIG, format!("failed to render skills.paths: {err}"))
         }),
@@ -416,6 +445,16 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         "session.dir" => config.session.dir = Some(value.to_string()),
         "tools.max_rounds" => {
             config.tools.max_rounds = Some(parse_u32(value, "tools.max_rounds")?);
+        }
+        "audit.enabled" => {
+            config.audit.enabled = Some(parse_bool(value)?);
+        }
+        "audit.model" => {
+            config.audit.model = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         "skills.paths" => {
             config.skills.paths = parse_string_array(value, "skills.paths")?;
@@ -540,6 +579,30 @@ mod tests {
         let mut config = AppConfig::default();
         set_config_value(&mut config, "tools.max_rounds", "12").unwrap();
         assert_eq!(config.tools.max_rounds, Some(12));
+    }
+
+    #[test]
+    fn set_config_value_parses_audit_keys() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "audit.enabled", "true").unwrap();
+        set_config_value(&mut config, "audit.model", "audit-model").unwrap();
+        assert_eq!(config.audit.enabled, Some(true));
+        assert_eq!(config.audit.model.as_deref(), Some("audit-model"));
+
+        set_config_value(&mut config, "audit.model", "").unwrap();
+        assert_eq!(config.audit.model, None);
+    }
+
+    #[test]
+    fn validate_config_reports_missing_audit_model() {
+        let mut config = AppConfig::default();
+        config.audit.model = Some("missing-audit-model".to_string());
+        let issues = validate_config(&config);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("audit.model references missing model"))
+        );
     }
 }
 

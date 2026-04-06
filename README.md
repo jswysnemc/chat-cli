@@ -12,6 +12,7 @@ A configurable LLM chat CLI written in Rust, supporting multiple providers, sess
 - **Machine-friendly output**: JSON, NDJSON, and line-based output for scripting
 - **Tool calling**: Support for function calling with confirmation
 - **Tool transcript persistence**: Sessions retain assistant `tool_calls` and tool results for replay and debugging
+- **Automatic audit subagent**: Tool-using turns can be reviewed by a second model with configurable enablement and model selection
 - **Configuration management**: TOML-based config with provider, model, and auth management
 
 ## Installation
@@ -124,6 +125,10 @@ default_model = "llama3"
 [tools]
 max_rounds = 20
 
+[audit]
+enabled = true
+model = "team-gpt-5-4"
+
 [skills]
 paths = [".claude/skills", "~/.claude/skills"]
 
@@ -164,6 +169,18 @@ temperature = 0.7
 ## Architecture Notes
 
 - Tool architecture comparison and project-specific optimizations: [`docs/tool-architecture-study.md`](./docs/tool-architecture-study.md)
+- Agent security mechanisms and operation-audit study: [`docs/agent-security-audit-study.md`](./docs/agent-security-audit-study.md)
+
+## Automatic Audit
+
+When `[audit].enabled = true`, `chat ask --tools` and `chat repl --tools` run an audit subagent before dangerous tools execute.
+
+- In the current implementation, mutating tools such as `write` and `bash` go through the audit path
+- Read-oriented tools such as `read`, `grep`, and `fetch` auto-pass and do not wait for audit
+- `audit.model`: model ID used for the audit pass; falls back to the active chat model when omitted
+- `pass`: the tool is auto-approved and runs without a manual prompt
+- `warning` / `block` / `unavailable`: a red warning is shown first, then the normal human confirmation flow is used
+- Audit results are stored as dedicated `audit` session events for later inspection
 
 ## Session Management
 
