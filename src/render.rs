@@ -9,13 +9,16 @@
 /// - Horizontal rules
 /// - <think>...</think> tag collapsing
 use crate::session::{is_temp_session, short_id};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ANSI escape codes
 const BOLD: &str = "\x1b[1m";
+const BLUE: &str = "\x1b[34m";
 const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const RESET: &str = "\x1b[0m";
+const STRIKETHROUGH: &str = "\x1b[9m";
+const UNDERLINE: &str = "\x1b[4m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
 #[allow(dead_code)]
@@ -32,11 +35,22 @@ const DELETE_LINE: &str = "\x1b[M";
 
 /// Path to store the last thinking content.
 pub fn thinking_file_path() -> PathBuf {
-    let config_dir = dirs_or_default();
-    config_dir.join(".last_thinking")
+    thinking_file_path_in(&data_dir_or_default())
 }
 
-fn dirs_or_default() -> PathBuf {
+fn thinking_file_path_in(root: &Path) -> PathBuf {
+    root.join(".last_thinking")
+}
+
+fn data_dir_or_default() -> PathBuf {
+    if let Some(dir) = dirs::data_dir() {
+        dir.join("chat-cli")
+    } else {
+        PathBuf::from(".local/share/chat-cli")
+    }
+}
+
+fn config_dir_or_default() -> PathBuf {
     if let Some(dir) = dirs::config_dir() {
         dir.join("chat-cli")
     } else {
@@ -44,9 +58,31 @@ fn dirs_or_default() -> PathBuf {
     }
 }
 
+fn legacy_thinking_file_path() -> PathBuf {
+    thinking_file_path_in(&config_dir_or_default())
+}
+
+fn migrate_legacy_thinking_file(path: &Path, legacy_path: &Path) {
+    if path.exists() || !legacy_path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::rename(legacy_path, path).is_ok() {
+        return;
+    }
+    if let Ok(content) = std::fs::read_to_string(legacy_path)
+        && std::fs::write(path, content).is_ok()
+    {
+        let _ = std::fs::remove_file(legacy_path);
+    }
+}
+
 /// Save thinking content to the persistent file.
 pub fn save_thinking(content: &str) {
     let path = thinking_file_path();
+    migrate_legacy_thinking_file(&path, &legacy_thinking_file_path());
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -56,6 +92,7 @@ pub fn save_thinking(content: &str) {
 /// Load the last saved thinking content.
 pub fn load_thinking() -> Option<String> {
     let path = thinking_file_path();
+    migrate_legacy_thinking_file(&path, &legacy_thinking_file_path());
     std::fs::read_to_string(path).ok().filter(|s| !s.is_empty())
 }
 
@@ -115,12 +152,8 @@ fn render_markdown_inner(input: &str) -> String {
 
         // Fenced code block
         if line.trim_start().starts_with("```") {
-            let indent = line.len() - line.trim_start().len();
-            let prefix = &line[..indent];
             let lang = line.trim_start().trim_start_matches('`').trim();
-            if !lang.is_empty() {
-                output.push_str(&format!("{prefix}{DIM}{CYAN}  {lang}{RESET}\n"));
-            }
+            let normalized_lang = normalize_code_lang(lang);
             i += 1;
             while i < lines.len() {
                 let code_line = lines[i];
@@ -128,7 +161,10 @@ fn render_markdown_inner(input: &str) -> String {
                     i += 1;
                     break;
                 }
-                output.push_str(&format!("{DIM}  {code_line}{RESET}\n"));
+                output.push_str(&render_code_block_line_with_lang(
+                    code_line,
+                    normalized_lang,
+                ));
                 i += 1;
             }
             continue;
@@ -150,23 +186,7 @@ fn render_markdown_inner(input: &str) -> String {
             continue;
         }
 
-        // Header
-        if let Some(rendered) = render_header(line) {
-            output.push_str(&rendered);
-            output.push('\n');
-            i += 1;
-            continue;
-        }
-
-        if let Some(rendered) = render_list_item(line) {
-            output.push_str(&rendered);
-            output.push('\n');
-            i += 1;
-            continue;
-        }
-
-        // Normal line
-        output.push_str(&render_inline(line));
+        output.push_str(&render_single_markdown_line(line));
         output.push('\n');
         i += 1;
     }
@@ -207,6 +227,44 @@ fn render_inline(text: &str) -> String {
             }
         }
 
+        if chars[i] == '[' {
+            if i + 1 < len && chars[i + 1] == '^' {
+                if let Some(end) = find_closing(&chars, i + 2, ']') {
+                    let label: String = chars[i + 2..end].iter().collect();
+                    result.push_str(&render_footnote_marker(&label));
+                    i = end + 1;
+                    continue;
+                }
+            } else if let Some(label_end) = find_closing(&chars, i + 1, ']')
+                && chars.get(label_end + 1) == Some(&'(')
+                && let Some(url_end) = find_closing(&chars, label_end + 2, ')')
+            {
+                let label: String = chars[i + 1..label_end].iter().collect();
+                let url: String = chars[label_end + 2..url_end].iter().collect();
+                result.push_str(&render_link(&label, &url));
+                i = url_end + 1;
+                continue;
+            }
+        }
+
+        if i + 2 < len && chars[i] == '*' && chars[i + 1] == '*' && chars[i + 2] == '*' {
+            if let Some(end) = find_triple_closing(&chars, i + 3, '*') {
+                let inner: String = chars[i + 3..end].iter().collect();
+                result.push_str(&format!("{BOLD}{ITALIC}{inner}{RESET}"));
+                i = end + 3;
+                continue;
+            }
+        }
+
+        if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
+            if let Some(end) = find_double_closing(&chars, i + 2, '~') {
+                let inner: String = chars[i + 2..end].iter().collect();
+                result.push_str(&format!("{STRIKETHROUGH}{inner}{RESET}"));
+                i = end + 2;
+                continue;
+            }
+        }
+
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
             if let Some(end) = find_double_closing(&chars, i + 2, '*') {
                 let inner: String = chars[i + 2..end].iter().collect();
@@ -241,6 +299,9 @@ fn render_list_item(line: &str) -> Option<String> {
         .or_else(|| trimmed.strip_prefix("* "))
         .or_else(|| trimmed.strip_prefix("+ "))
     {
+        if let Some(rendered) = render_task_list_item(indent, None, content) {
+            return Some(rendered);
+        }
         return Some(format!("{indent}{DIM}•{RESET} {}", render_inline(content)));
     }
 
@@ -251,6 +312,9 @@ fn render_list_item(line: &str) -> Option<String> {
     {
         let marker = &trimmed[..digit_count + 1];
         let content = &trimmed[digit_count + 2..];
+        if let Some(rendered) = render_task_list_item(indent, Some(marker), content) {
+            return Some(rendered);
+        }
         return Some(format!(
             "{indent}{DIM}{marker}{RESET} {}",
             render_inline(content)
@@ -258,6 +322,137 @@ fn render_list_item(line: &str) -> Option<String> {
     }
 
     None
+}
+
+fn render_blockquote_line(line: &str) -> Option<String> {
+    let (indent, depth, content) = parse_blockquote_line(line)?;
+
+    let rendered = if content.is_empty() {
+        String::new()
+    } else {
+        sticky_style(DIM, &render_single_markdown_line(content))
+    };
+    let bars = render_blockquote_bars(depth);
+
+    if rendered.is_empty() {
+        Some(format!("{indent}{bars}"))
+    } else {
+        Some(format!("{indent}{bars} {rendered}"))
+    }
+}
+
+fn render_single_markdown_line(line: &str) -> String {
+    if let Some(rendered) = render_blockquote_line(line) {
+        return rendered;
+    }
+    if let Some(rendered) = render_footnote_definition(line) {
+        return rendered;
+    }
+    if let Some(rendered) = render_header(line) {
+        return rendered;
+    }
+    if let Some(rendered) = render_list_item(line) {
+        return rendered;
+    }
+    render_inline(line)
+}
+
+fn render_task_list_item(
+    indent: &str,
+    ordered_marker: Option<&str>,
+    content: &str,
+) -> Option<String> {
+    let (checked, rest) = parse_task_marker(content)?;
+    let marker = if checked {
+        format!("{GREEN}☑{RESET}")
+    } else {
+        format!("{DIM}☐{RESET}")
+    };
+    let rendered = render_inline(rest);
+    Some(match ordered_marker {
+        Some(prefix) => format!("{indent}{DIM}{prefix}{RESET} {marker} {rendered}"),
+        None => format!("{indent}{marker} {rendered}"),
+    })
+}
+
+fn render_link(label: &str, url: &str) -> String {
+    let rendered_label = sticky_style(&format!("{UNDERLINE}{CYAN}"), &render_inline(label));
+    if label == url || rendered_label.is_empty() {
+        return rendered_label;
+    }
+    format!("{rendered_label} {DIM}{CYAN}<{url}>{RESET}")
+}
+
+fn render_code_block_line_with_lang(code_line: &str, lang: &str) -> String {
+    let highlighted = highlight_code_content(lang, code_line);
+    format!("{}\n", sticky_style(DIM, &highlighted))
+}
+
+fn parse_task_marker(content: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = content
+        .strip_prefix("[x] ")
+        .or_else(|| content.strip_prefix("[X] "))
+    {
+        return Some((true, rest));
+    }
+    if let Some(rest) = content.strip_prefix("[ ] ") {
+        return Some((false, rest));
+    }
+    None
+}
+
+fn render_footnote_definition(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let body = trimmed.strip_prefix("[^")?;
+    let (label, content) = body.split_once("]:")?;
+    let rendered_content = sticky_style(DIM, &render_inline(content.trim_start()));
+    if rendered_content.is_empty() {
+        Some(format!("{indent}{}", render_footnote_marker(label)))
+    } else {
+        Some(format!(
+            "{indent}{} {rendered_content}",
+            render_footnote_marker(label)
+        ))
+    }
+}
+
+fn render_footnote_marker(label: &str) -> String {
+    let display = footnote_display_label(label);
+    if label.chars().all(|c| c.is_ascii_digit()) {
+        format!("{DIM}{CYAN}⁽{display}⁾{RESET}")
+    } else {
+        format!("{DIM}{CYAN}[^{display}]{RESET}")
+    }
+}
+
+fn parse_blockquote_line(line: &str) -> Option<(&str, usize, &str)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('>') {
+        return None;
+    }
+    let indent = &line[..line.len() - trimmed.len()];
+    let mut depth = 0usize;
+    let mut content = trimmed;
+    while let Some(rest) = content.strip_prefix('>') {
+        depth += 1;
+        content = rest.trim_start();
+    }
+    Some((indent, depth, content))
+}
+
+fn render_blockquote_bars(depth: usize) -> String {
+    (0..depth)
+        .map(|_| format!("{BLUE}│{RESET}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn footnote_display_label(label: &str) -> String {
+    if label.chars().all(|c| c.is_ascii_digit()) {
+        return label.chars().map(to_superscript_digit).collect();
+    }
+    label.to_string()
 }
 
 fn find_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
@@ -280,6 +475,206 @@ fn find_double_closing(chars: &[char], start: usize, marker: char) -> Option<usi
         }
     }
     None
+}
+
+fn find_triple_closing(chars: &[char], start: usize, marker: char) -> Option<usize> {
+    let len = chars.len();
+    if len < 3 {
+        return None;
+    }
+    for i in start..len - 2 {
+        if chars[i] == marker && chars[i + 1] == marker && chars[i + 2] == marker {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn to_superscript_digit(ch: char) -> char {
+    match ch {
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        _ => ch,
+    }
+}
+
+fn highlight_code_content(lang: &str, line: &str) -> String {
+    let normalized = normalize_code_lang(lang);
+    if normalized.is_empty() {
+        return line.to_string();
+    }
+
+    let mut output = String::new();
+    let mut index = 0usize;
+
+    while index < line.len() {
+        if line_comment_prefix_at(line, index, normalized).is_some() {
+            output.push_str(&format!("{GREEN}{}{RESET}", &line[index..]));
+            break;
+        }
+
+        let ch = line[index..].chars().next().unwrap();
+        let ch_len = ch.len_utf8();
+
+        if ch == '"' || ch == '\'' {
+            let end = string_end_offset(line, index, ch);
+            output.push_str(&format!("{YELLOW}{}{RESET}", &line[index..end]));
+            index = end;
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let end = number_end_offset(line, index);
+            output.push_str(&format!("{MAGENTA}{}{RESET}", &line[index..end]));
+            index = end;
+            continue;
+        }
+
+        if is_identifier_start(ch) {
+            let end = identifier_end_offset(line, index);
+            let token = &line[index..end];
+            if keyword_set(normalized).contains(&token) {
+                output.push_str(&format!("{BOLD}{CYAN}{token}{RESET}"));
+            } else if boolean_literal_set(normalized).contains(&token) {
+                output.push_str(&format!("{BOLD}{MAGENTA}{token}{RESET}"));
+            } else {
+                output.push_str(token);
+            }
+            index = end;
+            continue;
+        }
+
+        output.push(ch);
+        index += ch_len;
+    }
+
+    output
+}
+
+fn normalize_code_lang(lang: &str) -> &str {
+    lang.split(|c: char| c.is_whitespace() || c == ',' || c == '{')
+        .next()
+        .unwrap_or("")
+        .trim()
+}
+
+fn line_comment_prefix_at<'a>(line: &'a str, index: usize, lang: &str) -> Option<&'a str> {
+    let rest = &line[index..];
+    comment_prefixes(lang)
+        .iter()
+        .copied()
+        .find(|prefix| rest.starts_with(prefix))
+}
+
+fn comment_prefixes(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rs" | "rust" | "js" | "jsx" | "ts" | "tsx" | "c" | "cpp" | "cc" | "cxx" | "go"
+        | "java" | "kt" | "kotlin" | "swift" | "scala" => &["//"],
+        "py" | "python" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "rb" | "ruby"
+        | "perl" | "pl" | "ini" | "conf" => &["#"],
+        "sql" | "lua" => &["--"],
+        _ => &[],
+    }
+}
+
+fn keyword_set(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rs" | "rust" => &[
+            "fn", "let", "mut", "pub", "impl", "struct", "enum", "trait", "use", "mod", "match",
+            "if", "else", "loop", "while", "for", "in", "return", "async", "await", "const",
+            "static", "crate", "super", "Self", "self",
+        ],
+        "js" | "jsx" | "ts" | "tsx" => &[
+            "function", "const", "let", "var", "return", "if", "else", "for", "while", "switch",
+            "case", "break", "continue", "class", "new", "import", "from", "export", "async",
+            "await", "try", "catch", "finally",
+        ],
+        "py" | "python" => &[
+            "def", "class", "import", "from", "return", "if", "elif", "else", "for", "while", "in",
+            "async", "await", "with", "as", "try", "except", "finally", "lambda", "pass",
+        ],
+        "sh" | "bash" | "zsh" => &[
+            "if", "then", "else", "fi", "for", "do", "done", "case", "esac", "function", "local",
+            "export", "in",
+        ],
+        "toml" => &[],
+        "json" => &[],
+        "yaml" | "yml" => &[],
+        _ => &[],
+    }
+}
+
+fn boolean_literal_set(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rs" | "rust" => &["true", "false", "None", "Some", "Ok", "Err"],
+        "js" | "jsx" | "ts" | "tsx" => &["true", "false", "null", "undefined"],
+        "py" | "python" => &["True", "False", "None"],
+        "toml" | "yaml" | "yml" => &["true", "false"],
+        "json" => &["true", "false", "null"],
+        "sh" | "bash" | "zsh" => &["true", "false"],
+        _ => &[],
+    }
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn identifier_end_offset(line: &str, start: usize) -> usize {
+    let mut index = start;
+    while index < line.len() {
+        let ch = line[index..].chars().next().unwrap();
+        if !is_identifier_continue(ch) {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn number_end_offset(line: &str, start: usize) -> usize {
+    let mut index = start;
+    while index < line.len() {
+        let ch = line[index..].chars().next().unwrap();
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | 'x' | 'X')) {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn string_end_offset(line: &str, start: usize, quote: char) -> usize {
+    let mut escaped = false;
+    let mut index = start + quote.len_utf8();
+    while index < line.len() {
+        let ch = line[index..].chars().next().unwrap();
+        index += ch.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            break;
+        }
+    }
+    index
 }
 
 fn is_horizontal_rule(line: &str) -> bool {
@@ -458,6 +853,7 @@ fn is_wide_char(c: char) -> bool {
 #[derive(Default)]
 struct LineRenderer {
     in_code_block: bool,
+    code_block_lang: String,
     table_buffer: Vec<String>,
     in_table: bool,
 }
@@ -467,19 +863,18 @@ impl LineRenderer {
         if line.trim_start().starts_with("```") {
             if self.in_code_block {
                 self.in_code_block = false;
+                self.code_block_lang.clear();
                 return String::new();
             }
 
             self.in_code_block = true;
             let lang = line.trim_start().trim_start_matches('`').trim();
-            if !lang.is_empty() {
-                return format!("{DIM}{CYAN}  {lang}{RESET}\n");
-            }
+            self.code_block_lang = normalize_code_lang(lang).to_string();
             return String::new();
         }
 
         if self.in_code_block {
-            return format!("{DIM}  {line}{RESET}\n");
+            return render_code_block_line_with_lang(line, &self.code_block_lang);
         }
 
         if line.contains('|') && !self.in_table {
@@ -515,20 +910,17 @@ impl LineRenderer {
     }
 
     fn can_render_partial_inline(&self, partial: &str) -> bool {
-        !self.in_code_block && !self.in_table && !partial.trim_start().starts_with("```")
+        !self.in_code_block
+            && !self.in_table
+            && !partial.trim_start().starts_with("```")
+            && !partial.trim_start().starts_with('>')
     }
 
     fn render_single_line(&self, line: &str) -> String {
         if is_horizontal_rule(line) {
             return format!("{DIM}{}{RESET}\n", "─".repeat(48));
         }
-        if let Some(rendered) = render_header(line) {
-            return format!("{rendered}\n");
-        }
-        if let Some(rendered) = render_list_item(line) {
-            return format!("{rendered}\n");
-        }
-        format!("{}\n", render_inline(line))
+        format!("{}\n", render_single_markdown_line(line))
     }
 }
 
@@ -792,7 +1184,7 @@ impl StreamRenderer {
         // Flush remaining text
         if !self.buffer.is_empty() {
             let remaining = std::mem::take(&mut self.buffer);
-            let rendered = render_inline(&remaining);
+            let rendered = self.normal_renderer.render_single_line(&remaining);
             if !rendered.is_empty() {
                 self.note_phase(StreamPhase::Answering);
                 output.push_str(&rendered);
@@ -1114,6 +1506,7 @@ impl Drop for StreamStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn render_markdown_keeps_thinking_without_markers() {
@@ -1130,8 +1523,9 @@ mod tests {
             "<think>\n```txt\nThis is the overwritten content using overwrite mode.\nLine 2\nLine 3\n```\n</think>\nDone",
             false,
         );
-        assert!(rendered.contains("txt"));
         assert!(rendered.contains("This is the overwritten content using overwrite mode."));
+        assert!(rendered.contains("Line "));
+        assert!(rendered.contains(&format!("{MAGENTA}2{RESET}")));
         assert!(!rendered.contains("```"));
     }
 
@@ -1142,6 +1536,87 @@ mod tests {
         assert!(rendered.contains("第一项"));
         assert!(rendered.contains("1."));
         assert!(!rendered.contains("- *"));
+    }
+
+    #[test]
+    fn render_markdown_renders_task_list_items_with_checkboxes() {
+        let rendered = render_markdown("- [x] 已完成任务\n- [ ] 未完成任务", false);
+        assert!(rendered.contains("☑"));
+        assert!(rendered.contains("☐"));
+        assert!(rendered.contains("已完成任务"));
+        assert!(rendered.contains("未完成任务"));
+        assert!(!rendered.contains("[x]"));
+        assert!(!rendered.contains("[ ]"));
+    }
+
+    #[test]
+    fn render_markdown_renders_strikethrough() {
+        let rendered = render_markdown("~~删除线文本~~", false);
+        assert!(rendered.contains(&format!("{STRIKETHROUGH}删除线文本{RESET}")));
+        assert!(!rendered.contains("~~删除线文本~~"));
+    }
+
+    #[test]
+    fn render_markdown_renders_blockquotes_with_blue_bar() {
+        let rendered = render_markdown("> 这是一段引用文本。\n> 可以包含多行。", false);
+        assert!(rendered.contains(&format!("{BLUE}│{RESET}")));
+        assert!(rendered.contains("这是一段引用文本。"));
+        assert!(rendered.contains("可以包含多行。"));
+        assert!(!rendered.contains("> 这是一段引用文本。"));
+    }
+
+    #[test]
+    fn render_markdown_renders_nested_blockquotes_with_multiple_bars() {
+        let rendered = render_markdown(">> 第二层引用", false);
+        assert!(rendered.contains(&format!("{BLUE}│{RESET} {BLUE}│{RESET}")));
+        assert!(rendered.contains("第二层引用"));
+        assert!(!rendered.contains(">> 第二层引用"));
+    }
+
+    #[test]
+    fn render_markdown_renders_bold_italic_inside_blockquote() {
+        let rendered = render_markdown("> ***粗斜体***", false);
+        assert!(rendered.contains(&format!("{BLUE}│{RESET}")));
+        assert!(rendered.contains(&format!("{BOLD}{ITALIC}粗斜体{RESET}")));
+        assert!(!rendered.contains("***粗斜体***"));
+    }
+
+    #[test]
+    fn render_markdown_renders_footnote_references_and_definitions() {
+        let rendered = render_markdown("这是一段带有脚注的文本[^1]\n\n[^1]: 这是脚注内容", false);
+        assert!(rendered.contains("这是一段带有脚注的文本"));
+        assert!(rendered.contains("这是脚注内容"));
+        assert!(rendered.contains("⁽¹⁾"));
+        assert!(!rendered.contains("[^1]"));
+        assert!(!rendered.contains("[^1]:"));
+    }
+
+    #[test]
+    fn render_markdown_renders_links_with_styled_label_and_url() {
+        let rendered = render_markdown("[OpenAI](https://openai.com)", false);
+        assert!(rendered.contains("OpenAI"));
+        assert!(rendered.contains("<https://openai.com>"));
+        assert!(!rendered.contains("[OpenAI](https://openai.com)"));
+    }
+
+    #[test]
+    fn render_markdown_renders_code_block_with_gutter() {
+        let rendered = render_markdown("```rs\nfn main() {}\n```", false);
+        assert!(!rendered.contains("▎"));
+        assert!(rendered.contains(&format!("{BOLD}{CYAN}fn{RESET}")));
+        assert!(rendered.contains("main() {}"));
+    }
+
+    #[test]
+    fn render_markdown_renders_basic_code_highlighting() {
+        let rendered = render_markdown(
+            "```rs\nfn main() { let value = \"hi\"; // note\n}\n```",
+            false,
+        );
+        assert!(rendered.contains(&format!("{BOLD}{CYAN}fn{RESET}")));
+        assert!(rendered.contains(&format!("{BOLD}{CYAN}let{RESET}")));
+        assert!(rendered.contains(&format!("{YELLOW}\"hi\"")));
+        assert!(rendered.contains(&format!("{GREEN}// note")));
     }
 
     #[test]
@@ -1179,6 +1654,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_renderer_flushes_blockquote_with_blue_bar() {
+        let mut renderer = StreamRenderer::new(false);
+        let rendered = renderer.push("> 这是引用");
+        assert!(rendered.is_empty(), "partial quote should be buffered");
+        let flushed = renderer.flush();
+        assert!(flushed.contains(&format!("{BLUE}│{RESET}")));
+        assert!(flushed.contains("这是引用"));
+        assert!(!flushed.contains("> 这是引用"));
+    }
+
+    #[test]
+    fn stream_renderer_renders_code_block_with_gutter() {
+        let mut renderer = StreamRenderer::new(false);
+        let rendered = renderer.push("```rs\nfn main() {}\n```\n");
+        assert!(!rendered.contains("▎"));
+        assert!(rendered.contains(&format!("{BOLD}{CYAN}fn{RESET}")));
+        assert!(rendered.contains("main() {}"));
+    }
+
+    #[test]
+    fn stream_renderer_renders_basic_code_highlighting() {
+        let mut renderer = StreamRenderer::new(false);
+        let rendered = renderer.push("```rs\nfn main() { let value = \"hi\"; }\n```\n");
+        assert!(rendered.contains(&format!("{BOLD}{CYAN}fn{RESET}")));
+        assert!(rendered.contains(&format!("{BOLD}{CYAN}let{RESET}")));
+        assert!(rendered.contains(&format!("{YELLOW}\"hi\"")));
+    }
+
+    #[test]
     fn format_status_bar_marks_temp_and_saved_sessions() {
         let saved = format_status_bar("deepseek", "deepseek-chat", "sess_01ABCDEF12345678");
         let temp = format_status_bar("deepseek", "deepseek-chat", "tmp_01ABCDEF12345678");
@@ -1207,5 +1711,26 @@ mod tests {
             .replace(RESET, "");
         assert_eq!(plain_first, "thinking");
         assert_eq!(plain_second, "thinking");
+    }
+
+    #[test]
+    fn migrate_legacy_thinking_file_moves_config_file_to_data_dir() {
+        let base = std::env::temp_dir().join(format!("chat-cli-render-test-{}", ulid::Ulid::new()));
+        let config_dir = base.join("config");
+        let data_dir = base.join("data");
+        let legacy_path = thinking_file_path_in(&config_dir);
+        let current_path = thinking_file_path_in(&data_dir);
+
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(&legacy_path, "legacy thinking").unwrap();
+        migrate_legacy_thinking_file(&current_path, &legacy_path);
+
+        assert_eq!(
+            fs::read_to_string(&current_path).unwrap(),
+            "legacy thinking"
+        );
+        assert!(!legacy_path.exists());
+
+        let _ = fs::remove_dir_all(base);
     }
 }
