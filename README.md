@@ -13,6 +13,7 @@ A configurable LLM chat CLI written in Rust, supporting multiple providers, sess
 - **Tool calling**: Support for function calling with confirmation
 - **Tool transcript persistence**: Sessions retain assistant `tool_calls` and tool results for replay and debugging
 - **Automatic audit subagent**: Tool-using turns can be reviewed by a second model with configurable enablement and model selection
+- **Progressive tool exposure**: Only `ToolSearch` is exposed initially, and it loads tools such as `Bash`, `Read`, `Edit`, `Grep`, `Glob`, and `WebFetch` on demand
 - **Configuration management**: TOML-based config with provider, model, and auth management
 
 ## Installation
@@ -84,16 +85,30 @@ chat session gc                  # garbage collect orphaned data
 
 ### `chat config`
 
-Manage configuration.
+Manage configuration, providers, models, and auth state.
 
 ```bash
 chat config init                 # initialize config directory
+chat config path                 # print config/data/cache paths
 chat config show                 # show full config
-chat config provider list        # list providers
+chat config get defaults.model   # read one config value
+chat config set audit.enabled true
+chat config validate             # validate references and defaults
+
+chat config provider list
+chat config provider get deepseek
 chat config provider set <id> --kind <type> --base-url <url>
-chat config model list           # list models
-chat config auth set <provider>  # set API key
-chat config doctor               # diagnose configuration issues
+chat config provider test <id>
+chat config provider remove <id>
+
+chat config model list --provider deepseek
+chat config model get deepseek-reasoner-search
+chat config model use minimax/minimax-m2-7
+chat config model remove <id>
+
+chat config auth set deepseek --env DEEPSEEK_API_KEY
+chat config auth status
+chat config auth remove deepseek
 ```
 
 ## Configuration
@@ -103,59 +118,90 @@ Default config locations (XDG compliant):
 - Secrets: `~/.config/chat-cli/secrets.toml`
 - Sessions: `~/.local/share/chat-cli/sessions/`
 
-### Example Config
+API keys should stay in `secrets.toml` or environment variables. The example below mirrors the current local setup, but private hosts and user-specific paths are intentionally redacted or normalized.
+
+### Sanitized Current Config
 
 ```toml
-[provider.openai]
-kind = "openai_compatible"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-default_model = "gpt-4o"
+[defaults]
+provider = "deepseek"                           # default provider id; must exist in [providers.*]
+model = "deepseek-reasoner-search"              # default local model id; must exist in [models.*]
+mode = "auto"                                   # current request mode
+output = "line"                                 # line | text | json | ndjson
+auto_create_session = true                      # create sessions automatically when needed
+auto_save_session = true                        # persist turns automatically
+session_id_kind = "ulid"                        # id format for new sessions
+tools = true                                    # enable tool calling by default
+system_prompt_file = "~/.config/chat-cli/system.md" # external system prompt file
+system_prompt_mode = "append"                   # append | override
+collapse_thinking = false                       # collapse <think> blocks in rendered output
 
-[provider.anthropic]
-kind = "anthropic"
-api_key_env = "ANTHROPIC_API_KEY"
-default_model = "claude-sonnet-4-20250514"
-
-[provider.ollama]
-kind = "ollama"
-base_url = "http://localhost:11434"
-default_model = "llama3"
+[session]
+store_format = "jsonl"                          # on-disk session format
+# dir = "~/.local/share/chat-cli/sessions"      # optional custom session directory
 
 [tools]
-max_rounds = 20
+max_rounds = 20                                 # max tool-calling rounds per turn
 
 [audit]
-enabled = true
-model = "team-gpt-5-4"
+enabled = true                                  # enable the dangerous-tool audit subagent
+model = "minimax-m2-7"                          # local model id from [models.*]
 
 [skills]
-paths = [".claude/skills", "~/.claude/skills"]
+paths = ["~/.claude/skills"]                    # skill search roots
 
-[model.gpt-4o]
-provider = "openai"
-remote_name = "gpt-4o"
-display_name = "GPT-4o"
-context_window = 128000
+[providers.deepseek]
+kind = "openai_compatible"                      # openai_compatible | anthropic | ollama
+base_url = "https://<private-gateway>/v1"       # sanitized endpoint
+api_key_env = "DEEPSEEK_API_KEY"                # env var name, not the secret value
+# headers = { "X-Example" = "value" }           # optional extra request headers
+# org = "example-org"                           # optional organization id
+# project = "example-project"                   # optional project id
+default_model = "deepseek-reasoner-search"      # fallback local model id
+# timeout = 120                                 # optional timeout in seconds
 
-[model.qw-coder-model]
-provider = "cpap"
-remote_name = "qw/coder-model"
-capabilities = ["chat", "reasoning", "vision", "image_generation"]
+[models.deepseek-reasoner-search]
+provider = "deepseek"                           # provider id from [providers.*]
+remote_name = "deepseek-reasoner-search"        # upstream model name sent to the API
+display_name = "deepseek-reasoner-search"       # human-readable label
+# context_window = 128000                       # optional context size hint
+# max_output_tokens = 8192                      # optional output token limit
+capabilities = ["chat", "reasoning"]           # e.g. chat reasoning vision image_generation
+# temperature = 0.7                             # optional model-level default
+# reasoning_effort = "medium"                   # optional reasoning level
+# [models.deepseek-reasoner-search.patches]
+# system_to_user = true                         # optional compatibility patch
 
-[model.team-gpt-5-4]
-provider = "cpap"
-remote_name = "team/gpt-5.4"
-capabilities = ["chat", "reasoning", "vision"]
+[profiles.review]
+provider = "deepseek"                           # profile-level provider override
+model = "deepseek-reasoner-search"              # profile-level model override
+system = "You are a careful reviewer."          # optional inline system prompt
+temperature = 0.2                               # optional runtime override
+max_output_tokens = 8192                        # optional runtime override
+output = "text"                                 # line | text | json | ndjson
+stream = true                                   # stream responses for this profile
 
-[model.team-gpt-5-4.patches]
-system_to_user = true
-
-[profile.default]
-provider = "openai"
-model = "gpt-4o"
-temperature = 0.7
+# secrets.toml
+# [providers.deepseek]
+# api_key = "<redacted>"                        # keep real secrets out of config.toml
 ```
+
+### Sanitized `secrets.toml` Example
+
+```toml
+[providers.deepseek]
+api_key = "<redacted>"
+
+[providers.minimax]
+api_key = "<redacted>"
+```
+
+### Current Local Inventory
+
+- Active defaults: `provider=deepseek`, `model=deepseek-reasoner-search`, `tools=true`, `audit.model=minimax-m2-7`
+- Configured providers: `cpap`, `deepseek`, `gb`, `grok2api`, `minimax`, `openclawbs`, `replit`
+- Configured models: `claude-opus-4-6-rep`, `claude-sonnet-4-6`, `deepseek-reasoner-search`, `gemini-3-1-pro-preview`, `grok-4-1-fast`, `grok-4-1-thinking`, `grok-4-20-beta`, `grok-imagine-1-0`, `grok-imagine-1-0-edit`, `grok-imagine-1-0-video`, `minimax-m2-7`, `minimax-m2-7-highspeed`, `minimax-m2-her`, `qw-coder-model`
+- No `[profiles.*]` entries are currently defined locally
 
 ## Output Formats
 
@@ -166,16 +212,15 @@ temperature = 0.7
 | `json`   | JSON object with metadata                |
 | `ndjson` | Newline-delimited JSON for streaming     |
 
-## Architecture Notes
+## Local Notes
 
-- Tool architecture comparison and project-specific optimizations: [`docs/tool-architecture-study.md`](./docs/tool-architecture-study.md)
-- Agent security mechanisms and operation-audit study: [`docs/agent-security-audit-study.md`](./docs/agent-security-audit-study.md)
+Study notes under `docs/` are kept as local-only files and are ignored by git.
 
 ## Automatic Audit
 
 When `[audit].enabled = true`, `chat ask --tools` and `chat repl --tools` run an audit subagent before dangerous tools execute.
 
-- In the current implementation, mutating tools such as `write` and `bash` go through the audit path
+- In the current implementation, mutating tools such as `edit` and `bash` go through the audit path
 - Read-oriented tools such as `read`, `grep`, and `fetch` auto-pass and do not wait for audit
 - `audit.model`: model ID used for the audit pass; falls back to the active chat model when omitted
 - `pass`: the tool is auto-approved and runs without a manual prompt
@@ -197,5 +242,7 @@ When tools are enabled, session files also retain:
 - `name`: tool name for tool-result messages
 
 ## License
+
+MIT. See [`LICENSE`](./LICENSE).
 
 MIT

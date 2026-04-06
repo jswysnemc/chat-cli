@@ -21,6 +21,5 @@ Thumbs.db
 # Uncomment if you want to ignore local overrides
 # config.local.toml
 
-# docs (internal)
-/docs/next.md
-/docs/product-plan.md
+# Local study docs
+/docs/

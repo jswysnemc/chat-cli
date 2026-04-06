@@ -13,11 +13,28 @@ const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
+const BRIGHT_GREEN: &str = "\x1b[38;5;151m";
+const BRIGHT_RED: &str = "\x1b[38;5;224m";
+const GUTTER: &str = "\x1b[38;5;245m";
+const ADD_BG: &str = "\x1b[48;5;22m";
+const REMOVE_BG: &str = "\x1b[48;5;52m";
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const MAX_SKILL_READ_BYTES: usize = 64 * 1024;
+const MAX_READ_LINES: usize = 2000;
+const MAX_EDIT_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 const TOOL_NAME_WIDTH: usize = 12;
-const PREVIEW_MAX_LINES: usize = 3;
 const PREVIEW_MAX_CHARS: usize = 120;
+const DIFF_PREVIEW_MAX_LINES: usize = 8;
+const DIFF_CONTEXT_LINES: usize = 1;
+const BASH_SEARCH_COMMANDS: &[&str] = &[
+    "find", "grep", "rg", "ag", "ack", "locate", "which", "whereis",
+];
+const BASH_READ_COMMANDS: &[&str] = &[
+    "cat", "head", "tail", "less", "more", "wc", "stat", "file", "strings", "jq", "awk", "cut",
+    "sort", "uniq", "tr", "pwd", "date", "uname", "whoami", "id", "ps", "env", "printenv",
+];
+const BASH_LIST_COMMANDS: &[&str] = &["ls", "tree", "du"];
+const BASH_NEUTRAL_COMMANDS: &[&str] = &["echo", "printf", "true", "false", ":"];
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -48,11 +65,14 @@ pub enum ToolParallelism {
 #[derive(Debug, Clone, Copy)]
 pub struct ToolSpec {
     pub name: &'static str,
+    pub aliases: &'static [&'static str],
     #[allow(dead_code)]
     pub description: &'static str,
+    pub search_hint: &'static str,
     pub side_effects: ToolSideEffects,
     pub parallelism: ToolParallelism,
     pub requires_confirmation: bool,
+    pub defer_loading: bool,
     pub definition: fn() -> Value,
 }
 
@@ -90,130 +110,223 @@ struct SkillEntry {
     summary: Option<String>,
 }
 
-const BUILTIN_TOOL_HANDLERS: [ToolHandler; 7] = [
+const BUILTIN_TOOL_HANDLERS: [ToolHandler; 9] = [
     ToolHandler {
         spec: ToolSpec {
-            name: "read",
-            description: "Read the contents of a file at the given path.",
+            name: "ToolSearch",
+            aliases: &["tool_search"],
+            description: "",
+            search_hint: "search deferred tools",
             side_effects: ToolSideEffects::ReadOnly,
             parallelism: ToolParallelism::ParallelSafe,
             requires_confirmation: false,
+            defer_loading: false,
+            definition: define_tool_search_tool,
+        },
+        execute: execute_tool_search_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "Read",
+            aliases: &["read"],
+            description: "Read a file from the local filesystem.",
+            search_hint: "read file contents",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            defer_loading: true,
             definition: define_read_tool,
         },
         execute: execute_read_tool,
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "write",
-            description: "Write content to a file via overwrite or unified diff patch.",
+            name: "Edit",
+            aliases: &["edit", "write", "Write"],
+            description: "Create a new file or edit an existing file by replacing old text with new text.",
+            search_hint: "create or modify file contents",
             side_effects: ToolSideEffects::Mutating,
             parallelism: ToolParallelism::SequentialOnly,
             requires_confirmation: true,
-            definition: define_write_tool,
+            defer_loading: true,
+            definition: define_edit_tool,
         },
-        execute: execute_write_tool,
+        execute: execute_edit_tool,
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "bash",
-            description: "Execute a bash command and return stdout and stderr.",
+            name: "Bash",
+            aliases: &["bash"],
+            description: "Run a shell command.",
+            search_hint: "execute shell commands",
             side_effects: ToolSideEffects::Mutating,
             parallelism: ToolParallelism::SequentialOnly,
             requires_confirmation: true,
+            defer_loading: true,
             definition: define_bash_tool,
         },
         execute: execute_bash_tool,
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "grep",
-            description: "Search for a regex pattern in files with ripgrep.",
+            name: "Grep",
+            aliases: &["grep"],
+            description: "Search for a pattern in files.",
+            search_hint: "search file contents by pattern",
             side_effects: ToolSideEffects::ReadOnly,
             parallelism: ToolParallelism::ParallelSafe,
             requires_confirmation: false,
+            defer_loading: true,
             definition: define_grep_tool,
         },
         execute: execute_grep_tool,
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "fetch",
+            name: "Glob",
+            aliases: &["glob"],
+            description: "Find files by glob pattern.",
+            search_hint: "find files by wildcard",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            defer_loading: true,
+            definition: define_glob_tool,
+        },
+        execute: execute_glob_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "WebFetch",
+            aliases: &["fetch", "web_fetch"],
             description: "Fetch content from a URL via HTTP GET.",
+            search_hint: "fetch web page contents",
             side_effects: ToolSideEffects::External,
             parallelism: ToolParallelism::ParallelSafe,
             requires_confirmation: false,
+            defer_loading: true,
             definition: define_fetch_tool,
         },
         execute: execute_fetch_tool,
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "skills_list",
+            name: "SkillsList",
+            aliases: &["skills_list"],
             description: "List available project and global skills.",
+            search_hint: "list available skills",
             side_effects: ToolSideEffects::ReadOnly,
             parallelism: ToolParallelism::ParallelSafe,
             requires_confirmation: false,
+            defer_loading: true,
             definition: define_skills_list_tool,
         },
         execute: execute_skills_list_tool,
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "skill_read",
+            name: "SkillRead",
+            aliases: &["skill_read"],
             description: "Read the SKILL.md content for a named skill.",
+            search_hint: "read skill instructions",
             side_effects: ToolSideEffects::ReadOnly,
             parallelism: ToolParallelism::ParallelSafe,
             requires_confirmation: false,
+            defer_loading: true,
             definition: define_skill_read_tool,
         },
         execute: execute_skill_read_tool,
     },
 ];
 
-fn define_read_tool() -> Value {
+fn deferred_tool_names() -> Vec<&'static str> {
+    builtin_tool_handlers()
+        .iter()
+        .filter(|handler| handler.spec.defer_loading)
+        .map(|handler| handler.spec.name)
+        .collect()
+}
+
+fn define_tool_search_tool() -> Value {
+    let available = deferred_tool_names().join(", ");
     json!({
         "type": "function",
         "function": {
-            "name": "read",
-            "description": "Read the contents of a file at the given path.",
+            "name": "ToolSearch",
+            "description": format!("Search deferred tools and load their schemas for later turns. Available tool names: {available}. Use this first before calling any deferred tool."),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "query": {
                         "type": "string",
-                        "description": "Absolute or relative file path to read."
+                        "description": "Tool name or capability phrase to search for."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of tool schemas to load. Default 5."
                     }
                 },
-                "required": ["path"]
+                "required": ["query"]
             }
         }
     })
 }
 
-fn define_write_tool() -> Value {
+fn define_read_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "write",
-            "description": "Write content to a file. Supports two modes: 'overwrite' (default) replaces the entire file, 'diff' applies a unified diff patch to the existing file.",
+            "name": "Read",
+            "description": "Read a file from the local filesystem.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "file_path": {
                         "type": "string",
-                        "description": "Absolute or relative file path to write."
+                        "description": "Absolute file path to the file to read."
                     },
-                    "content": {
-                        "type": "string",
-                        "description": "The content to write. In 'overwrite' mode: full file content. In 'diff' mode: unified diff format."
+                    "offset": {
+                        "type": "integer",
+                        "description": "Optional 1-based line number to start reading from."
                     },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["overwrite", "diff"],
-                        "description": "Write mode. 'overwrite' replaces the file entirely (default). 'diff' applies a unified diff patch."
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional maximum number of lines to read."
                     }
                 },
-                "required": ["path", "content"]
+                "required": ["file_path"]
+            }
+        }
+    })
+}
+
+fn define_edit_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "description": "Create a new file or edit an existing file by replacing old text with new text. Use old_string=\"\" when creating a new file or populating an empty file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute file path to create or edit."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace. Use an empty string to create a new file or populate an empty file."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text, or the full file contents when creating a file."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all matches instead of exactly one."
+                    }
+                },
+                "required": ["file_path", "new_string"]
             }
         }
     })
@@ -223,8 +336,8 @@ fn define_bash_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "bash",
-            "description": "Execute a bash command and return its stdout and stderr output.",
+            "name": "Bash",
+            "description": "Run a shell command and return its stdout and stderr.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -243,8 +356,8 @@ fn define_grep_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "grep",
-            "description": "Search for a regex pattern in files. Returns matching lines with file paths and line numbers. Max 50 results.",
+            "name": "Grep",
+            "description": "Search for a regex pattern in files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -254,14 +367,43 @@ fn define_grep_tool() -> Value {
                     },
                     "path": {
                         "type": "string",
-                        "description": "File or directory to search in."
+                        "description": "Optional file or directory to search in. Defaults to the current working directory."
                     },
-                    "include": {
+                    "glob": {
                         "type": "string",
                         "description": "Optional glob pattern to filter files, e.g. '*.rs', '*.py'."
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_with_matches", "count"],
+                        "description": "Search output mode. Defaults to files_with_matches."
                     }
                 },
-                "required": ["pattern", "path"]
+                "required": ["pattern"]
+            }
+        }
+    })
+}
+
+fn define_glob_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "Glob",
+            "description": "Find files by glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern such as **/*.rs or src/*.ts."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional base directory to search in."
+                    }
+                },
+                "required": ["pattern"]
             }
         }
     })
@@ -271,7 +413,7 @@ fn define_fetch_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "fetch",
+            "name": "WebFetch",
             "description": "Fetch content from a URL via HTTP GET. Returns the response body as text (max 32KB).",
             "parameters": {
                 "type": "object",
@@ -291,7 +433,7 @@ fn define_skills_list_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "skills_list",
+            "name": "SkillsList",
             "description": "List available skills from the current project's .claude/skills directory and ~/.claude/skills.",
             "parameters": {
                 "type": "object",
@@ -310,7 +452,7 @@ fn define_skill_read_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "skill_read",
+            "name": "SkillRead",
             "description": "Read the SKILL.md content for a named skill.",
             "parameters": {
                 "type": "object",
@@ -337,18 +479,97 @@ fn builtin_tool_handlers() -> &'static [ToolHandler] {
 fn find_tool_handler(name: &str) -> Option<&'static ToolHandler> {
     builtin_tool_handlers()
         .iter()
-        .find(|handler| handler.spec.name == name)
+        .find(|handler| handler.spec.name == name || handler.spec.aliases.contains(&name))
 }
 
 pub fn lookup_tool_spec(name: &str) -> Option<&'static ToolSpec> {
     find_tool_handler(name).map(|handler| &handler.spec)
 }
 
-/// Returns OpenAI-compatible tool definitions.
-pub fn tool_definitions() -> Vec<Value> {
+pub fn tool_call_side_effects(call: &ToolCall) -> ToolSideEffects {
+    if matches!(call.name.as_str(), "Bash" | "bash")
+        && call.arguments["command"]
+            .as_str()
+            .is_some_and(is_read_only_bash_command)
+    {
+        return ToolSideEffects::ReadOnly;
+    }
+    lookup_tool_spec(&call.name)
+        .map(|spec| spec.side_effects)
+        .unwrap_or(ToolSideEffects::Mutating)
+}
+
+pub fn tool_call_requires_confirmation(call: &ToolCall) -> bool {
+    if matches!(tool_call_side_effects(call), ToolSideEffects::ReadOnly) {
+        return false;
+    }
+    lookup_tool_spec(&call.name)
+        .map(|spec| spec.requires_confirmation)
+        .unwrap_or(true)
+}
+
+pub fn initial_tool_definitions() -> Vec<Value> {
     builtin_tool_handlers()
         .iter()
+        .filter(|handler| !handler.spec.defer_loading)
         .map(|handler| (handler.spec.definition)())
+        .collect()
+}
+
+pub fn tool_definitions_for_names(names: &[String]) -> Vec<Value> {
+    let mut tools = initial_tool_definitions();
+    for name in names {
+        if let Some(handler) = find_tool_handler(name)
+            && handler.spec.defer_loading
+        {
+            tools.push((handler.spec.definition)());
+        }
+    }
+    tools
+}
+
+pub fn tool_search_matches(query: &str, max_results: usize) -> Vec<&'static ToolSpec> {
+    let query = query.trim().to_ascii_lowercase();
+    let mut matches = builtin_tool_handlers()
+        .iter()
+        .filter(|handler| handler.spec.defer_loading)
+        .map(|handler| {
+            let mut score = 0usize;
+            if handler.spec.name.to_ascii_lowercase() == query {
+                score += 100;
+            }
+            if handler.spec.name.to_ascii_lowercase().contains(&query) {
+                score += 50;
+            }
+            if handler
+                .spec
+                .aliases
+                .iter()
+                .any(|alias| alias.to_ascii_lowercase().contains(&query))
+            {
+                score += 25;
+            }
+            if handler
+                .spec
+                .search_hint
+                .to_ascii_lowercase()
+                .contains(&query)
+            {
+                score += 10;
+            }
+            (score, &handler.spec)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left_spec), (right_score, right_spec)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_spec.name.cmp(right_spec.name))
+    });
+    matches
+        .into_iter()
+        .take(max_results.max(1))
+        .map(|(_, spec)| spec)
         .collect()
 }
 
@@ -391,54 +612,99 @@ pub fn execute_tool(
     })
 }
 
-fn execute_read_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
-    let path = call.arguments["path"]
+fn execute_tool_search_tool(
+    call: &ToolCall,
+    _context: &ToolRuntimeContext<'_>,
+) -> AppResult<String> {
+    let query = call.arguments["query"]
         .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "read tool: missing 'path' argument"))?;
-    print_tool_header("read", path);
-    tool_read(path)
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "ToolSearch: missing 'query' argument"))?;
+    let max_results = call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
+    let matches = tool_search_matches(query, max_results);
+    if matches.is_empty() {
+        return Ok("no matching tools found".to_string());
+    }
+    let results = matches
+        .into_iter()
+        .filter_map(|spec| {
+            find_tool_handler(spec.name).map(|handler| {
+                json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "aliases": spec.aliases,
+                    "side_effects": match spec.side_effects {
+                        ToolSideEffects::ReadOnly => "read_only",
+                        ToolSideEffects::Mutating => "mutating",
+                        ToolSideEffects::External => "external",
+                    },
+                    "schema": (handler.spec.definition)(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "loaded_tools": results.iter().map(|item| item["name"].clone()).collect::<Vec<_>>(),
+        "results": results,
+    }))
+    .map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to render ToolSearch results: {err}"),
+        )
+    })
 }
 
-fn execute_write_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
-    let path = call.arguments["path"]
+fn execute_read_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let path = call.arguments["file_path"]
         .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "write tool: missing 'path' argument"))?;
-    let content = call.arguments["content"]
-        .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "write tool: missing 'content' argument"))?;
-    let mode = call.arguments["mode"].as_str().unwrap_or("overwrite");
+        .or_else(|| call.arguments["path"].as_str())
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "Read: missing 'file_path' argument"))?;
+    let normalized = normalize_tool_path(path);
+    let offset = call.arguments["offset"]
+        .as_u64()
+        .map(|value| value as usize);
+    let limit = call.arguments["limit"].as_u64().map(|value| value as usize);
+    print_tool_header("Read", &normalized);
+    tool_read(&normalized, offset, limit)
+}
 
-    match mode {
-        "diff" => {
-            let (additions, deletions) = count_diff_changes(content);
-            print_tool_header_detail(
-                "write",
-                &format!("{path} · +{additions} -{deletions}"),
-                "diff",
-            );
-            print_tool_preview(&render_diff_preview(path, content));
-            match confirm_tool_action("apply", Some(content), context.auto_confirm)? {
-                ConfirmResult::Yes => tool_write_diff(path, content),
-                ConfirmResult::No => Ok("user declined the write operation".to_string()),
-                ConfirmResult::Edit(new_diff) => tool_write_diff(path, &new_diff),
-            }
-        }
-        _ => {
-            print_tool_header_detail(
-                "write",
-                &format!(
-                    "{path} · {} lines · {} bytes",
-                    preview_line_count(content),
-                    content.len()
-                ),
-                "overwrite",
-            );
-            print_tool_preview(&render_write_preview(path, content));
-            match confirm_tool_action("write", None, context.auto_confirm)? {
-                ConfirmResult::Yes => tool_write(path, content),
-                ConfirmResult::No => Ok("user declined the write operation".to_string()),
-                ConfirmResult::Edit(new_content) => tool_write(path, &new_content),
-            }
+fn execute_edit_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let path = call.arguments["file_path"]
+        .as_str()
+        .or_else(|| call.arguments["path"].as_str())
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "Edit: missing 'file_path' argument"))?;
+    let normalized = normalize_tool_path(path);
+    let old_string = call.arguments["old_string"].as_str().unwrap_or("");
+    let new_string = call.arguments["new_string"]
+        .as_str()
+        .or_else(|| call.arguments["content"].as_str())
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "Edit: missing 'new_string' argument"))?;
+    let replace_all = call.arguments["replace_all"].as_bool().unwrap_or(false);
+
+    let diff = build_edit_preview(&normalized, old_string, new_string, replace_all)?;
+    let (additions, deletions) = count_diff_changes(&diff);
+    let display_path = display_tool_path(&normalized);
+    let mode = if old_string.is_empty() {
+        "create"
+    } else {
+        "replace"
+    };
+    let action = if old_string.is_empty() {
+        "create"
+    } else {
+        "edit"
+    };
+    print_tool_header_detail(
+        "Edit",
+        &format!("{display_path} (+{additions} -{deletions})"),
+        mode,
+    );
+    print_tool_preview(&render_diff_preview(&normalized, &diff));
+    match confirm_tool_action(action, Some(new_string), context.auto_confirm)? {
+        ConfirmResult::Yes => tool_edit(&normalized, old_string, new_string, replace_all),
+        ConfirmResult::No => Ok("user declined the edit operation".to_string()),
+        ConfirmResult::Edit(replacement) => {
+            tool_edit(&normalized, old_string, &replacement, replace_all)
         }
     }
 }
@@ -446,9 +712,10 @@ fn execute_write_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppR
 fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
     let command = call.arguments["command"]
         .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "bash tool: missing 'command' argument"))?;
-    print_tool_header("bash", &truncate_preview(command, 120));
-    match confirm_tool_action("run", Some(command), context.auto_confirm)? {
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "Bash: missing 'command' argument"))?;
+    print_tool_header("Bash", &truncate_preview(command, 120));
+    let auto_confirm = context.auto_confirm || is_read_only_bash_command(command);
+    match confirm_tool_action("run", Some(command), auto_confirm)? {
         ConfirmResult::Yes => tool_bash(command),
         ConfirmResult::No => Ok("user declined the bash execution".to_string()),
         ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd),
@@ -458,20 +725,33 @@ fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
 fn execute_grep_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
     let pattern = call.arguments["pattern"]
         .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "grep tool: missing 'pattern' argument"))?;
-    let path = call.arguments["path"]
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "Grep: missing 'pattern' argument"))?;
+    let path = call.arguments["path"].as_str().unwrap_or(".");
+    let normalized = normalize_tool_path(path);
+    let include = call.arguments["glob"]
         .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "grep tool: missing 'path' argument"))?;
-    let include = call.arguments["include"].as_str();
-    print_tool_header("grep", &format!("/{pattern}/ in {path}"));
-    tool_grep(pattern, path, include)
+        .or_else(|| call.arguments["include"].as_str());
+    let output_mode = call.arguments["output_mode"]
+        .as_str()
+        .unwrap_or("files_with_matches");
+    print_tool_header("Grep", &format!("/{pattern}/ in {normalized}"));
+    tool_grep(pattern, &normalized, include, output_mode)
+}
+
+fn execute_glob_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    let pattern = call.arguments["pattern"]
+        .as_str()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "Glob: missing 'pattern' argument"))?;
+    let path = normalize_tool_path(call.arguments["path"].as_str().unwrap_or("."));
+    print_tool_header("Glob", &format!("{pattern} in {path}"));
+    tool_glob(pattern, &path)
 }
 
 fn execute_fetch_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
     let url = call.arguments["url"]
         .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "fetch tool: missing 'url' argument"))?;
-    print_tool_header("fetch", url);
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "WebFetch: missing 'url' argument"))?;
+    print_tool_header("WebFetch", url);
     tool_fetch(url)
 }
 
@@ -480,7 +760,7 @@ fn execute_skills_list_tool(
     context: &ToolRuntimeContext<'_>,
 ) -> AppResult<String> {
     let query = call.arguments["query"].as_str();
-    print_tool_header("skills_list", query.unwrap_or("all skills"));
+    print_tool_header("SkillsList", query.unwrap_or("all skills"));
     tool_skills_list(query, context.config)
 }
 
@@ -489,18 +769,39 @@ fn execute_skill_read_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) ->
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "skill_read tool: missing 'name' argument"))?;
     let scope = call.arguments["scope"].as_str();
-    print_tool_header("skill_read", name);
+    print_tool_header("SkillRead", name);
     tool_skill_read(name, scope, context.config)
 }
 
 // ─── Tool Implementations ───
 
-fn tool_read(path: &str) -> AppResult<String> {
-    std::fs::read_to_string(path)
-        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read `{path}`: {err}")))
+fn tool_read(path: &str, offset: Option<usize>, limit: Option<usize>) -> AppResult<String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read `{path}`: {err}")))?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = offset.unwrap_or(1).max(1);
+    let effective_limit = limit.unwrap_or(MAX_READ_LINES).min(MAX_READ_LINES);
+    let end = Some(effective_limit)
+        .map(|limit| start.saturating_sub(1) + limit)
+        .unwrap_or(lines.len());
+    let numbered = lines
+        .iter()
+        .enumerate()
+        .skip(start.saturating_sub(1))
+        .take(end.saturating_sub(start.saturating_sub(1)))
+        .map(|(index, line)| format!("{:>6}\t{}", index + 1, line))
+        .collect::<Vec<_>>();
+    let mut output = numbered.join("\n");
+    if lines.len() > end {
+        output.push_str(&format!(
+            "\n... (truncated at {} lines; use offset and limit to read more)",
+            effective_limit
+        ));
+    }
+    Ok(output)
 }
 
-fn tool_write(path: &str, content: &str) -> AppResult<String> {
+fn write_file_contents(path: &str, content: &str) -> AppResult<()> {
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|err| {
@@ -512,17 +813,156 @@ fn tool_write(path: &str, content: &str) -> AppResult<String> {
         }
     }
     std::fs::write(path, content)
-        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write `{path}`: {err}")))?;
-    Ok(format!("wrote {} bytes to {path}", content.len()))
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write `{path}`: {err}")))
 }
 
-fn tool_write_diff(path: &str, diff_content: &str) -> AppResult<String> {
-    let original = std::fs::read_to_string(path).unwrap_or_default();
-    let patched = apply_unified_diff(&original, diff_content)?;
-    std::fs::write(path, &patched)
-        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write `{path}`: {err}")))?;
-    let (add, del) = count_diff_changes(diff_content);
-    Ok(format!("patched {path} (+{add} -{del})"))
+fn build_edit_preview(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> AppResult<String> {
+    validate_edit_inputs(path, old_string, new_string)?;
+    if !Path::new(path).exists() {
+        if !old_string.is_empty() {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                format!("Edit: `{path}` does not exist; use old_string=\"\" to create a new file"),
+            ));
+        }
+        return Ok(build_full_file_diff(path, "", new_string));
+    }
+    let original = std::fs::read_to_string(path)
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read `{path}`: {err}")))?;
+    if old_string.is_empty() {
+        if !original.trim().is_empty() {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                format!(
+                    "Edit: cannot create new file at `{path}` because it already exists; read it first and replace exact text"
+                ),
+            ));
+        }
+        return Ok(build_full_file_diff(path, "", new_string));
+    }
+    let occurrences = original.matches(old_string).count();
+    if occurrences == 0 {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("Edit: old_string was not found in `{path}`"),
+        ));
+    }
+    if !replace_all && occurrences > 1 {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("Edit: old_string matched {occurrences} times; set replace_all=true"),
+        ));
+    }
+    let match_offsets = original
+        .match_indices(old_string)
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    let selected_offsets = if replace_all {
+        match_offsets
+    } else {
+        match_offsets.into_iter().take(1).collect()
+    };
+    Ok(build_edit_preview_diff(
+        path,
+        &original,
+        &selected_offsets,
+        old_string,
+        new_string,
+    ))
+}
+
+fn tool_edit(
+    path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> AppResult<String> {
+    validate_edit_inputs(path, old_string, new_string)?;
+    if !Path::new(path).exists() {
+        if !old_string.is_empty() {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                format!("Edit: `{path}` does not exist; use old_string=\"\" to create a new file"),
+            ));
+        }
+        write_file_contents(path, new_string)?;
+        return Ok(format!("created `{path}`"));
+    }
+    let original = std::fs::read_to_string(path)
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read `{path}`: {err}")))?;
+    if old_string.is_empty() {
+        if !original.trim().is_empty() {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                format!(
+                    "Edit: cannot create new file at `{path}` because it already exists; read it first and replace exact text"
+                ),
+            ));
+        }
+        write_file_contents(path, new_string)?;
+        return Ok(format!("created `{path}`"));
+    }
+    let occurrences = original.matches(old_string).count();
+    if occurrences == 0 {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("Edit: old_string was not found in `{path}`"),
+        ));
+    }
+    if !replace_all && occurrences > 1 {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("Edit: old_string matched {occurrences} times; set replace_all=true"),
+        ));
+    }
+    let updated = if replace_all {
+        original.replace(old_string, new_string)
+    } else {
+        original.replacen(old_string, new_string, 1)
+    };
+    write_file_contents(path, &updated)?;
+    Ok(format!("edited `{path}`"))
+}
+
+fn validate_edit_inputs(path: &str, old_string: &str, new_string: &str) -> AppResult<()> {
+    if old_string == new_string {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "Edit: old_string and new_string are identical",
+        ));
+    }
+    if path.ends_with(".ipynb") {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "Edit: notebook files are not supported by this tool",
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            if metadata.len() > MAX_EDIT_FILE_SIZE_BYTES {
+                return Err(AppError::new(
+                    EXIT_ARGS,
+                    format!(
+                        "Edit: file exceeds max editable size ({} bytes)",
+                        MAX_EDIT_FILE_SIZE_BYTES
+                    ),
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                format!("failed to inspect `{path}`: {err}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn tool_bash(command: &str) -> AppResult<String> {
@@ -557,41 +997,32 @@ fn tool_bash(command: &str) -> AppResult<String> {
     Ok(result)
 }
 
-fn tool_grep(pattern: &str, path: &str, include: Option<&str>) -> AppResult<String> {
-    let max_results = 50;
-    if !Path::new(path).exists() {
+fn tool_glob(pattern: &str, path: &str) -> AppResult<String> {
+    let max_results = 100usize;
+    let root = Path::new(path);
+    if !root.exists() {
         return Err(AppError::new(EXIT_ARGS, format!("path not found: {path}")));
     }
-
-    let output = Command::new("rg")
-        .args(build_ripgrep_args(pattern, path, include))
-        .output()
-        .map_err(|err| {
-            AppError::new(
-                EXIT_ARGS,
-                format!("failed to execute ripgrep (`rg`): {err}"),
-            )
-        })?;
-
-    match output.status.code() {
-        Some(0) | Some(1) => {}
-        Some(_) | None => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let message = if stderr.is_empty() {
-                "ripgrep search failed".to_string()
-            } else {
-                format!("ripgrep search failed: {stderr}")
-            };
-            return Err(AppError::new(EXIT_ARGS, message));
-        }
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (results, truncated) = parse_ripgrep_matches(&stdout, max_results)?;
-    if results.is_empty() {
+    let regex = glob_to_regex(pattern)?;
+    let mut matches = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let display = entry.path().to_string_lossy().replace('\\', "/");
+            regex.is_match(&display).then_some(display)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    if matches.is_empty() {
         Ok("no matches found".to_string())
     } else {
-        let mut output = results.join("\n");
+        let truncated = matches.len() > max_results;
+        let mut output = matches
+            .into_iter()
+            .take(max_results)
+            .collect::<Vec<_>>()
+            .join("\n");
         if truncated {
             output.push_str(&format!("\n... (truncated at {max_results} results)"));
         }
@@ -599,10 +1030,150 @@ fn tool_grep(pattern: &str, path: &str, include: Option<&str>) -> AppResult<Stri
     }
 }
 
+fn tool_grep(
+    pattern: &str,
+    path: &str,
+    include: Option<&str>,
+    output_mode: &str,
+) -> AppResult<String> {
+    let max_results = 50;
+    if !Path::new(path).exists() {
+        return Err(AppError::new(EXIT_ARGS, format!("path not found: {path}")));
+    }
+
+    match output_mode {
+        "content" => {
+            let output = Command::new("rg")
+                .args(build_ripgrep_args(pattern, path, include))
+                .output()
+                .map_err(|err| {
+                    AppError::new(
+                        EXIT_ARGS,
+                        format!("failed to execute ripgrep (`rg`): {err}"),
+                    )
+                })?;
+            match output.status.code() {
+                Some(0) | Some(1) => {}
+                Some(_) | None => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let message = if stderr.is_empty() {
+                        "ripgrep search failed".to_string()
+                    } else {
+                        format!("ripgrep search failed: {stderr}")
+                    };
+                    return Err(AppError::new(EXIT_ARGS, message));
+                }
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let (results, truncated) = parse_ripgrep_matches(&stdout, max_results)?;
+            if results.is_empty() {
+                Ok("no matches found".to_string())
+            } else {
+                let mut output = results.join("\n");
+                if truncated {
+                    output.push_str(&format!("\n... (truncated at {max_results} results)"));
+                }
+                Ok(output)
+            }
+        }
+        "files_with_matches" => {
+            let mut args = build_ripgrep_common_args(path, include);
+            args.push("-l".to_string());
+            args.push("--".to_string());
+            args.push(pattern.to_string());
+            args.push(path.to_string());
+            let output = Command::new("rg").args(args).output().map_err(|err| {
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("failed to execute ripgrep (`rg`): {err}"),
+                )
+            })?;
+            let stdout = handle_ripgrep_plain_output(output, "ripgrep search failed")?;
+            let mut files = stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(max_results + 1)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+            let truncated = files.len() > max_results;
+            files.truncate(max_results);
+            if files.is_empty() {
+                Ok("no matches found".to_string())
+            } else {
+                let mut rendered = files.join("\n");
+                if truncated {
+                    rendered.push_str(&format!("\n... (truncated at {max_results} results)"));
+                }
+                Ok(rendered)
+            }
+        }
+        "count" => {
+            let mut args = build_ripgrep_common_args(path, include);
+            args.push("-c".to_string());
+            args.push("--".to_string());
+            args.push(pattern.to_string());
+            args.push(path.to_string());
+            let output = Command::new("rg").args(args).output().map_err(|err| {
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("failed to execute ripgrep (`rg`): {err}"),
+                )
+            })?;
+            let stdout = handle_ripgrep_plain_output(output, "ripgrep count failed")?;
+            let lines = stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .take(max_results + 1)
+                .collect::<Vec<_>>();
+            if lines.is_empty() {
+                Ok("no matches found".to_string())
+            } else {
+                let truncated = lines.len() > max_results;
+                let mut rendered = lines[..lines.len().min(max_results)].join("\n");
+                if truncated {
+                    rendered.push_str(&format!("\n... (truncated at {max_results} results)"));
+                }
+                Ok(rendered)
+            }
+        }
+        other => Err(AppError::new(
+            EXIT_ARGS,
+            format!("unsupported Grep output_mode `{other}`"),
+        )),
+    }
+}
+
+fn handle_ripgrep_plain_output(
+    output: std::process::Output,
+    failure_label: &str,
+) -> AppResult<String> {
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        Some(_) | None => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                failure_label.to_string()
+            } else {
+                format!("{failure_label}: {stderr}")
+            };
+            return Err(AppError::new(EXIT_ARGS, message));
+        }
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn build_ripgrep_args(pattern: &str, path: &str, include: Option<&str>) -> Vec<String> {
+    let mut args = build_ripgrep_common_args(path, include);
+    args.push("--json".to_string());
+    args.push("--line-number".to_string());
+    args.push("--".to_string());
+    args.push(pattern.to_string());
+    args.push(path.to_string());
+    args
+}
+
+fn build_ripgrep_common_args(path: &str, include: Option<&str>) -> Vec<String> {
     let mut args = vec![
-        "--json".to_string(),
-        "--line-number".to_string(),
         "--color".to_string(),
         "never".to_string(),
         "--with-filename".to_string(),
@@ -620,9 +1191,7 @@ fn build_ripgrep_args(pattern: &str, path: &str, include: Option<&str>) -> Vec<S
         args.push("--glob".to_string());
         args.push(include.to_string());
     }
-    args.push("--".to_string());
-    args.push(pattern.to_string());
-    args.push(path.to_string());
+    let _ = path;
     args
 }
 
@@ -724,46 +1293,11 @@ fn tool_skill_read(name: &str, scope: Option<&str>, config: &AppConfig) -> AppRe
     ))
 }
 
-// ─── Unified Diff Patcher ───
-
-fn apply_unified_diff(original: &str, diff: &str) -> AppResult<String> {
-    let mut result: Vec<String> = original.lines().map(|s| s.to_string()).collect();
-
-    // Parse hunks from diff
-    let hunks = parse_diff_hunks(diff)?;
-
-    // Apply hunks in reverse order to preserve line numbers
-    let mut sorted_hunks = hunks;
-    sorted_hunks.sort_by(|a, b| b.orig_start.cmp(&a.orig_start));
-
-    for hunk in &sorted_hunks {
-        let start = hunk.orig_start.saturating_sub(1); // 1-indexed to 0-indexed
-        let end = (start + hunk.orig_count).min(result.len());
-
-        let mut new_lines: Vec<String> = Vec::new();
-        for line in &hunk.lines {
-            match line.kind {
-                DiffLineKind::Context | DiffLineKind::Add => {
-                    new_lines.push(line.content.to_string());
-                }
-                DiffLineKind::Remove => {}
-            }
-        }
-
-        result.splice(start..end, new_lines);
-    }
-
-    let mut output = result.join("\n");
-    // Preserve trailing newline if original had one
-    if original.ends_with('\n') {
-        output.push('\n');
-    }
-    Ok(output)
-}
-
 struct DiffHunk<'a> {
     orig_start: usize,
     orig_count: usize,
+    new_start: usize,
+    new_count: usize,
     lines: Vec<DiffLine<'a>>,
 }
 
@@ -788,7 +1322,7 @@ fn parse_diff_hunks(diff: &str) -> AppResult<Vec<DiffHunk<'_>>> {
         let line = lines[i];
         // Look for @@ -start,count +start,count @@
         if line.starts_with("@@") {
-            let (orig_start, orig_count) = parse_hunk_header(line)?;
+            let (orig_start, orig_count, new_start, new_count) = parse_hunk_header(line)?;
             i += 1;
 
             let mut hunk_lines = Vec::new();
@@ -822,6 +1356,8 @@ fn parse_diff_hunks(diff: &str) -> AppResult<Vec<DiffHunk<'_>>> {
             hunks.push(DiffHunk {
                 orig_start,
                 orig_count,
+                new_start,
+                new_count,
                 lines: hunk_lines,
             });
         } else {
@@ -839,7 +1375,7 @@ fn parse_diff_hunks(diff: &str) -> AppResult<Vec<DiffHunk<'_>>> {
     Ok(hunks)
 }
 
-fn parse_hunk_header(line: &str) -> AppResult<(usize, usize)> {
+fn parse_hunk_header(line: &str) -> AppResult<(usize, usize, usize, usize)> {
     // @@ -start,count +start,count @@
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -850,7 +1386,7 @@ fn parse_hunk_header(line: &str) -> AppResult<(usize, usize)> {
     }
     let orig_part = parts[1]; // -start,count
     let orig = orig_part.trim_start_matches('-');
-    let (start, count) = if let Some((s, c)) = orig.split_once(',') {
+    let (orig_start, orig_count) = if let Some((s, c)) = orig.split_once(',') {
         (
             s.parse::<usize>().unwrap_or(1),
             c.parse::<usize>().unwrap_or(0),
@@ -858,7 +1394,17 @@ fn parse_hunk_header(line: &str) -> AppResult<(usize, usize)> {
     } else {
         (orig.parse::<usize>().unwrap_or(1), 1)
     };
-    Ok((start, count))
+    let new_part = parts[2]; // +start,count
+    let new = new_part.trim_start_matches('+');
+    let (new_start, new_count) = if let Some((s, c)) = new.split_once(',') {
+        (
+            s.parse::<usize>().unwrap_or(1),
+            c.parse::<usize>().unwrap_or(0),
+        )
+    } else {
+        (new.parse::<usize>().unwrap_or(1), 1)
+    };
+    Ok((orig_start, orig_count, new_start, new_count))
 }
 
 fn count_diff_changes(diff: &str) -> (usize, usize) {
@@ -872,6 +1418,38 @@ fn count_diff_changes(diff: &str) -> (usize, usize) {
         }
     }
     (additions, deletions)
+}
+
+fn glob_to_regex(pattern: &str) -> AppResult<regex::Regex> {
+    let mut regex = String::from("^");
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    regex.push_str(".*");
+                } else {
+                    regex.push_str("[^/]*");
+                }
+            }
+            '?' => regex.push('.'),
+            '.' => regex.push_str("\\."),
+            '/' => regex.push('/'),
+            other if "+()[]{}^$|\\".contains(other) => {
+                regex.push('\\');
+                regex.push(other);
+            }
+            other => regex.push(other),
+        }
+    }
+    regex.push('$');
+    regex::Regex::new(&regex).map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("invalid glob pattern `{pattern}`: {err}"),
+        )
+    })
 }
 
 // ─── UI Helpers ───
@@ -892,70 +1470,318 @@ fn print_tool_preview(rendered: &str) {
     }
 }
 
-fn render_write_preview(path: &str, content: &str) -> String {
-    let mut lines = Vec::new();
-    if let Some(lang) = preview_language(path) {
-        lines.push(format!(
-            "{DIM}{lang} · {} lines · {} bytes{RESET}",
-            preview_line_count(content),
-            content.len()
-        ));
-    } else {
-        lines.push(format!(
-            "{DIM}{} lines · {} bytes{RESET}",
-            preview_line_count(content),
-            content.len()
-        ));
-    }
+fn render_diff_preview(path: &str, diff: &str) -> String {
+    let hunks = match parse_diff_hunks(diff) {
+        Ok(hunks) => hunks,
+        Err(_) => return render_fallback_diff_preview(path, diff),
+    };
+    let max_line_number = hunks
+        .iter()
+        .flat_map(|hunk| {
+            [
+                hunk.orig_start.saturating_add(hunk.orig_count),
+                hunk.new_start.saturating_add(hunk.new_count),
+            ]
+        })
+        .max()
+        .unwrap_or(1);
+    let gutter_width = max_line_number.max(1).to_string().len();
+    let mut output = Vec::new();
+    let total_lines = hunks.iter().map(|hunk| hunk.lines.len()).sum::<usize>();
+    let mut shown = 0usize;
+    let mut truncated = false;
 
-    if content.is_empty() {
-        lines.push(format!("{DIM}· (empty file){RESET}"));
-        return lines.join("\n");
+    'hunks: for (index, hunk) in hunks.iter().enumerate() {
+        if index > 0 && shown < DIFF_PREVIEW_MAX_LINES {
+            output.push(format!("{DIM}...{RESET}"));
+        }
+        let mut old_line = hunk.orig_start;
+        let mut new_line = hunk.new_start;
+        for line in &hunk.lines {
+            if shown >= DIFF_PREVIEW_MAX_LINES {
+                truncated = true;
+                break 'hunks;
+            }
+            match line.kind {
+                DiffLineKind::Context => {
+                    output.push(format_diff_preview_line(
+                        Some(old_line),
+                        ' ',
+                        line.content,
+                        gutter_width,
+                        None,
+                        Some(DIM),
+                    ));
+                    old_line += 1;
+                    new_line += 1;
+                }
+                DiffLineKind::Remove => {
+                    output.push(format_diff_preview_line(
+                        Some(old_line),
+                        '-',
+                        line.content,
+                        gutter_width,
+                        Some((REMOVE_BG, BRIGHT_RED)),
+                        Some(GUTTER),
+                    ));
+                    old_line += 1;
+                }
+                DiffLineKind::Add => {
+                    output.push(format_diff_preview_line(
+                        Some(new_line),
+                        '+',
+                        line.content,
+                        gutter_width,
+                        Some((ADD_BG, BRIGHT_GREEN)),
+                        Some(GUTTER),
+                    ));
+                    new_line += 1;
+                }
+            }
+            shown += 1;
+        }
     }
-
-    let content_lines = content.lines().collect::<Vec<_>>();
-    for line in content_lines.iter().take(PREVIEW_MAX_LINES) {
-        lines.push(format!(
-            "{DIM}· {}{RESET}",
-            truncate_preview(line, PREVIEW_MAX_CHARS)
-        ));
+    if truncated || total_lines > shown {
+        output.push(format!("{DIM}...{RESET}"));
     }
-    if content_lines.len() > PREVIEW_MAX_LINES {
-        lines.push(format!("{DIM}· ...{RESET}"));
+    if output.is_empty() {
+        return render_fallback_diff_preview(path, diff);
     }
-    lines.join("\n")
+    output.join("\n")
 }
 
-fn render_diff_preview(path: &str, diff: &str) -> String {
-    let mut output = Vec::new();
-    let (additions, deletions) = count_diff_changes(diff);
-    output.push(format!(
-        "{DIM}{path} · +{additions} -{deletions} · {} lines{RESET}",
-        preview_line_count(diff)
-    ));
+fn render_fallback_diff_preview(path: &str, diff: &str) -> String {
+    let mut output = vec![format!(
+        "{DIM}{} · diff preview unavailable{RESET}",
+        display_tool_path(path)
+    )];
     let mut shown = 0usize;
     for line in diff.lines() {
-        if shown >= PREVIEW_MAX_LINES {
+        if shown >= DIFF_PREVIEW_MAX_LINES {
             break;
         }
         if line.starts_with('+') && !line.starts_with("+++") {
             output.push(format!(
-                "{GREEN}· {}{RESET}",
-                truncate_preview(line, PREVIEW_MAX_CHARS)
+                "{GREEN}+ {}{RESET}",
+                truncate_preview(line.trim_start_matches('+'), PREVIEW_MAX_CHARS)
             ));
             shown += 1;
         } else if line.starts_with('-') && !line.starts_with("---") {
             output.push(format!(
-                "{RED}· {}{RESET}",
-                truncate_preview(line, PREVIEW_MAX_CHARS)
+                "{RED}- {}{RESET}",
+                truncate_preview(line.trim_start_matches('-'), PREVIEW_MAX_CHARS)
             ));
             shown += 1;
         }
     }
-    if additions + deletions > shown {
-        output.push(format!("{DIM}· ...{RESET}"));
-    }
     output.join("\n")
+}
+
+fn format_diff_preview_line(
+    line_number: Option<usize>,
+    marker: char,
+    content: &str,
+    gutter_width: usize,
+    highlight: Option<(&str, &str)>,
+    gutter_style: Option<&str>,
+) -> String {
+    let line_label = line_number
+        .map(|value| format!("{value:>gutter_width$}"))
+        .unwrap_or_else(|| " ".repeat(gutter_width));
+    let content = truncate_code_preview(content, PREVIEW_MAX_CHARS);
+    match highlight {
+        Some((background, foreground)) => format!(
+            "{background}{}{line_label} {foreground}{marker} {content}{RESET}",
+            gutter_style.unwrap_or(foreground)
+        ),
+        None => format!(
+            "{}{line_label} {marker} {content}{RESET}",
+            gutter_style.unwrap_or(DIM)
+        ),
+    }
+}
+
+fn build_edit_preview_diff(
+    path: &str,
+    original: &str,
+    match_offsets: &[usize],
+    old_string: &str,
+    new_string: &str,
+) -> String {
+    let display_path = display_tool_path(path);
+    let original_lines = original.lines().collect::<Vec<_>>();
+    let line_starts = line_start_offsets(original);
+    let mut diff = format!("--- {display_path}\n+++ {display_path}\n");
+    let mut line_delta = 0isize;
+
+    for &match_start in match_offsets {
+        let match_end = match_start + old_string.len();
+        let start_line = line_index_for_offset(&line_starts, match_start);
+        let end_line = line_index_for_offset(&line_starts, match_end.saturating_sub(1));
+        let context_start = start_line.saturating_sub(DIFF_CONTEXT_LINES);
+        let context_end = (end_line + DIFF_CONTEXT_LINES + 1).min(original_lines.len());
+        let block_start = line_starts[start_line];
+        let block_end = line_end_offset(original, &line_starts, end_line);
+        let block = &original[block_start..block_end];
+        let local_start = match_start.saturating_sub(block_start);
+        let local_end = local_start + old_string.len();
+        let updated_block = format!(
+            "{}{}{}",
+            &block[..local_start],
+            new_string,
+            &block[local_end..]
+        );
+        let block_lines = block.lines().collect::<Vec<_>>();
+        let updated_block_lines = updated_block.lines().collect::<Vec<_>>();
+        let diff_lines = diff_line_sequences(&block_lines, &updated_block_lines);
+        let orig_start = context_start + 1;
+        let new_start = (orig_start as isize + line_delta).max(1) as usize;
+        let orig_count = (start_line - context_start)
+            + block_lines.len()
+            + context_end.saturating_sub(end_line + 1);
+        let new_count = (start_line - context_start)
+            + updated_block_lines.len()
+            + context_end.saturating_sub(end_line + 1);
+        diff.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            orig_start, orig_count, new_start, new_count
+        ));
+        for line in &original_lines[context_start..start_line] {
+            push_diff_line(&mut diff, ' ', line);
+        }
+        for (kind, content) in diff_lines {
+            push_diff_line(
+                &mut diff,
+                match kind {
+                    DiffLineKind::Context => ' ',
+                    DiffLineKind::Add => '+',
+                    DiffLineKind::Remove => '-',
+                },
+                &content,
+            );
+        }
+        for line in &original_lines[end_line + 1..context_end] {
+            push_diff_line(&mut diff, ' ', line);
+        }
+        line_delta += updated_block_lines.len() as isize - block_lines.len() as isize;
+    }
+
+    diff
+}
+
+fn build_full_file_diff(path: &str, original: &str, updated: &str) -> String {
+    let display_path = display_tool_path(path);
+    let original_lines = if original.is_empty() {
+        Vec::new()
+    } else {
+        original.lines().collect::<Vec<_>>()
+    };
+    let updated_lines = if updated.is_empty() {
+        Vec::new()
+    } else {
+        updated.lines().collect::<Vec<_>>()
+    };
+    let mut diff = format!("--- {display_path}\n+++ {display_path}\n");
+    diff.push_str(&format!(
+        "@@ -1,{} +1,{} @@\n",
+        original_lines.len(),
+        updated_lines.len()
+    ));
+    for (kind, content) in diff_line_sequences(&original_lines, &updated_lines) {
+        push_diff_line(
+            &mut diff,
+            match kind {
+                DiffLineKind::Context => ' ',
+                DiffLineKind::Add => '+',
+                DiffLineKind::Remove => '-',
+            },
+            &content,
+        );
+    }
+    diff
+}
+
+fn push_diff_line(output: &mut String, prefix: char, content: &str) {
+    output.push(prefix);
+    output.push_str(content);
+    output.push('\n');
+}
+
+fn diff_line_sequences<'a>(
+    old_lines: &[&'a str],
+    new_lines: &[&'a str],
+) -> Vec<(DiffLineKind, String)> {
+    let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
+    for old_index in (0..old_lines.len()).rev() {
+        for new_index in (0..new_lines.len()).rev() {
+            lcs[old_index][new_index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[old_index + 1][new_index + 1] + 1
+            } else {
+                lcs[old_index + 1][new_index].max(lcs[old_index][new_index + 1])
+            };
+        }
+    }
+
+    let mut diff = Vec::new();
+    let mut old_index = 0usize;
+    let mut new_index = 0usize;
+    while old_index < old_lines.len() && new_index < new_lines.len() {
+        if old_lines[old_index] == new_lines[new_index] {
+            diff.push((DiffLineKind::Context, old_lines[old_index].to_string()));
+            old_index += 1;
+            new_index += 1;
+        } else if lcs[old_index + 1][new_index] >= lcs[old_index][new_index + 1] {
+            diff.push((DiffLineKind::Remove, old_lines[old_index].to_string()));
+            old_index += 1;
+        } else {
+            diff.push((DiffLineKind::Add, new_lines[new_index].to_string()));
+            new_index += 1;
+        }
+    }
+    while old_index < old_lines.len() {
+        diff.push((DiffLineKind::Remove, old_lines[old_index].to_string()));
+        old_index += 1;
+    }
+    while new_index < new_lines.len() {
+        diff.push((DiffLineKind::Add, new_lines[new_index].to_string()));
+        new_index += 1;
+    }
+    diff
+}
+
+fn display_tool_path(path: &str) -> String {
+    let candidate = Path::new(path);
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| candidate.strip_prefix(&cwd).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| candidate.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn line_start_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < content.len() {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
+    match line_starts.binary_search(&offset) {
+        Ok(index) => index,
+        Err(0) => 0,
+        Err(index) => index.saturating_sub(1),
+    }
+}
+
+fn line_end_offset(content: &str, line_starts: &[usize], line_index: usize) -> usize {
+    line_starts
+        .get(line_index + 1)
+        .copied()
+        .unwrap_or(content.len())
 }
 
 /// Interactive tool confirmation with y/n/e(dit) options.
@@ -1201,14 +2027,6 @@ fn resolve_skill_entry<'a>(
     }
 }
 
-fn preview_line_count(content: &str) -> usize {
-    if content.is_empty() {
-        0
-    } else {
-        content.matches('\n').count() + 1
-    }
-}
-
 fn format_tool_label(name: &str, mode: Option<&str>) -> String {
     let label = mode.map_or_else(|| name.to_string(), |mode| format!("{name}:{mode}"));
     format!("{label:<TOOL_NAME_WIDTH$}")
@@ -1226,31 +2044,105 @@ fn truncate_preview(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn preview_language(path: &str) -> Option<&'static str> {
-    let ext = Path::new(path).extension()?.to_str()?;
-    match ext {
-        "rs" => Some("rust"),
-        "py" => Some("python"),
-        "js" => Some("javascript"),
-        "ts" => Some("typescript"),
-        "tsx" => Some("tsx"),
-        "jsx" => Some("jsx"),
-        "sh" => Some("shell"),
-        "bash" => Some("bash"),
-        "zsh" => Some("zsh"),
-        "json" => Some("json"),
-        "toml" => Some("toml"),
-        "yaml" | "yml" => Some("yaml"),
-        "md" => Some("markdown"),
-        "html" => Some("html"),
-        "css" => Some("css"),
-        _ => None,
+fn truncate_code_preview(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        format!("{}...", value.chars().take(max_chars).collect::<String>())
     }
+}
+
+fn normalize_tool_path(path: &str) -> String {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        candidate.to_string_lossy().to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(candidate))
+            .unwrap_or_else(|_| candidate.to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+fn split_command_segments(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+        if matches!(ch, ';' | '|')
+            || (ch == '&' && next == Some('&'))
+            || (ch == '|' && next == Some('|'))
+        {
+            if !current.trim().is_empty() {
+                parts.push(current.trim().to_string());
+            }
+            current.clear();
+            if (ch == '&' || ch == '|') && next == Some(ch) {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        current.push(ch);
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn command_base_name(segment: &str) -> Option<&str> {
+    segment.split_whitespace().next()
+}
+
+fn is_read_only_bash_command(command: &str) -> bool {
+    let segments = split_command_segments(command);
+    if segments.is_empty() {
+        return false;
+    }
+
+    let mut has_non_neutral = false;
+    for segment in segments {
+        if segment.contains('>') || segment.contains(">>") {
+            return false;
+        }
+        let Some(base) = command_base_name(&segment) else {
+            continue;
+        };
+        if BASH_NEUTRAL_COMMANDS.contains(&base) {
+            continue;
+        }
+        has_non_neutral = true;
+        if BASH_SEARCH_COMMANDS.contains(&base)
+            || BASH_READ_COMMANDS.contains(&base)
+            || BASH_LIST_COMMANDS.contains(&base)
+        {
+            continue;
+        }
+        if base == "git" {
+            let sub = segment.split_whitespace().nth(1).unwrap_or_default();
+            if matches!(
+                sub,
+                "status" | "diff" | "show" | "log" | "branch" | "rev-parse"
+            ) {
+                continue;
+            }
+        }
+        return false;
+    }
+    has_non_neutral
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1351,10 +2243,115 @@ mod tests {
         assert_eq!(grep.side_effects, ToolSideEffects::ReadOnly);
         assert!(grep.is_parallel_safe());
         assert!(!grep.requires_confirmation);
+        assert_eq!(grep.name, "Grep");
 
         let fetch = lookup_tool_spec("fetch").unwrap();
         assert_eq!(fetch.side_effects, ToolSideEffects::External);
         assert!(!fetch.requires_confirmation);
+
+        let write_alias = lookup_tool_spec("write").unwrap();
+        assert_eq!(write_alias.name, "Edit");
+        assert!(write_alias.requires_confirmation);
+    }
+
+    #[test]
+    fn initial_tool_definitions_only_exposes_tool_search() {
+        let defs = initial_tool_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0]["function"]["name"].as_str(), Some("ToolSearch"));
+    }
+
+    #[test]
+    fn tool_search_matches_claude_style_tools() {
+        let matches = tool_search_matches("shell", 3);
+        let names = matches.iter().map(|spec| spec.name).collect::<Vec<_>>();
+        assert!(names.contains(&"Bash"));
+
+        let write_matches = tool_search_matches("write", 3);
+        let write_names = write_matches
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(write_names.contains(&"Edit"));
+        assert!(!write_names.contains(&"Write"));
+    }
+
+    #[test]
+    fn bash_read_only_detection_distinguishes_safe_and_mutating_commands() {
+        assert!(is_read_only_bash_command("ls -la"));
+        assert!(is_read_only_bash_command("pwd && date && uname -a"));
+        assert!(!is_read_only_bash_command("echo hi > /tmp/x"));
+        assert!(!is_read_only_bash_command("rm -f /tmp/x"));
+    }
+
+    #[test]
+    fn tool_call_side_effects_downgrades_read_only_bash() {
+        let read_only_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "Bash".to_string(),
+            arguments: json!({"command":"ls -la"}),
+        };
+        let mutating_call = ToolCall {
+            id: "call_2".to_string(),
+            name: "Bash".to_string(),
+            arguments: json!({"command":"rm -f /tmp/x"}),
+        };
+        assert_eq!(
+            tool_call_side_effects(&read_only_call),
+            ToolSideEffects::ReadOnly
+        );
+        assert_eq!(
+            tool_call_side_effects(&mutating_call),
+            ToolSideEffects::Mutating
+        );
+        assert!(!tool_call_requires_confirmation(&read_only_call));
+        assert!(tool_call_requires_confirmation(&mutating_call));
+    }
+
+    #[test]
+    fn build_edit_preview_diff_includes_hunk_context_and_changes() {
+        let original = "fn main() {\n    old_call();\n}\n";
+        let match_start = original.find("old_call();").unwrap();
+        let diff = build_edit_preview_diff(
+            "src/app.rs",
+            original,
+            &[match_start],
+            "old_call();",
+            "new_call();\n    trace_call();",
+        );
+
+        assert!(diff.contains("@@ -1,3 +1,4 @@"));
+        assert!(diff.contains(" fn main() {"));
+        assert!(diff.contains("-    old_call();"));
+        assert!(diff.contains("+    new_call();"));
+        assert!(diff.contains("+    trace_call();"));
+    }
+
+    #[test]
+    fn build_full_file_diff_renders_file_creation() {
+        let diff = build_full_file_diff("src/new.rs", "", "fn main() {}\n");
+        assert!(diff.contains("@@ -1,0 +1,1 @@"));
+        assert!(diff.contains("+fn main() {}"));
+    }
+
+    #[test]
+    fn render_diff_preview_renders_line_numbers_for_removed_and_added_lines() {
+        let diff = "\
+--- src/app.rs
++++ src/app.rs
+@@ -10,3 +10,4 @@
+ fn main() {
+-    old_call();
++    new_call();
++    trace_call();
+ }
+";
+        let stripped = strip_ansi(&render_diff_preview("src/app.rs", diff));
+
+        assert!(stripped.contains("10   fn main() {"));
+        assert!(stripped.contains("11 -     old_call();"));
+        assert!(stripped.contains("11 +     new_call();"));
+        assert!(stripped.contains("12 +     trace_call();"));
     }
 
     fn make_temp_dir(label: &str) -> PathBuf {
@@ -1365,5 +2362,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chat-cli-{label}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn strip_ansi(value: &str) -> String {
+        Regex::new(r"\x1b\[[0-9;]*m")
+            .unwrap()
+            .replace_all(value, "")
+            .into_owned()
     }
 }

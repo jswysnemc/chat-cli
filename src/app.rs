@@ -23,11 +23,16 @@ use crate::session::{
     list_session_summaries, load_state, now_rfc3339, read_events, resolve_session_id,
     set_current_session, short_id,
 };
-use crate::tool::{execute_tool, lookup_tool_spec, parse_tool_call, tool_definitions};
+use crate::tool::{
+    execute_tool, initial_tool_definitions, lookup_tool_spec, parse_tool_call,
+    tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
+    tool_search_matches,
+};
 use clap::CommandFactory;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
 
@@ -763,6 +768,46 @@ fn execute_tool_as_message(
     }
 }
 
+fn execute_tool_as_message_with_context(
+    raw_call: &Value,
+    auto_confirm: bool,
+    config: &AppConfig,
+    transcript: &[ChatMessage],
+) -> ChatMessage {
+    let fallback_id = raw_call["id"]
+        .as_str()
+        .unwrap_or("invalid_tool_call")
+        .to_string();
+    let fallback_name = raw_call["function"]["name"]
+        .as_str()
+        .unwrap_or("unknown_tool")
+        .to_string();
+
+    match parse_tool_call(raw_call) {
+        Ok(call) => {
+            if let Err(err) = call_requires_prior_read(transcript, &call) {
+                return ChatMessage {
+                    role: "tool".to_string(),
+                    content: format!("tool execution error: {}", err.message),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id),
+                    name: Some(call.name),
+                };
+            }
+            execute_tool_as_message(raw_call, auto_confirm, config)
+        }
+        Err(err) => ChatMessage {
+            role: "tool".to_string(),
+            content: format!("tool invocation error: {}", err.message),
+            images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: Some(fallback_id),
+            name: Some(fallback_name),
+        },
+    }
+}
+
 fn chat_message_has_payload(message: &ChatMessage) -> bool {
     !message.content.is_empty()
         || !message.images.is_empty()
@@ -819,6 +864,14 @@ fn tool_side_effects_label(name: &str) -> &'static str {
     }
 }
 
+fn tool_call_side_effects_label(call: &crate::tool::ToolCall) -> &'static str {
+    match tool_call_side_effects(call) {
+        crate::tool::ToolSideEffects::ReadOnly => "read_only",
+        crate::tool::ToolSideEffects::Mutating => "mutating",
+        crate::tool::ToolSideEffects::External => "external",
+    }
+}
+
 fn tool_parallelism_label(name: &str) -> &'static str {
     match lookup_tool_spec(name).map(|spec| spec.parallelism) {
         Some(crate::tool::ToolParallelism::ParallelSafe) => "parallel_safe",
@@ -835,9 +888,9 @@ fn summarize_tool_call(raw_call: &Value) -> Value {
                 "id": call.id,
                 "name": call.name,
                 "arguments_preview": audit_preview_value(&call.arguments, 600),
-                "side_effects": spec.map(|tool| tool_side_effects_label(tool.name)).unwrap_or("unknown"),
+                "side_effects": tool_call_side_effects_label(&call),
                 "parallelism": spec.map(|tool| tool_parallelism_label(tool.name)).unwrap_or("unknown"),
-                "requires_confirmation": spec.map(|tool| tool.requires_confirmation).unwrap_or(false),
+                "requires_confirmation": tool_call_requires_confirmation(&call),
             })
         }
         Err(err) => json!({
@@ -861,31 +914,72 @@ fn truncate_tool_call_id(id: &str) -> String {
 fn summarize_tool_call_activity(raw_call: &Value) -> String {
     match parse_tool_call(raw_call) {
         Ok(call) => match call.name.as_str() {
+            "ToolSearch" | "tool_search" => format!(
+                "ToolSearch: {}",
+                audit_preview_text(call.arguments["query"].as_str().unwrap_or(""), 32)
+            ),
             "bash" => format!(
                 "bash: {}",
                 audit_preview_text(call.arguments["command"].as_str().unwrap_or(""), 40)
             ),
-            "write" => format!(
-                "write: {}",
-                audit_preview_text(call.arguments["path"].as_str().unwrap_or(""), 32)
+            "Bash" => format!(
+                "Bash: {}",
+                audit_preview_text(call.arguments["command"].as_str().unwrap_or(""), 40)
+            ),
+            "Write" | "write" | "Edit" | "edit" => format!(
+                "Edit: {}",
+                audit_preview_text(
+                    call.arguments["file_path"]
+                        .as_str()
+                        .or_else(|| call.arguments["path"].as_str())
+                        .unwrap_or(""),
+                    32
+                )
             ),
             "read" => format!(
                 "read: {}",
                 audit_preview_text(call.arguments["path"].as_str().unwrap_or(""), 32)
             ),
+            "Read" => format!(
+                "Read: {}",
+                audit_preview_text(
+                    call.arguments["file_path"]
+                        .as_str()
+                        .or_else(|| call.arguments["path"].as_str())
+                        .unwrap_or(""),
+                    32
+                )
+            ),
             "fetch" => format!(
                 "fetch: {}",
+                audit_preview_text(call.arguments["url"].as_str().unwrap_or(""), 40)
+            ),
+            "WebFetch" | "web_fetch" => format!(
+                "WebFetch: {}",
                 audit_preview_text(call.arguments["url"].as_str().unwrap_or(""), 40)
             ),
             "grep" => format!(
                 "grep: {}",
                 audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
             ),
+            "Grep" => format!(
+                "Grep: {}",
+                audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
+            ),
+            "Glob" | "glob" => format!(
+                "Glob: {}",
+                audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
+            ),
             "skill_read" => format!(
                 "skill_read: {}",
                 audit_preview_text(call.arguments["name"].as_str().unwrap_or(""), 24)
             ),
+            "SkillRead" => format!(
+                "SkillRead: {}",
+                audit_preview_text(call.arguments["name"].as_str().unwrap_or(""), 24)
+            ),
             "skills_list" => "skills_list".to_string(),
+            "SkillsList" => "SkillsList".to_string(),
             other => other.to_string(),
         },
         Err(_) => "unknown_tool".to_string(),
@@ -898,6 +992,90 @@ fn summarize_tool_call_names(raw_calls: &[Value]) -> String {
         .map(summarize_tool_call_activity)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn normalize_tool_path(path: &str) -> String {
+    let candidate = std::path::Path::new(path);
+    if candidate.is_absolute() {
+        candidate.to_string_lossy().to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(candidate))
+            .unwrap_or_else(|_| candidate.to_path_buf())
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+fn call_file_path(call: &crate::tool::ToolCall) -> Option<String> {
+    match call.name.as_str() {
+        "Read" | "Edit" | "Write" | "read" | "edit" | "write" => call.arguments["file_path"]
+            .as_str()
+            .or_else(|| call.arguments["path"].as_str())
+            .map(normalize_tool_path),
+        _ => None,
+    }
+}
+
+fn transcript_has_read_for_path(transcript: &[ChatMessage], target_path: &str) -> bool {
+    transcript
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter_map(|raw_call| parse_tool_call(raw_call).ok())
+        .any(|call| {
+            matches!(call.name.as_str(), "Read" | "read")
+                && call_file_path(&call).as_deref() == Some(target_path)
+        })
+}
+
+fn call_requires_prior_read(
+    transcript: &[ChatMessage],
+    call: &crate::tool::ToolCall,
+) -> AppResult<()> {
+    let Some(path) = call_file_path(call) else {
+        return Ok(());
+    };
+    if !matches!(call.name.as_str(), "Edit" | "Write" | "edit" | "write") {
+        return Ok(());
+    }
+    if !std::path::Path::new(&path).exists() {
+        return Ok(());
+    }
+    if call.arguments["old_string"]
+        .as_str()
+        .is_some_and(str::is_empty)
+        && std::fs::read_to_string(&path)
+            .map(|content| content.trim().is_empty())
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if transcript_has_read_for_path(transcript, &path) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        EXIT_ARGS,
+        format!(
+            "{}: file must be read first with Read before modifying `{}`",
+            call.name, path
+        ),
+    ))
+}
+
+fn discovered_tool_names_from_search(raw_call: &Value) -> Vec<String> {
+    let Ok(call) = parse_tool_call(raw_call) else {
+        return Vec::new();
+    };
+    if call.name != "ToolSearch" && call.name != "tool_search" {
+        return Vec::new();
+    }
+    let query = call.arguments["query"].as_str().unwrap_or_default();
+    let max_results = call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
+    tool_search_matches(query, max_results)
+        .into_iter()
+        .map(|spec| spec.name.to_string())
+        .collect()
 }
 
 fn build_tool_review_payload(
@@ -953,11 +1131,9 @@ fn build_tool_review_payload(
                 "id": call.id,
                 "name": call.name,
                 "arguments": call.arguments,
-                "side_effects": tool_side_effects_label(&call.name),
+                "side_effects": tool_call_side_effects_label(call),
                 "parallelism": tool_parallelism_label(&call.name),
-                "requires_confirmation": lookup_tool_spec(&call.name)
-                    .map(|tool| tool.requires_confirmation)
-                    .unwrap_or(false),
+                "requires_confirmation": tool_call_requires_confirmation(call),
             })
         }).collect::<Vec<_>>(),
         "transcript": transcript,
@@ -1116,8 +1292,10 @@ fn resolve_audit_target(
 
 fn tool_requires_agent_review(config: &AppConfig, call: &crate::tool::ToolCall) -> bool {
     config.audit.enabled.unwrap_or(false)
-        && lookup_tool_spec(&call.name)
-            .is_some_and(|spec| spec.side_effects == crate::tool::ToolSideEffects::Mutating)
+        && matches!(
+            tool_call_side_effects(call),
+            crate::tool::ToolSideEffects::Mutating
+        )
 }
 
 async fn maybe_review_tool_call(
@@ -1551,13 +1729,16 @@ async fn execute_ask_with_tools(
     output_override: Option<OutputFormat>,
 ) -> AppResult<AskExecution> {
     let mut prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
-    prepared.request.tools = tool_definitions();
+    let mut loaded_tool_names = BTreeSet::new();
+    prepared.request.tools = initial_tool_definitions();
     let max_rounds = config.tools.max_rounds.unwrap_or(20) as usize;
     let turn_start_index = prepared.request.messages.len().saturating_sub(1);
     let response_result: AppResult<ChatResponse> = async {
         let mut final_response: Option<ChatResponse> = None;
 
         for round in 0..max_rounds {
+            prepared.request.tools =
+                tool_definitions_for_names(&loaded_tool_names.iter().cloned().collect::<Vec<_>>());
             let use_stream = should_stream_tool_round(&prepared.request, args.stream, round);
             let mut stdout = io::stdout();
             let collapse = config.defaults.collapse_thinking.unwrap_or(false);
@@ -1702,6 +1883,9 @@ async fn execute_ask_with_tools(
             };
 
             for raw_call in &response.tool_calls {
+                for tool_name in discovered_tool_names_from_search(raw_call) {
+                    loaded_tool_names.insert(tool_name);
+                }
                 let auto_confirm = parse_tool_call(raw_call)
                     .ok()
                     .and_then(|call| {
@@ -1712,7 +1896,12 @@ async fn execute_ask_with_tools(
                     })
                     .unwrap_or(false)
                     || args.yes;
-                let tool_message = execute_tool_as_message(raw_call, auto_confirm, config);
+                let tool_message = execute_tool_as_message_with_context(
+                    raw_call,
+                    auto_confirm,
+                    config,
+                    &prepared.request.messages,
+                );
                 prepared.request.messages.push(tool_message);
             }
         }

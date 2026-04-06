@@ -11,6 +11,7 @@
 - **工具调用**：支持函数调用和确认机制
 - **工具链路落盘**：会话可持久化 assistant `tool_calls` 和 tool result，便于回放与调试
 - **自动审核子 agent**：可对发生 tool 操作的回合做二次安全审核，支持配置开关和审核模型
+- **渐进式工具暴露**：默认只暴露 `ToolSearch`，由模型先搜索并加载 `Bash`、`Read`、`Edit`、`Grep`、`Glob`、`WebFetch` 等工具
 - **配置管理**：基于 TOML 的配置，支持 provider、model、auth 管理
 
 ## 安装
@@ -86,16 +87,30 @@ chat session gc              # 垃圾回收孤立数据
 
 ### `chat config`
 
-管理配置。
+管理配置、provider、model 和认证状态。
 
 ```bash
 chat config init              # 初始化配置目录
+chat config path              # 打印配置/数据/缓存路径
 chat config show              # 显示完整配置
-chat config provider list     # 列出 providers
+chat config get defaults.model
+chat config set audit.enabled true
+chat config validate          # 校验引用关系和默认项
+
+chat config provider list
+chat config provider get deepseek
 chat config provider set <id> --kind <type> --base-url <url>
-chat config model list        # 列出模型
-chat config auth set <provider> # 设置 API 密钥
-chat config doctor            # 诊断配置问题
+chat config provider test <id>
+chat config provider remove <id>
+
+chat config model list --provider deepseek
+chat config model get deepseek-reasoner-search
+chat config model use minimax/minimax-m2-7
+chat config model remove <id>
+
+chat config auth set deepseek --env DEEPSEEK_API_KEY
+chat config auth status
+chat config auth remove deepseek
 ```
 
 ## 配置
@@ -105,59 +120,90 @@ chat config doctor            # 诊断配置问题
 - 密钥：`~/.config/chat-cli/secrets.toml`
 - 会话：`~/.local/share/chat-cli/sessions/`
 
-### 配置示例
+API 密钥应放在 `secrets.toml` 或环境变量里。下面的示例按照当前本地配置整理，但私有域名和用户专属路径已经做了脱敏或归一化处理。
+
+### 当前配置脱敏版
 
 ```toml
-[provider.openai]
-kind = "openai_compatible"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-default_model = "gpt-4o"
+[defaults]
+provider = "deepseek"                           # 默认 provider id，必须存在于 [providers.*]
+model = "deepseek-reasoner-search"              # 默认本地 model id，必须存在于 [models.*]
+mode = "auto"                                   # 当前请求模式
+output = "line"                                 # line | text | json | ndjson
+auto_create_session = true                      # 需要时自动创建会话
+auto_save_session = true                        # 自动持久化会话
+session_id_kind = "ulid"                        # 新会话 id 格式
+tools = true                                    # 默认启用工具调用
+system_prompt_file = "~/.config/chat-cli/system.md" # 外部 system prompt 文件
+system_prompt_mode = "append"                   # append | override
+collapse_thinking = false                       # 是否折叠 <think> 输出
 
-[provider.anthropic]
-kind = "anthropic"
-api_key_env = "ANTHROPIC_API_KEY"
-default_model = "claude-sonnet-4-20250514"
-
-[provider.ollama]
-kind = "ollama"
-base_url = "http://localhost:11434"
-default_model = "llama3"
+[session]
+store_format = "jsonl"                          # 会话落盘格式
+# dir = "~/.local/share/chat-cli/sessions"      # 可选，自定义会话目录
 
 [tools]
-max_rounds = 20
+max_rounds = 20                                 # 单轮 ask/repl 最多允许多少轮工具调用
 
 [audit]
-enabled = true
-model = "team-gpt-5-4"
+enabled = true                                  # 启用危险工具审核子 agent
+model = "minimax-m2-7"                          # 审核使用的本地 model id，来自 [models.*]
 
 [skills]
-paths = [".claude/skills", "~/.claude/skills"]
+paths = ["~/.claude/skills"]                    # 技能扫描目录
 
-[model.gpt-4o]
-provider = "openai"
-remote_name = "gpt-4o"
-display_name = "GPT-4o"
-context_window = 128000
+[providers.deepseek]
+kind = "openai_compatible"                      # openai_compatible | anthropic | ollama
+base_url = "https://<private-gateway>/v1"       # 已脱敏的接口地址
+api_key_env = "DEEPSEEK_API_KEY"                # 环境变量名，不是密钥明文
+# headers = { "X-Example" = "value" }           # 可选，附加请求头
+# org = "example-org"                           # 可选，组织 id
+# project = "example-project"                   # 可选，项目 id
+default_model = "deepseek-reasoner-search"      # provider 级默认 model，本地 id
+# timeout = 120                                 # 可选，超时时间（秒）
 
-[model.qw-coder-model]
-provider = "cpap"
-remote_name = "qw/coder-model"
-capabilities = ["chat", "reasoning", "vision", "image_generation"]
+[models.deepseek-reasoner-search]
+provider = "deepseek"                           # 关联的 provider id
+remote_name = "deepseek-reasoner-search"        # 实际发给上游 API 的模型名
+display_name = "deepseek-reasoner-search"       # 本地展示名
+# context_window = 128000                       # 可选，上下文窗口提示值
+# max_output_tokens = 8192                      # 可选，输出上限
+capabilities = ["chat", "reasoning"]           # 例如 chat reasoning vision image_generation
+# temperature = 0.7                             # 可选，模型默认 temperature
+# reasoning_effort = "medium"                   # 可选，推理强度
+# [models.deepseek-reasoner-search.patches]
+# system_to_user = true                         # 可选，兼容性 patch
 
-[model.team-gpt-5-4]
-provider = "cpap"
-remote_name = "team/gpt-5.4"
-capabilities = ["chat", "reasoning", "vision"]
+[profiles.review]
+provider = "deepseek"                           # profile 级 provider 覆盖
+model = "deepseek-reasoner-search"              # profile 级 model 覆盖
+system = "You are a careful reviewer."          # 可选，内联 system prompt
+temperature = 0.2                               # 可选，运行时覆盖
+max_output_tokens = 8192                        # 可选，运行时覆盖
+output = "text"                                 # line | text | json | ndjson
+stream = true                                   # 此 profile 是否流式输出
 
-[model.team-gpt-5-4.patches]
-system_to_user = true
-
-[profile.default]
-provider = "openai"
-model = "gpt-4o"
-temperature = 0.7
+# secrets.toml
+# [providers.deepseek]
+# api_key = "<redacted>"                        # 真正的密钥不要写进 config.toml
 ```
+
+### `secrets.toml` 脱敏示例
+
+```toml
+[providers.deepseek]
+api_key = "<redacted>"
+
+[providers.minimax]
+api_key = "<redacted>"
+```
+
+### 当前本地清单
+
+- 当前默认项：`provider=deepseek`、`model=deepseek-reasoner-search`、`tools=true`、`audit.model=minimax-m2-7`
+- 已配置 provider：`cpap`、`deepseek`、`gb`、`grok2api`、`minimax`、`openclawbs`、`replit`
+- 已配置 model：`claude-opus-4-6-rep`、`claude-sonnet-4-6`、`deepseek-reasoner-search`、`gemini-3-1-pro-preview`、`grok-4-1-fast`、`grok-4-1-thinking`、`grok-4-20-beta`、`grok-imagine-1-0`、`grok-imagine-1-0-edit`、`grok-imagine-1-0-video`、`minimax-m2-7`、`minimax-m2-7-highspeed`、`minimax-m2-her`、`qw-coder-model`
+- 当前本地尚未定义任何 `[profiles.*]`
 
 ## 输出格式
 
@@ -168,16 +214,15 @@ temperature = 0.7
 | `json`  | 带元数据的 JSON 对象      |
 | `ndjson`| 流式输出的换行分隔 JSON    |
 
-## 架构学习
+## 本地笔记
 
-- 工具架构对照与本项目优化说明：[`docs/tool-architecture-study.md`](./docs/tool-architecture-study.md)
-- Agent 安全机制与操作审计学习：[`docs/agent-security-audit-study.md`](./docs/agent-security-audit-study.md)
+`docs/` 下的学习笔记只保留在本地，已加入 git 忽略。
 
 ## 自动审核
 
 当 `[audit].enabled = true` 时，`chat ask --tools` 和 `chat repl --tools` 会在危险 tool 执行前触发一个审核子 agent。
 
-- 当前实现里，`write`、`bash` 这类 `mutating` tool 会进入审核链路
+- 当前实现里，`edit`、`bash` 这类 `mutating` tool 会进入审核链路
 - `read`、`grep`、`fetch` 这类只读或只取回内容的 tool 会直接通过，不进审核
 - `audit.model`：审核使用的模型 ID；未配置时回退到当前对话模型
 - 审核 `pass`：自动放行，不再询问人工
@@ -199,5 +244,7 @@ temperature = 0.7
 - `name`：tool 名称
 
 ## 许可
+
+MIT，见 [`LICENSE`](./LICENSE)。
 
 MIT
