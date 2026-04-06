@@ -12,8 +12,8 @@ A configurable LLM chat CLI written in Rust, supporting multiple providers, sess
 - **Machine-friendly output**: JSON, NDJSON, and line-based output for scripting
 - **Tool calling**: Support for function calling with confirmation
 - **Tool transcript persistence**: Sessions retain assistant `tool_calls` and tool results for replay and debugging
-- **Automatic audit subagent**: Tool-using turns can be reviewed by a second model with configurable enablement and model selection
-- **Progressive tool exposure**: Only `ToolSearch` is exposed initially, and it loads tools such as `Bash`, `Read`, `Edit`, `Grep`, `Glob`, and `WebFetch` on demand
+- **Automatic audit subagent**: Tool-using turns can be reviewed by a second model with configurable enablement, model selection, and prompt files
+- **Configurable tool exposure**: Use progressive loading to expose `ToolSearch` first, or disable it to expose the full tool metadata upfront
 - **Configuration management**: TOML-based config with provider, model, and auth management
 
 ## Installation
@@ -142,10 +142,14 @@ store_format = "jsonl"                          # on-disk session format
 
 [tools]
 max_rounds = 20                                 # max tool-calling rounds per turn
+progressive_loading = true                     # true: expose ToolSearch first; false: expose all tool schemas upfront
 
 [audit]
 enabled = true                                  # enable the dangerous-tool audit subagent
 model = "minimax-m2-7"                          # local model id from [models.*]
+default_prompt_file = "/home/example/.config/chat-cli/prompts/audit-default.md"
+bash_prompt_file = "/home/example/.config/chat-cli/prompts/audit-bash.md"
+edit_prompt_file = "/home/example/.config/chat-cli/prompts/audit-edit.md"
 
 [skills]
 paths = ["~/.claude/skills"]                    # skill search roots
@@ -216,9 +220,12 @@ When `[audit].enabled = true`, `chat ask --tools` and `chat repl --tools` run an
 - In the current implementation, mutating tools such as `edit` and `bash` go through the audit path
 - Read-oriented tools such as `read`, `grep`, and `fetch` auto-pass and do not wait for audit
 - `audit.model`: model ID used for the audit pass; falls back to the active chat model when omitted
+- `audit.default_prompt_file`, `audit.bash_prompt_file`, `audit.edit_prompt_file`: editable prompt files used by the audit subagent; the `bash` and `edit` reviews use their own prompt files
 - `pass`: the tool is auto-approved and runs without a manual prompt
 - `warning` / `block` / `unavailable`: a red warning is shown first, then the normal human confirmation flow is used
 - Audit results are stored as dedicated `audit` session events for later inspection
+
+Default audit prompt files are created under the config directory's `prompts/` folder so they can be edited directly during prompt tuning.
 
 ## Session Management
 

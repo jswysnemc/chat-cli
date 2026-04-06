@@ -4,9 +4,9 @@ use crate::cli::{
 };
 use crate::config::{
     AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderSecret,
-    SecretsConfig, ensure_dirs, init_config_files, load_config, load_secrets, parse_headers,
-    read_system_prompt, render_config_value, save_config, save_secrets, set_config_value,
-    validate_config,
+    SecretsConfig, apply_runtime_config_defaults, ensure_dirs, init_config_files, load_config,
+    load_secrets, parse_headers, read_system_prompt, render_config_value, save_config,
+    save_secrets, set_config_value, validate_config,
 };
 use crate::error::{
     AppError, AppResult, EXIT_ARGS, EXIT_AUTH, EXIT_CONFIG, EXIT_MODEL, EXIT_PROVIDER,
@@ -62,6 +62,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
     }
 
     let mut config = load_config(&paths)?;
+    apply_runtime_config_defaults(&paths, &mut config);
     ensure_dirs(&paths, &config)?;
     let mut secrets = load_secrets(&paths)?;
 
@@ -1078,6 +1079,57 @@ fn discovered_tool_names_from_search(raw_call: &Value) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AuditPromptKind {
+    Default,
+    Bash,
+    Edit,
+}
+
+fn audit_prompt_kind(call: &crate::tool::ToolCall) -> AuditPromptKind {
+    match call.name.as_str() {
+        "Bash" | "bash" => AuditPromptKind::Bash,
+        "Edit" | "edit" | "Write" | "write" => AuditPromptKind::Edit,
+        _ => AuditPromptKind::Default,
+    }
+}
+
+fn audit_prompt_path<'a>(config: &'a AppConfig, kind: AuditPromptKind) -> Option<&'a str> {
+    match kind {
+        AuditPromptKind::Default => config.audit.default_prompt_file.as_deref(),
+        AuditPromptKind::Bash => config.audit.bash_prompt_file.as_deref(),
+        AuditPromptKind::Edit => config.audit.edit_prompt_file.as_deref(),
+    }
+}
+
+fn audit_prompt_label(kind: AuditPromptKind) -> &'static str {
+    match kind {
+        AuditPromptKind::Default => "audit.default_prompt_file",
+        AuditPromptKind::Bash => "audit.bash_prompt_file",
+        AuditPromptKind::Edit => "audit.edit_prompt_file",
+    }
+}
+
+fn load_audit_prompt(config: &AppConfig, kind: AuditPromptKind) -> AppResult<String> {
+    let label = audit_prompt_label(kind);
+    let configured_path = audit_prompt_path(config, kind).ok_or_else(|| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!("missing configured audit prompt path `{label}`"),
+        )
+    })?;
+    let expanded = crate::config::expand_tilde(configured_path);
+    fs::read_to_string(&expanded).map_err(|err| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!(
+                "failed to read audit prompt file `{}`: {err}",
+                expanded.display()
+            ),
+        )
+    })
+}
+
 fn build_tool_review_payload(
     session_id: &str,
     transcript: &[ChatMessage],
@@ -1298,6 +1350,58 @@ fn tool_requires_agent_review(config: &AppConfig, call: &crate::tool::ToolCall) 
         )
 }
 
+async fn review_tool_call_batch(
+    target: &ResolvedChatTarget,
+    fallback_request: &ChatRequest,
+    session_id: &str,
+    transcript: &[ChatMessage],
+    calls: &[crate::tool::ToolCall],
+    prompt: String,
+) -> BatchAuditDecision {
+    let payload = build_tool_review_payload(session_id, transcript, calls);
+    let request = ChatRequest {
+        provider_id: target.provider_id.clone(),
+        provider: target.provider.clone(),
+        model_id: target.model_id.clone(),
+        model: target.model.clone(),
+        api_key: target.api_key.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: prompt,
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| payload.to_string()),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ],
+        temperature: Some(0.0),
+        max_output_tokens: Some(target.model.max_output_tokens.unwrap_or(800).min(800)),
+        params: BTreeMap::new(),
+        timeout_secs: fallback_request.timeout_secs,
+        tools: Vec::new(),
+    };
+
+    match send_chat(request).await {
+        Ok(response) => parse_batch_audit_report(response, calls),
+        Err(err) => unavailable_batch_audit_decision(
+            target.provider_id.clone(),
+            target.model_id.clone(),
+            calls,
+            format!("audit agent failed: {}", err.message),
+        ),
+    }
+}
+
 async fn maybe_review_tool_call(
     config: &AppConfig,
     secrets: &SecretsConfig,
@@ -1326,48 +1430,47 @@ async fn maybe_review_tool_call(
         }
     };
 
-    let payload = build_tool_review_payload(session_id, transcript, calls);
-    let request = ChatRequest {
-        provider_id: target.provider_id.clone(),
-        provider: target.provider.clone(),
-        model_id: target.model_id.clone(),
-        model: target.model.clone(),
-        api_key: target.api_key.clone(),
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are the approval-review subagent for a coding assistant. Review a batch of dangerous tool calls before execution. Return JSON only with this exact shape: {\"results\":[{\"id\":\"tool_call_id\",\"verdict\":\"pass|warning|block\",\"message\":\"short text\"}]}. You must return one result for each tool call id. The `message` must be plain text, no markdown, at most 12 Chinese characters or 24 English words. Use `pass` only when that tool should auto-run without human confirmation. Use `warning` when human confirmation is still needed. Use `block` when that tool is clearly unsafe.".to_string(),
-                images: Vec::new(),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: serde_json::to_string_pretty(&payload)
-                    .unwrap_or_else(|_| payload.to_string()),
-                images: Vec::new(),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            },
-        ],
-        temperature: Some(0.0),
-        max_output_tokens: Some(target.model.max_output_tokens.unwrap_or(800).min(800)),
-        params: BTreeMap::new(),
-        timeout_secs: fallback_request.timeout_secs,
-        tools: Vec::new(),
-    };
+    let mut grouped_calls = BTreeMap::<AuditPromptKind, Vec<crate::tool::ToolCall>>::new();
+    for call in calls {
+        grouped_calls
+            .entry(audit_prompt_kind(call))
+            .or_default()
+            .push(call.clone());
+    }
 
-    Some(match send_chat(request).await {
-        Ok(response) => parse_batch_audit_report(response, calls),
-        Err(err) => unavailable_batch_audit_decision(
-            target.provider_id,
-            target.model_id,
-            calls,
-            format!("audit agent failed: {}", err.message),
-        ),
-    })
+    let mut reports = BTreeMap::new();
+    for (kind, group) in grouped_calls {
+        let prompt = match load_audit_prompt(config, kind) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                reports.extend(
+                    unavailable_batch_audit_decision(
+                        target.provider_id.clone(),
+                        target.model_id.clone(),
+                        &group,
+                        format!("audit prompt could not be loaded: {}", err.message),
+                    )
+                    .reports,
+                );
+                continue;
+            }
+        };
+
+        reports.extend(
+            review_tool_call_batch(
+                &target,
+                fallback_request,
+                session_id,
+                transcript,
+                &group,
+                prompt,
+            )
+            .await
+            .reports,
+        );
+    }
+
+    Some(BatchAuditDecision { reports })
 }
 
 fn print_audit_start(call_count: usize, model_id: &str) {
@@ -1730,15 +1833,17 @@ async fn execute_ask_with_tools(
 ) -> AppResult<AskExecution> {
     let mut prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     let mut loaded_tool_names = BTreeSet::new();
-    prepared.request.tools = initial_tool_definitions();
+    prepared.request.tools = initial_tool_definitions(config);
     let max_rounds = config.tools.max_rounds.unwrap_or(20) as usize;
     let turn_start_index = prepared.request.messages.len().saturating_sub(1);
     let response_result: AppResult<ChatResponse> = async {
         let mut final_response: Option<ChatResponse> = None;
 
         for round in 0..max_rounds {
-            prepared.request.tools =
-                tool_definitions_for_names(&loaded_tool_names.iter().cloned().collect::<Vec<_>>());
+            prepared.request.tools = tool_definitions_for_names(
+                config,
+                &loaded_tool_names.iter().cloned().collect::<Vec<_>>(),
+            );
             let use_stream = should_stream_tool_round(&prepared.request, args.stream, round);
             let mut stdout = io::stdout();
             let collapse = config.defaults.collapse_thinking.unwrap_or(false);
@@ -1883,8 +1988,10 @@ async fn execute_ask_with_tools(
             };
 
             for raw_call in &response.tool_calls {
-                for tool_name in discovered_tool_names_from_search(raw_call) {
-                    loaded_tool_names.insert(tool_name);
+                if config.tools.progressive_loading.unwrap_or(true) {
+                    for tool_name in discovered_tool_names_from_search(raw_call) {
+                        loaded_tool_names.insert(tool_name);
+                    }
                 }
                 let auto_confirm = parse_tool_call(raw_call)
                     .ok()
@@ -2709,6 +2816,63 @@ mod tests {
         let report = batch.reports.get("call_1").unwrap();
         assert_eq!(report.verdict, "block");
         assert_eq!(report.message, "危险操作");
+    }
+
+    #[test]
+    fn audit_prompt_kind_routes_bash_and_edit_calls() {
+        let bash_call = crate::tool::ToolCall {
+            id: "call_bash".to_string(),
+            name: "Bash".to_string(),
+            arguments: json!({"command":"git status"}),
+        };
+        let edit_call = crate::tool::ToolCall {
+            id: "call_edit".to_string(),
+            name: "write".to_string(),
+            arguments: json!({"path":"src/main.rs"}),
+        };
+        let other_call = crate::tool::ToolCall {
+            id: "call_other".to_string(),
+            name: "OtherMutatingTool".to_string(),
+            arguments: json!({}),
+        };
+
+        assert_eq!(audit_prompt_kind(&bash_call), AuditPromptKind::Bash);
+        assert_eq!(audit_prompt_kind(&edit_call), AuditPromptKind::Edit);
+        assert_eq!(audit_prompt_kind(&other_call), AuditPromptKind::Default);
+    }
+
+    #[test]
+    fn load_audit_prompt_reads_configured_prompt_files() {
+        let (paths, base_dir) = test_paths();
+        let mut config = test_config();
+        let prompt_dir = paths.config_dir.join("custom-prompts");
+        fs::create_dir_all(&prompt_dir).unwrap();
+
+        let default_prompt = prompt_dir.join("default.md");
+        let bash_prompt = prompt_dir.join("bash.md");
+        let edit_prompt = prompt_dir.join("edit.md");
+        fs::write(&default_prompt, "default prompt").unwrap();
+        fs::write(&bash_prompt, "bash prompt").unwrap();
+        fs::write(&edit_prompt, "edit prompt").unwrap();
+
+        config.audit.default_prompt_file = Some(default_prompt.display().to_string());
+        config.audit.bash_prompt_file = Some(bash_prompt.display().to_string());
+        config.audit.edit_prompt_file = Some(edit_prompt.display().to_string());
+
+        assert_eq!(
+            load_audit_prompt(&config, AuditPromptKind::Default).unwrap(),
+            "default prompt"
+        );
+        assert_eq!(
+            load_audit_prompt(&config, AuditPromptKind::Bash).unwrap(),
+            "bash prompt"
+        );
+        assert_eq!(
+            load_audit_prompt(&config, AuditPromptKind::Edit).unwrap(),
+            "edit prompt"
+        );
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

@@ -10,8 +10,8 @@
 - **机器友好输出**：JSON、NDJSON 和单行文本输出，方便脚本调用
 - **工具调用**：支持函数调用和确认机制
 - **工具链路落盘**：会话可持久化 assistant `tool_calls` 和 tool result，便于回放与调试
-- **自动审核子 agent**：可对发生 tool 操作的回合做二次安全审核，支持配置开关和审核模型
-- **渐进式工具暴露**：默认只暴露 `ToolSearch`，由模型先搜索并加载 `Bash`、`Read`、`Edit`、`Grep`、`Glob`、`WebFetch` 等工具
+- **自动审核子 agent**：可对发生 tool 操作的回合做二次安全审核，支持配置开关、审核模型和外部 prompt 文件
+- **可配置工具暴露模式**：可选择渐进式只先暴露 `ToolSearch`，也可关闭渐进式后一次性暴露全部工具元信息
 - **配置管理**：基于 TOML 的配置，支持 provider、model、auth 管理
 
 ## 安装
@@ -144,10 +144,14 @@ store_format = "jsonl"                          # 会话落盘格式
 
 [tools]
 max_rounds = 20                                 # 单轮 ask/repl 最多允许多少轮工具调用
+progressive_loading = true                     # true: 先暴露 ToolSearch；false: 直接暴露全部工具 schema
 
 [audit]
 enabled = true                                  # 启用危险工具审核子 agent
 model = "minimax-m2-7"                          # 审核使用的本地 model id，来自 [models.*]
+default_prompt_file = "/home/example/.config/chat-cli/prompts/audit-default.md"
+bash_prompt_file = "/home/example/.config/chat-cli/prompts/audit-bash.md"
+edit_prompt_file = "/home/example/.config/chat-cli/prompts/audit-edit.md"
 
 [skills]
 paths = ["~/.claude/skills"]                    # 技能扫描目录
@@ -219,9 +223,12 @@ api_key = "<redacted>"
 - 当前实现里，`edit`、`bash` 这类 `mutating` tool 会进入审核链路
 - `read`、`grep`、`fetch` 这类只读或只取回内容的 tool 会直接通过，不进审核
 - `audit.model`：审核使用的模型 ID；未配置时回退到当前对话模型
+- `audit.default_prompt_file`、`audit.bash_prompt_file`、`audit.edit_prompt_file`：审核子 agent 使用的可编辑 prompt 文件，其中 `bash` 和 `edit` 会分别读取各自的 prompt
 - 审核 `pass`：自动放行，不再询问人工
 - 审核 `warning` / `block` / `unavailable`：先打印红色告警，再进入人工确认
 - 审核结果会以独立 `audit` 事件写入 session，便于事后复盘
+
+默认审核 prompt 文件会自动创建在配置目录下的 `prompts/` 目录，方便直接调试和修改。
 
 ## 会话管理
 

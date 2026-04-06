@@ -6,6 +6,14 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_AUDIT_PROMPT_DIR: &str = "prompts";
+const DEFAULT_AUDIT_PROMPT_FILE: &str = "audit-default.md";
+const DEFAULT_AUDIT_BASH_PROMPT_FILE: &str = "audit-bash.md";
+const DEFAULT_AUDIT_EDIT_PROMPT_FILE: &str = "audit-edit.md";
+const DEFAULT_AUDIT_PROMPT_TEMPLATE: &str = include_str!("../assets/prompts/audit-default.md");
+const DEFAULT_AUDIT_BASH_PROMPT_TEMPLATE: &str = include_str!("../assets/prompts/audit-bash.md");
+const DEFAULT_AUDIT_EDIT_PROMPT_TEMPLATE: &str = include_str!("../assets/prompts/audit-edit.md");
+
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -144,12 +152,14 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsConfig {
     pub max_rounds: Option<u32>,
+    pub progressive_loading: Option<bool>,
 }
 
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             max_rounds: Some(20),
+            progressive_loading: Some(true),
         }
     }
 }
@@ -158,6 +168,9 @@ impl Default for ToolsConfig {
 pub struct AuditConfig {
     pub enabled: Option<bool>,
     pub model: Option<String>,
+    pub default_prompt_file: Option<String>,
+    pub bash_prompt_file: Option<String>,
+    pub edit_prompt_file: Option<String>,
 }
 
 impl Default for AuditConfig {
@@ -165,6 +178,9 @@ impl Default for AuditConfig {
         Self {
             enabled: Some(false),
             model: None,
+            default_prompt_file: None,
+            bash_prompt_file: None,
+            edit_prompt_file: None,
         }
     }
 }
@@ -250,11 +266,13 @@ pub fn ensure_dirs(paths: &AppPaths, config: &AppConfig) -> AppResult<()> {
     fs::create_dir_all(&paths.cache_dir).code(EXIT_CONFIG, "failed to create cache dir")?;
     fs::create_dir_all(paths.sessions_dir(config))
         .code(EXIT_CONFIG, "failed to create sessions dir")?;
+    ensure_default_audit_prompt_files(paths)?;
     Ok(())
 }
 
 pub fn init_config_files(paths: &AppPaths) -> AppResult<()> {
-    let config = AppConfig::default();
+    let mut config = AppConfig::default();
+    apply_runtime_config_defaults(paths, &mut config);
     ensure_dirs(paths, &config)?;
     if !paths.config_file.exists() {
         save_config(paths, &config)?;
@@ -263,6 +281,24 @@ pub fn init_config_files(paths: &AppPaths) -> AppResult<()> {
         save_secrets(paths, &SecretsConfig::default())?;
     }
     Ok(())
+}
+
+pub fn apply_runtime_config_defaults(paths: &AppPaths, config: &mut AppConfig) {
+    config.audit.default_prompt_file.get_or_insert_with(|| {
+        default_audit_prompt_path(paths, DEFAULT_AUDIT_PROMPT_FILE)
+            .display()
+            .to_string()
+    });
+    config.audit.bash_prompt_file.get_or_insert_with(|| {
+        default_audit_prompt_path(paths, DEFAULT_AUDIT_BASH_PROMPT_FILE)
+            .display()
+            .to_string()
+    });
+    config.audit.edit_prompt_file.get_or_insert_with(|| {
+        default_audit_prompt_path(paths, DEFAULT_AUDIT_EDIT_PROMPT_FILE)
+            .display()
+            .to_string()
+    });
 }
 
 pub fn load_config(paths: &AppPaths) -> AppResult<AppConfig> {
@@ -395,8 +431,16 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .unwrap_or_else(|| "jsonl".to_string())),
         "session.dir" => Ok(config.session.dir.clone().unwrap_or_default()),
         "tools.max_rounds" => Ok(config.tools.max_rounds.unwrap_or(20).to_string()),
+        "tools.progressive_loading" => {
+            Ok(config.tools.progressive_loading.unwrap_or(true).to_string())
+        }
         "audit.enabled" => Ok(config.audit.enabled.unwrap_or(false).to_string()),
         "audit.model" => Ok(config.audit.model.clone().unwrap_or_default()),
+        "audit.default_prompt_file" => {
+            Ok(config.audit.default_prompt_file.clone().unwrap_or_default())
+        }
+        "audit.bash_prompt_file" => Ok(config.audit.bash_prompt_file.clone().unwrap_or_default()),
+        "audit.edit_prompt_file" => Ok(config.audit.edit_prompt_file.clone().unwrap_or_default()),
         "skills.paths" => serde_json::to_string(&config.skills.paths).map_err(|err| {
             AppError::new(EXIT_CONFIG, format!("failed to render skills.paths: {err}"))
         }),
@@ -446,6 +490,9 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         "tools.max_rounds" => {
             config.tools.max_rounds = Some(parse_u32(value, "tools.max_rounds")?);
         }
+        "tools.progressive_loading" => {
+            config.tools.progressive_loading = Some(parse_bool(value)?);
+        }
         "audit.enabled" => {
             config.audit.enabled = Some(parse_bool(value)?);
         }
@@ -455,6 +502,15 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
             } else {
                 Some(value.to_string())
             };
+        }
+        "audit.default_prompt_file" => {
+            config.audit.default_prompt_file = normalize_optional_path(value);
+        }
+        "audit.bash_prompt_file" => {
+            config.audit.bash_prompt_file = normalize_optional_path(value);
+        }
+        "audit.edit_prompt_file" => {
+            config.audit.edit_prompt_file = normalize_optional_path(value);
         }
         "skills.paths" => {
             config.skills.paths = parse_string_array(value, "skills.paths")?;
@@ -507,6 +563,46 @@ pub fn expand_tilde(input: &str) -> PathBuf {
     PathBuf::from(input)
 }
 
+fn default_audit_prompt_path(paths: &AppPaths, file_name: &str) -> PathBuf {
+    paths
+        .config_dir
+        .join(DEFAULT_AUDIT_PROMPT_DIR)
+        .join(file_name)
+}
+
+fn ensure_default_audit_prompt_file(path: &Path, contents: &str) -> AppResult<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).code(EXIT_CONFIG, "failed to create audit prompt dir")?;
+    }
+    fs::write(path, contents).code(
+        EXIT_CONFIG,
+        format!("failed to write audit prompt file `{}`", path.display()),
+    )
+}
+
+fn ensure_default_audit_prompt_files(paths: &AppPaths) -> AppResult<()> {
+    ensure_default_audit_prompt_file(
+        &default_audit_prompt_path(paths, DEFAULT_AUDIT_PROMPT_FILE),
+        DEFAULT_AUDIT_PROMPT_TEMPLATE,
+    )?;
+    ensure_default_audit_prompt_file(
+        &default_audit_prompt_path(paths, DEFAULT_AUDIT_BASH_PROMPT_FILE),
+        DEFAULT_AUDIT_BASH_PROMPT_TEMPLATE,
+    )?;
+    ensure_default_audit_prompt_file(
+        &default_audit_prompt_path(paths, DEFAULT_AUDIT_EDIT_PROMPT_FILE),
+        DEFAULT_AUDIT_EDIT_PROMPT_TEMPLATE,
+    )
+}
+
+fn normalize_optional_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn parse_output_format(value: &str) -> AppResult<OutputFormat> {
     match value {
         "line" => Ok(OutputFormat::Line),
@@ -556,6 +652,7 @@ fn parse_string_array(value: &str, key: &str) -> AppResult<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn default_skills_paths_are_populated() {
@@ -565,6 +662,7 @@ mod tests {
             vec![".claude/skills", "~/.claude/skills"]
         );
         assert_eq!(config.tools.max_rounds, Some(20));
+        assert_eq!(config.tools.progressive_loading, Some(true));
     }
 
     #[test]
@@ -578,7 +676,9 @@ mod tests {
     fn set_config_value_parses_tools_max_rounds() {
         let mut config = AppConfig::default();
         set_config_value(&mut config, "tools.max_rounds", "12").unwrap();
+        set_config_value(&mut config, "tools.progressive_loading", "false").unwrap();
         assert_eq!(config.tools.max_rounds, Some(12));
+        assert_eq!(config.tools.progressive_loading, Some(false));
     }
 
     #[test]
@@ -586,11 +686,33 @@ mod tests {
         let mut config = AppConfig::default();
         set_config_value(&mut config, "audit.enabled", "true").unwrap();
         set_config_value(&mut config, "audit.model", "audit-model").unwrap();
+        set_config_value(
+            &mut config,
+            "audit.default_prompt_file",
+            "/tmp/audit-default.md",
+        )
+        .unwrap();
+        set_config_value(&mut config, "audit.bash_prompt_file", "/tmp/audit-bash.md").unwrap();
+        set_config_value(&mut config, "audit.edit_prompt_file", "/tmp/audit-edit.md").unwrap();
         assert_eq!(config.audit.enabled, Some(true));
         assert_eq!(config.audit.model.as_deref(), Some("audit-model"));
+        assert_eq!(
+            config.audit.default_prompt_file.as_deref(),
+            Some("/tmp/audit-default.md")
+        );
+        assert_eq!(
+            config.audit.bash_prompt_file.as_deref(),
+            Some("/tmp/audit-bash.md")
+        );
+        assert_eq!(
+            config.audit.edit_prompt_file.as_deref(),
+            Some("/tmp/audit-edit.md")
+        );
 
         set_config_value(&mut config, "audit.model", "").unwrap();
+        set_config_value(&mut config, "audit.default_prompt_file", "").unwrap();
         assert_eq!(config.audit.model, None);
+        assert_eq!(config.audit.default_prompt_file, None);
     }
 
     #[test]
@@ -603,6 +725,32 @@ mod tests {
                 .iter()
                 .any(|issue| issue.contains("audit.model references missing model"))
         );
+    }
+
+    #[test]
+    fn runtime_defaults_populate_audit_prompt_paths_and_create_prompt_files() {
+        let base = std::env::temp_dir().join(format!("chat-cli-config-test-{}", ulid::Ulid::new()));
+        let paths =
+            AppPaths::from_overrides(Some(base.join("config")), Some(base.join("data"))).unwrap();
+        let mut config = AppConfig::default();
+        apply_runtime_config_defaults(&paths, &mut config);
+        ensure_dirs(&paths, &config).unwrap();
+
+        let default_path = config.audit.default_prompt_file.clone().unwrap();
+        let bash_path = config.audit.bash_prompt_file.clone().unwrap();
+        let edit_path = config.audit.edit_prompt_file.clone().unwrap();
+        assert!(Path::new(&default_path).exists());
+        assert!(Path::new(&bash_path).exists());
+        assert!(Path::new(&edit_path).exists());
+
+        let default_text = fs::read_to_string(&default_path).unwrap();
+        let bash_text = fs::read_to_string(&bash_path).unwrap();
+        let edit_text = fs::read_to_string(&edit_path).unwrap();
+        assert!(default_text.contains("\"results\""));
+        assert!(bash_text.contains("shell"));
+        assert!(edit_text.contains("file edit"));
+
+        let _ = fs::remove_dir_all(base);
     }
 }
 

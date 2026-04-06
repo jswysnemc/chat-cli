@@ -98,7 +98,7 @@ struct ToolHandler {
 #[derive(Debug)]
 enum ConfirmResult {
     Yes,
-    No,
+    No(Option<String>),
     Edit(String),
 }
 
@@ -476,6 +476,18 @@ fn builtin_tool_handlers() -> &'static [ToolHandler] {
     &BUILTIN_TOOL_HANDLERS
 }
 
+fn progressive_loading_enabled(config: &AppConfig) -> bool {
+    config.tools.progressive_loading.unwrap_or(true)
+}
+
+fn full_tool_definitions() -> Vec<Value> {
+    builtin_tool_handlers()
+        .iter()
+        .filter(|handler| handler.spec.name != "ToolSearch")
+        .map(|handler| (handler.spec.definition)())
+        .collect()
+}
+
 fn find_tool_handler(name: &str) -> Option<&'static ToolHandler> {
     builtin_tool_handlers()
         .iter()
@@ -508,16 +520,22 @@ pub fn tool_call_requires_confirmation(call: &ToolCall) -> bool {
         .unwrap_or(true)
 }
 
-pub fn initial_tool_definitions() -> Vec<Value> {
+pub fn initial_tool_definitions(config: &AppConfig) -> Vec<Value> {
+    if !progressive_loading_enabled(config) {
+        return full_tool_definitions();
+    }
     builtin_tool_handlers()
         .iter()
-        .filter(|handler| !handler.spec.defer_loading)
+        .filter(|handler| handler.spec.name == "ToolSearch")
         .map(|handler| (handler.spec.definition)())
         .collect()
 }
 
-pub fn tool_definitions_for_names(names: &[String]) -> Vec<Value> {
-    let mut tools = initial_tool_definitions();
+pub fn tool_definitions_for_names(config: &AppConfig, names: &[String]) -> Vec<Value> {
+    if !progressive_loading_enabled(config) {
+        return full_tool_definitions();
+    }
+    let mut tools = initial_tool_definitions(config);
     for name in names {
         if let Some(handler) = find_tool_handler(name)
             && handler.spec.defer_loading
@@ -702,7 +720,10 @@ fn execute_edit_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
     print_tool_preview(&render_diff_preview(&normalized, &diff));
     match confirm_tool_action(action, Some(new_string), context.auto_confirm)? {
         ConfirmResult::Yes => tool_edit(&normalized, old_string, new_string, replace_all),
-        ConfirmResult::No => Ok("user declined the edit operation".to_string()),
+        ConfirmResult::No(None) => Ok("user declined the edit operation".to_string()),
+        ConfirmResult::No(Some(feedback)) => Ok(format!(
+            "user declined the edit operation. user feedback: {feedback}"
+        )),
         ConfirmResult::Edit(replacement) => {
             tool_edit(&normalized, old_string, &replacement, replace_all)
         }
@@ -717,7 +738,10 @@ fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
     let auto_confirm = context.auto_confirm || is_read_only_bash_command(command);
     match confirm_tool_action("run", Some(command), auto_confirm)? {
         ConfirmResult::Yes => tool_bash(command),
-        ConfirmResult::No => Ok("user declined the bash execution".to_string()),
+        ConfirmResult::No(None) => Ok("user declined the bash execution".to_string()),
+        ConfirmResult::No(Some(feedback)) => Ok(format!(
+            "user declined the bash execution. user feedback: {feedback}"
+        )),
         ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd),
     }
 }
@@ -1786,6 +1810,38 @@ fn line_end_offset(content: &str, line_starts: &[usize], line_index: usize) -> u
 
 /// Interactive tool confirmation with y/n/e(dit) options.
 /// `editable_content` is shown to the user when they choose to edit.
+fn parse_confirm_input(input: &str, editable_content: Option<&str>) -> Option<ConfirmResult> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_lowercase();
+    match lower.as_str() {
+        "y" | "yes" | "" => Some(ConfirmResult::Yes),
+        "n" | "no" => Some(ConfirmResult::No(None)),
+        _ => {
+            if editable_content.is_none() {
+                return None;
+            }
+            if lower == "edit" || lower == "e" {
+                return None;
+            }
+            if lower.starts_with("edit ") {
+                let replacement = trimmed[4..].trim();
+                if !replacement.is_empty() {
+                    return Some(ConfirmResult::Edit(replacement.to_string()));
+                }
+                return None;
+            }
+            if lower.starts_with("e ") {
+                let replacement = trimmed[1..].trim();
+                if !replacement.is_empty() {
+                    return Some(ConfirmResult::Edit(replacement.to_string()));
+                }
+                return None;
+            }
+            Some(ConfirmResult::No(Some(trimmed.to_string())))
+        }
+    }
+}
+
 fn confirm_tool_action(
     action: &str,
     editable_content: Option<&str>,
@@ -1809,20 +1865,16 @@ fn confirm_tool_action(
         io::stdin()
             .read_line(&mut input)
             .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read input: {err}")))?;
-        let trimmed = input.trim();
-        let lower = trimmed.to_lowercase();
+        if let Some(result) = parse_confirm_input(&input, editable_content) {
+            return Ok(result);
+        }
 
-        match lower.as_str() {
-            "y" | "yes" | "" => return Ok(ConfirmResult::Yes),
-            "n" | "no" => return Ok(ConfirmResult::No),
-            _ => {
-                if editable_content.is_some() {
-                    // Any other input is treated as replacement content
-                    return Ok(ConfirmResult::Edit(trimmed.to_string()));
-                } else {
-                    eprintln!("    {DIM}please enter y or n{RESET}");
-                }
-            }
+        if editable_content.is_some() {
+            eprintln!(
+                "    {DIM}请输入 y / n，或使用 `edit <替换内容>`；其他文本会作为反馈返回给模型{RESET}"
+            );
+        } else {
+            eprintln!("    {DIM}please enter y or n{RESET}");
         }
     }
 }
@@ -2255,10 +2307,28 @@ mod tests {
     }
 
     #[test]
-    fn initial_tool_definitions_only_exposes_tool_search() {
-        let defs = initial_tool_definitions();
+    fn initial_tool_definitions_only_exposes_tool_search_when_progressive_loading_enabled() {
+        let mut config = AppConfig::default();
+        config.tools.progressive_loading = Some(true);
+        let defs = initial_tool_definitions(&config);
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0]["function"]["name"].as_str(), Some("ToolSearch"));
+    }
+
+    #[test]
+    fn initial_tool_definitions_exposes_full_toolset_when_progressive_loading_disabled() {
+        let mut config = AppConfig::default();
+        config.tools.progressive_loading = Some(false);
+        let defs = initial_tool_definitions(&config);
+        let names = defs
+            .iter()
+            .filter_map(|def| def["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"ToolSearch"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Edit"));
+        assert_eq!(defs.len(), 8);
     }
 
     #[test]
@@ -2306,6 +2376,28 @@ mod tests {
         );
         assert!(!tool_call_requires_confirmation(&read_only_call));
         assert!(tool_call_requires_confirmation(&mutating_call));
+    }
+
+    #[test]
+    fn parse_confirm_input_treats_freeform_text_as_feedback_when_editable() {
+        let result = parse_confirm_input("将 echo 结果改为中文", Some("echo test"));
+        match result {
+            Some(ConfirmResult::No(Some(feedback))) => {
+                assert_eq!(feedback, "将 echo 结果改为中文");
+            }
+            other => panic!("unexpected confirm result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_confirm_input_only_edits_on_explicit_edit_prefix() {
+        let result = parse_confirm_input("edit echo 中文结果", Some("echo test"));
+        match result {
+            Some(ConfirmResult::Edit(replacement)) => {
+                assert_eq!(replacement, "echo 中文结果");
+            }
+            other => panic!("unexpected confirm result: {other:?}"),
+        }
     }
 
     #[test]
