@@ -2,7 +2,7 @@ use crate::config::{AppConfig, expand_tilde};
 use crate::error::{AppError, AppResult, EXIT_ARGS};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1814,7 +1814,8 @@ fn parse_confirm_input(input: &str, editable_content: Option<&str>) -> Option<Co
     let trimmed = input.trim();
     let lower = trimmed.to_lowercase();
     match lower.as_str() {
-        "y" | "yes" | "" => Some(ConfirmResult::Yes),
+        "y" | "yes" => Some(ConfirmResult::Yes),
+        "" => None,
         "n" | "no" => Some(ConfirmResult::No(None)),
         _ => {
             if editable_content.is_none() {
@@ -1851,6 +1852,12 @@ fn confirm_tool_action(
         return Ok(ConfirmResult::Yes);
     }
 
+    if !io::stdin().is_terminal() {
+        return Ok(ConfirmResult::No(Some(
+            "interactive confirmation unavailable (stdin is not a TTY)".to_string(),
+        )));
+    }
+
     loop {
         if editable_content.is_some() {
             eprint!("    {DIM}{action}? {GREEN}y{RESET}{DIM}/{RED}n{RESET}{DIM}/edit:{RESET} ");
@@ -1862,9 +1869,14 @@ fn confirm_tool_action(
             .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush stderr: {err}")))?;
 
         let mut input = String::new();
-        io::stdin()
+        let bytes_read = io::stdin()
             .read_line(&mut input)
             .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read input: {err}")))?;
+        if bytes_read == 0 {
+            return Ok(ConfirmResult::No(Some(
+                "interactive confirmation aborted (stdin closed)".to_string(),
+            )));
+        }
         if let Some(result) = parse_confirm_input(&input, editable_content) {
             return Ok(result);
         }
@@ -2387,6 +2399,12 @@ mod tests {
             }
             other => panic!("unexpected confirm result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_confirm_input_does_not_treat_empty_input_as_yes() {
+        let result = parse_confirm_input("\n", Some("echo test"));
+        assert!(result.is_none());
     }
 
     #[test]

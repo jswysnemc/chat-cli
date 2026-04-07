@@ -78,6 +78,9 @@ Manage chat sessions.
 ```bash
 chat session list                # list all sessions
 chat session show <id>           # show session details
+chat session render             # render the latest turn from the current session
+chat session render <id> --last 3 # render the latest 3 turns from a session
+chat session render <id> --all  # render the whole session
 chat session export <id>          # export session to JSON
 chat session delete <id>          # delete a session
 chat session gc                  # garbage collect orphaned data
@@ -225,7 +228,9 @@ When `[audit].enabled = true`, `chat ask --tools` and `chat repl --tools` run an
 - `warning` / `block` / `unavailable`: a red warning is shown first, then the normal human confirmation flow is used
 - Audit results are stored as dedicated `audit` session events for later inspection
 
-Default audit prompt files are created under the config directory's `prompts/` folder so they can be edited directly during prompt tuning.
+The canonical default audit prompt templates are versioned in [`assets/prompts/`](./assets/prompts/). The active default templates use the base filenames, and separate English variants are provided as `*.en.md` siblings. These files are important because they define the exact JSON output shape expected by the audit parser.
+
+Runtime copies of those prompt files are created under the config directory's `prompts/` folder so they can still be edited directly during prompt tuning.
 
 ## Session Management
 

@@ -80,6 +80,9 @@ chat repl --multiline        # 启用多行输入
 ```bash
 chat session list            # 列出所有会话
 chat session show <id>       # 显示会话详情
+chat session render          # 渲染当前会话最近 1 个用户轮次
+chat session render <id> --last 3 # 渲染指定会话最近 3 个用户轮次
+chat session render <id> --all # 渲染指定会话全部内容
 chat session export <id>     # 将会话导出为 JSON
 chat session delete <id>     # 删除会话
 chat session gc              # 垃圾回收孤立数据
@@ -228,7 +231,9 @@ api_key = "<redacted>"
 - 审核 `warning` / `block` / `unavailable`：先打印红色告警，再进入人工确认
 - 审核结果会以独立 `audit` 事件写入 session，便于事后复盘
 
-默认审核 prompt 文件会自动创建在配置目录下的 `prompts/` 目录，方便直接调试和修改。
+仓库中的默认审核 prompt 模板会版本化保存在 [`assets/prompts/`](./assets/prompts/) 下。当前生效的默认模板使用基础文件名，英文版本则以 `*.en.md` 的形式单独存放。这些文件比较重要，因为其中约束了审核模型必须返回的 JSON 结构，直接影响审核结果的解析。
+
+运行时会把这些 prompt 文件复制到配置目录下的 `prompts/` 目录，方便继续调试和修改。
 
 ## 会话管理
 

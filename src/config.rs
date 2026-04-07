@@ -747,8 +747,8 @@ mod tests {
         let bash_text = fs::read_to_string(&bash_path).unwrap();
         let edit_text = fs::read_to_string(&edit_path).unwrap();
         assert!(default_text.contains("\"results\""));
-        assert!(bash_text.contains("shell"));
-        assert!(edit_text.contains("file edit"));
+        assert!(bash_text.contains("Bash"));
+        assert!(edit_text.contains("文件编辑"));
 
         let _ = fs::remove_dir_all(base);
     }

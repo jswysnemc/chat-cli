@@ -39,8 +39,10 @@ use std::io::{self, Read, Write};
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const GREEN: &str = "\x1b[32m";
+const MAGENTA: &str = "\x1b[35m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
+const YELLOW: &str = "\x1b[33m";
 
 pub async fn run(cli: Cli) -> AppResult<()> {
     let root = cli.clone();
@@ -535,6 +537,26 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             );
             Ok(())
         }
+        SessionCommand::Render { id, last, all } => {
+            if last == Some(0) {
+                return Err(AppError::new(
+                    crate::error::EXIT_SESSION,
+                    "--last must be greater than 0",
+                ));
+            }
+            let resolved = resolve_render_session_id(paths, config, id.as_deref())?;
+            let events = read_events(paths, config, &resolved)?;
+            let turns = session_turns_from_events(&events);
+            if turns.is_empty() {
+                return Err(AppError::new(
+                    crate::error::EXIT_SESSION,
+                    format!("session `{resolved}` has no renderable messages"),
+                ));
+            }
+            let render_limit = if all { None } else { Some(last.unwrap_or(1)) };
+            println!("{}", render_session_turns(config, &turns, render_limit));
+            Ok(())
+        }
         SessionCommand::Export { id } => {
             let resolved = resolve_session_id(paths, config, &id)?;
             let path = crate::session::session_file(paths, config, &resolved);
@@ -571,6 +593,157 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             Ok(())
         }
     }
+}
+
+fn resolve_render_session_id(
+    paths: &AppPaths,
+    config: &AppConfig,
+    requested: Option<&str>,
+) -> AppResult<String> {
+    if let Some(id) = requested {
+        return resolve_session_id(paths, config, id);
+    }
+    load_state(paths)?.current_session.ok_or_else(|| {
+        AppError::new(
+            crate::error::EXIT_SESSION,
+            "no active session; use `chat session render <id>` or switch to one first",
+        )
+    })
+}
+
+fn session_message_has_renderable_payload(message: &SessionMessage) -> bool {
+    !message.content.is_empty()
+        || !message.images.is_empty()
+        || !message.tool_calls.is_empty()
+        || message.tool_call_id.is_some()
+}
+
+fn session_turns_from_events(events: &[SessionEvent]) -> Vec<Vec<SessionMessage>> {
+    let mut turns = Vec::new();
+    let mut current = Vec::new();
+
+    for event in events {
+        let SessionEvent::Message(message) = event else {
+            continue;
+        };
+        if !session_message_has_renderable_payload(message) {
+            continue;
+        }
+
+        if message.role == "user" && !current.is_empty() {
+            turns.push(current);
+            current = Vec::new();
+        }
+        current.push(message.clone());
+    }
+
+    if !current.is_empty() {
+        turns.push(current);
+    }
+
+    turns
+}
+
+fn render_session_turns(
+    config: &AppConfig,
+    turns: &[Vec<SessionMessage>],
+    last: Option<usize>,
+) -> String {
+    let slice = match last {
+        Some(last) => {
+            let start = turns.len().saturating_sub(last);
+            &turns[start..]
+        }
+        None => turns,
+    };
+    slice
+        .iter()
+        .map(|turn| {
+            turn.iter()
+                .map(|message| render_session_message(config, message))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .collect::<Vec<_>>()
+        .join(&format!("\n\n{DIM}{}{RESET}\n\n", "─".repeat(56)))
+}
+
+fn render_session_message(config: &AppConfig, message: &SessionMessage) -> String {
+    let label = session_message_label(message);
+    let body = render_session_message_body(config, message);
+
+    match message.role.as_str() {
+        "user" => render_user_message_block(&label, &body),
+        _ if body.is_empty() => label,
+        _ => format!("{label}\n{body}"),
+    }
+}
+
+fn session_message_label(message: &SessionMessage) -> String {
+    match message.role.as_str() {
+        "user" => format!("{GREEN}User{RESET}"),
+        "assistant" => format!("{CYAN}Assistant{RESET}"),
+        "tool" => {
+            let name = message.name.as_deref().unwrap_or("Tool");
+            format!("{YELLOW}Tool:{RESET} {name}")
+        }
+        "system" => format!("{MAGENTA}System{RESET}"),
+        other => format!("{DIM}{other}{RESET}"),
+    }
+}
+
+fn render_session_message_body(config: &AppConfig, message: &SessionMessage) -> String {
+    let mut sections = Vec::new();
+    let collapse = config.defaults.collapse_thinking.unwrap_or(false);
+
+    if !message.content.is_empty() {
+        sections.push(render_markdown(&message.content, collapse));
+    }
+
+    if !message.tool_calls.is_empty() {
+        let tool_lines = message
+            .tool_calls
+            .iter()
+            .map(|raw_call| format!("{DIM}•{RESET} {}", summarize_tool_call_activity(raw_call)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("{DIM}tool calls{RESET}\n{tool_lines}"));
+    }
+
+    if !message.images.is_empty() {
+        sections.push(format!(
+            "{DIM}[{} image(s) attached]{RESET}",
+            message.images.len()
+        ));
+    }
+
+    if sections.is_empty() && message.tool_call_id.is_some() {
+        sections.push(format!("{DIM}[empty tool result]{RESET}"));
+    }
+
+    sections.join("\n")
+}
+
+fn render_user_message_block(label: &str, body: &str) -> String {
+    let lines = if body.is_empty() {
+        vec![String::new()]
+    } else {
+        body.lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    };
+    let rendered_body = lines
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                format!("{GREEN}│{RESET}")
+            } else {
+                format!("{GREEN}│{RESET} {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{label}\n{rendered_body}")
 }
 
 async fn handle_doctor(
@@ -2750,6 +2923,137 @@ mod tests {
     }
 
     #[test]
+    fn resolve_render_session_id_uses_current_session_when_omitted() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        set_current_session(&paths, &config, Some("sess_render"), false).unwrap();
+
+        let resolved = resolve_render_session_id(&paths, &config, None).unwrap();
+        assert_eq!(resolved, "sess_render");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn session_turns_group_messages_by_user_turn() {
+        let events = vec![
+            SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "first question".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "assistant".to_string(),
+                content: "first answer".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "tool".to_string(),
+                content: "tool output".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".to_string()),
+                name: Some("read".to_string()),
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "second question".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "assistant".to_string(),
+                content: "second answer".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+        ];
+
+        let turns = session_turns_from_events(&events);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].len(), 3);
+        assert_eq!(turns[1].len(), 2);
+        assert_eq!(turns[0][0].content, "first question");
+        assert_eq!(turns[1][0].content, "second question");
+    }
+
+    #[test]
+    fn render_session_turns_formats_user_messages_with_accent_bar() {
+        let config = test_config();
+        let turns = vec![vec![
+            SessionMessage {
+                role: "user".to_string(),
+                content: "用户提问".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            },
+            SessionMessage {
+                role: "assistant".to_string(),
+                content: "助手回答".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            },
+        ]];
+
+        let rendered = render_session_turns(&config, &turns, Some(1));
+        assert!(rendered.contains(&format!("{GREEN}User{RESET}")));
+        assert!(rendered.contains(&format!("{GREEN}│{RESET}")));
+        assert!(rendered.contains("用户提问"));
+        assert!(rendered.contains(&format!("{CYAN}Assistant{RESET}")));
+        assert!(rendered.contains("助手回答"));
+    }
+
+    #[test]
+    fn render_session_turns_supports_all_turns() {
+        let config = test_config();
+        let turns = vec![
+            vec![SessionMessage {
+                role: "user".to_string(),
+                content: "第一条".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }],
+            vec![SessionMessage {
+                role: "user".to_string(),
+                content: "第二条".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }],
+        ];
+
+        let rendered = render_session_turns(&config, &turns, None);
+        assert!(rendered.contains("第一条"));
+        assert!(rendered.contains("第二条"));
+    }
+
+    #[test]
     fn model_list_entry_uses_provider_and_remote_name() {
         let model = ModelConfig {
             provider: "minimax".to_string(),
@@ -2937,6 +3241,27 @@ mod tests {
         assert_eq!(message.role, "tool");
         assert_eq!(message.tool_call_id.as_deref(), Some("call_bad"));
         assert!(message.content.contains("tool invocation error:"));
+    }
+
+    #[test]
+    fn execute_bash_tool_declines_when_interactive_confirmation_is_unavailable() {
+        let config = AppConfig::default();
+        let raw_call = json!({
+            "id": "call_bash",
+            "function": {
+                "name": "Bash",
+                "arguments": "{\"command\":\"rm -f /tmp/chat-cli-test\"}"
+            }
+        });
+        let message = execute_tool_as_message(&raw_call, false, &config);
+        assert_eq!(message.role, "tool");
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_bash"));
+        assert!(
+            message
+                .content
+                .contains("interactive confirmation unavailable")
+                || message.content.contains("user declined the bash execution")
+        );
     }
 
     #[test]

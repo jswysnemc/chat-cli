@@ -166,6 +166,13 @@ pub enum SessionCommand {
     Show {
         id: String,
     },
+    Render {
+        id: Option<String>,
+        #[arg(long, conflicts_with = "all")]
+        last: Option<usize>,
+        #[arg(long, conflicts_with = "last")]
+        all: bool,
+    },
     Export {
         id: String,
     },
@@ -345,6 +352,42 @@ mod tests {
                 assert_eq!(args.prompt.as_deref(), Some("describe"));
             }
             other => panic!("expected ask command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_render_parses_optional_id_and_last() {
+        let cli = Cli::try_parse_from(["chat", "session", "render", "sess_abc", "--last", "3"])
+            .expect("cli should parse session render");
+
+        match cli.command {
+            Commands::Session { command } => match command {
+                super::SessionCommand::Render { id, last, all } => {
+                    assert_eq!(id.as_deref(), Some("sess_abc"));
+                    assert_eq!(last, Some(3));
+                    assert!(!all);
+                }
+                other => panic!("expected session render command, got {other:?}"),
+            },
+            other => panic!("expected session command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_render_parses_all_flag() {
+        let cli = Cli::try_parse_from(["chat", "session", "render", "--all"])
+            .expect("cli should parse session render --all");
+
+        match cli.command {
+            Commands::Session { command } => match command {
+                super::SessionCommand::Render { id, last, all } => {
+                    assert_eq!(id, None);
+                    assert_eq!(last, None);
+                    assert!(all);
+                }
+                other => panic!("expected session render command, got {other:?}"),
+            },
+            other => panic!("expected session command, got {other:?}"),
         }
     }
 }
