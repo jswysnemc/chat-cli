@@ -2185,6 +2185,8 @@ struct ReplScreenView {
 #[derive(Debug, Clone, Copy)]
 struct ReplLayout {
     transcript_height: u16,
+    popup_top: u16,
+    popup_height: u16,
     composer_top: u16,
     composer_body_height: u16,
     status_row: u16,
@@ -2202,6 +2204,11 @@ struct ReplComposerView {
     lines: Vec<String>,
     cursor_row: usize,
     cursor_col: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReplSlashPopupView {
+    lines: Vec<String>,
 }
 
 impl ReplTerminalGuard {
@@ -2480,6 +2487,7 @@ fn render_repl_editor(
         layout.transcript_height,
         draft.transcript_scroll,
     );
+    let popup_view = repl_slash_popup_view(draft, cols);
     let composer_view = repl_composer_view(draft, cols, layout.composer_body_height);
     let status_bar = build_repl_status_bar(view, draft, cols);
 
@@ -2490,6 +2498,7 @@ fn render_repl_editor(
         write_repl_line(stdout, row as u16, line)?;
     }
 
+    draw_repl_slash_popup(stdout, cols, &layout, &popup_view)?;
     draw_repl_composer(stdout, cols, &layout, &composer_view)?;
     write_repl_line(stdout, layout.status_row, &status_bar)?;
 
@@ -2503,14 +2512,19 @@ fn render_repl_editor(
 }
 
 fn compute_repl_layout(cols: u16, rows: u16, draft: &ReplEditorDraft) -> ReplLayout {
+    let popup_view = repl_slash_popup_view(draft, cols);
     let composer_view = repl_composer_view(draft, cols, u16::MAX);
     let max_body = min(8usize, rows.saturating_sub(4) as usize).max(3);
     let composer_body_height = min(composer_view.lines.len(), max_body).max(3) as u16;
     let status_row = rows.saturating_sub(1);
+    let popup_height = popup_view.lines.len() as u16;
     let composer_top = rows.saturating_sub(composer_body_height + 3);
-    let transcript_height = composer_top;
+    let popup_top = composer_top.saturating_sub(popup_height);
+    let transcript_height = popup_top;
     ReplLayout {
         transcript_height,
+        popup_top,
+        popup_height,
         composer_top,
         composer_body_height,
         status_row,
@@ -2578,6 +2592,30 @@ fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> Rep
     }
 }
 
+fn repl_slash_popup_view(draft: &ReplEditorDraft, cols: u16) -> ReplSlashPopupView {
+    let width = cols.saturating_sub(4).max(12) as usize;
+    let Some(query) = repl_slash_query(draft) else {
+        return ReplSlashPopupView { lines: Vec::new() };
+    };
+    let matches = filtered_repl_slash_commands(&query);
+    if matches.is_empty() {
+        return ReplSlashPopupView {
+            lines: vec![format!("{DIM}  no matching commands{RESET}")],
+        };
+    }
+
+    let mut lines = Vec::new();
+    for command in matches.into_iter().take(6) {
+        let line = format!(
+            "{CYAN}/{:<12}{RESET} {DIM}{}{RESET}",
+            command.command(),
+            command.description()
+        );
+        lines.push(ansi_truncate(&line, width));
+    }
+    ReplSlashPopupView { lines }
+}
+
 fn clipped_repl_transcript_lines(
     transcript: &str,
     cols: u16,
@@ -2633,6 +2671,27 @@ fn draw_repl_composer(
         layout.composer_top + layout.composer_body_height + 1,
         &bottom_border,
     )?;
+    Ok(())
+}
+
+fn draw_repl_slash_popup(
+    stdout: &mut io::Stdout,
+    cols: u16,
+    layout: &ReplLayout,
+    popup_view: &ReplSlashPopupView,
+) -> AppResult<()> {
+    if popup_view.lines.is_empty() || layout.popup_height == 0 {
+        return Ok(());
+    }
+    let inner_width = cols.saturating_sub(2) as usize;
+    for index in 0..layout.popup_height as usize {
+        let content = popup_view.lines.get(index).cloned().unwrap_or_default();
+        let truncated = ansi_truncate(&content, inner_width);
+        let padding = inner_width.saturating_sub(visible_width(&truncated));
+        let row = layout.popup_top + index as u16;
+        let line = format!(" {truncated}{}", " ".repeat(padding));
+        write_repl_line(stdout, row, &line)?;
+    }
     Ok(())
 }
 
@@ -3168,6 +3227,29 @@ fn visible_repl_slash_commands() -> Vec<ReplSlashCommand> {
         .iter()
         .copied()
         .filter(|command| command.visible())
+        .collect()
+}
+
+fn repl_slash_query(draft: &ReplEditorDraft) -> Option<String> {
+    let first_line = draft.buffer.lines().next().unwrap_or_default();
+    let stripped = first_line.strip_prefix('/')?;
+    if stripped.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+fn filtered_repl_slash_commands(query: &str) -> Vec<ReplSlashCommand> {
+    let query = query.trim().to_ascii_lowercase();
+    visible_repl_slash_commands()
+        .into_iter()
+        .filter(|command| {
+            if query.is_empty() {
+                return true;
+            }
+            let name = command.command().to_ascii_lowercase();
+            name.starts_with(&query) || name.contains(&query)
+        })
         .collect()
 }
 
@@ -4368,6 +4450,29 @@ mod tests {
         let (command, rest) = parse_repl_slash_command("/help").unwrap();
         assert_eq!(command, ReplSlashCommand::HelpAlias);
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn filtered_repl_slash_commands_show_all_when_query_empty() {
+        let commands = filtered_repl_slash_commands("")
+            .into_iter()
+            .map(|command| command.command())
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&"commands"));
+        assert!(commands.contains(&"status"));
+        assert!(commands.contains(&"stream"));
+        assert!(!commands.contains(&"help"));
+    }
+
+    #[test]
+    fn filtered_repl_slash_commands_filter_by_prefix() {
+        let commands = filtered_repl_slash_commands("st")
+            .into_iter()
+            .map(|command| command.command())
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&"status"));
+        assert!(commands.contains(&"stream"));
+        assert!(!commands.contains(&"clear"));
     }
 
     #[test]
