@@ -78,6 +78,19 @@ pub fn read_clipboard_image() -> AppResult<MessageImage> {
         })
 }
 
+pub fn read_clipboard_text() -> AppResult<String> {
+    try_read_wayland_clipboard_text()
+        .or_else(try_read_xclip_clipboard_text)
+        .or_else(try_read_pbpaste_clipboard_text)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| {
+            AppError::new(
+                EXIT_ARGS,
+                "failed to read clipboard text; copy some text first and ensure `wl-paste`, `xclip`, or `pbpaste` is available",
+            )
+        })
+}
+
 fn try_read_wayland_clipboard_image() -> Option<MessageImage> {
     let targets = Command::new("wl-paste")
         .args(["--list-types"])
@@ -128,6 +141,36 @@ fn try_read_pngpaste_clipboard_image() -> Option<MessageImage> {
         return None;
     }
     Some(MessageImage::from_bytes(&output.stdout, "image/png"))
+}
+
+fn try_read_wayland_clipboard_text() -> Option<String> {
+    let output = Command::new("wl-paste")
+        .args(["--no-newline"])
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn try_read_xclip_clipboard_text() -> Option<String> {
+    let output = Command::new("xclip")
+        .args(["-selection", "clipboard", "-o"])
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn try_read_pbpaste_clipboard_text() -> Option<String> {
+    let output = Command::new("pbpaste").output().ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn detect_image_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {

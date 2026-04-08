@@ -1,10 +1,15 @@
 use crate::config::{AppConfig, expand_tilde};
 use crate::error::{AppError, AppResult, EXIT_ARGS};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+use ulid::Ulid;
 
 // ANSI codes for tool UI
 const BOLD: &str = "\x1b[1m";
@@ -35,6 +40,12 @@ const BASH_READ_COMMANDS: &[&str] = &[
 ];
 const BASH_LIST_COMMANDS: &[&str] = &["ls", "tree", "du"];
 const BASH_NEUTRAL_COMMANDS: &[&str] = &["echo", "printf", "true", "false", ":"];
+const BASH_SESSION_IDLE_TIMEOUT: Duration = Duration::from_millis(350);
+const BASH_SESSION_START_TIMEOUT: Duration = Duration::from_millis(900);
+const BASH_SESSION_DRAIN_TIMEOUT: Duration = Duration::from_millis(120);
+const BASH_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const BASH_SESSION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(2);
+const BASH_SESSION_MAX_OUTPUT_CHARS: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -47,6 +58,12 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashSessionSummary {
+    pub session_id: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +126,33 @@ struct SkillEntry {
     path: PathBuf,
     summary: Option<String>,
 }
+
+#[derive(Debug)]
+struct InteractiveBashSession {
+    command: String,
+    child: Child,
+    stdin: ChildStdin,
+    receiver: mpsc::Receiver<BashOutputChunk>,
+}
+
+#[derive(Debug)]
+enum BashOutputChunk {
+    Stdout(String),
+    Stderr(String),
+}
+
+#[derive(Debug, Default)]
+struct BashOutput {
+    stdout: String,
+    stderr: String,
+}
+
+enum BashSessionUpdate {
+    Completed(String),
+    Waiting(String),
+}
+
+static BASH_SESSIONS: OnceLock<Mutex<BTreeMap<String, InteractiveBashSession>>> = OnceLock::new();
 
 const BUILTIN_TOOL_HANDLERS: [ToolHandler; 9] = [
     ToolHandler {
@@ -337,16 +381,28 @@ fn define_bash_tool() -> Value {
         "type": "function",
         "function": {
             "name": "Bash",
-            "description": "Run a shell command and return its stdout and stderr.",
+            "description": "Run a shell command and return its stdout and stderr. If the command becomes interactive, the tool returns a session_id that can be continued with more input.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The bash command to execute."
+                        "description": "The bash command to execute for a new session."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Continue an existing interactive bash session instead of starting a new command."
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": "Optional text to send to an existing interactive bash session. A trailing newline is added automatically."
+                    },
+                    "close": {
+                        "type": "boolean",
+                        "description": "Terminate an existing interactive bash session."
                     }
                 },
-                "required": ["command"]
+                "additionalProperties": false
             }
         }
     })
@@ -474,6 +530,53 @@ fn define_skill_read_tool() -> Value {
 
 fn builtin_tool_handlers() -> &'static [ToolHandler] {
     &BUILTIN_TOOL_HANDLERS
+}
+
+fn bash_sessions() -> &'static Mutex<BTreeMap<String, InteractiveBashSession>> {
+    BASH_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub fn list_bash_sessions() -> Vec<BashSessionSummary> {
+    let mut sessions = bash_sessions().lock().unwrap();
+    let stale_ids = sessions
+        .iter_mut()
+        .filter_map(|(session_id, session)| match session.child.try_wait() {
+            Ok(Some(_)) => Some(session_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for session_id in stale_ids {
+        sessions.remove(&session_id);
+    }
+    sessions
+        .iter()
+        .map(|(session_id, session)| BashSessionSummary {
+            session_id: session_id.clone(),
+            command: session.command.clone(),
+        })
+        .collect()
+}
+
+pub fn continue_bash_session(
+    session_id: &str,
+    input: Option<&str>,
+    close: bool,
+) -> AppResult<String> {
+    let mut sessions = bash_sessions().lock().unwrap();
+    let Some(mut session) = sessions.remove(session_id) else {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("Bash: unknown interactive session `{session_id}`"),
+        ));
+    };
+    let update = update_bash_session(session_id, &mut session, input, close)?;
+    let keep_running = matches!(update, BashSessionUpdate::Waiting(_));
+    if keep_running {
+        sessions.insert(session_id.to_string(), session);
+    }
+    match update {
+        BashSessionUpdate::Completed(result) | BashSessionUpdate::Waiting(result) => Ok(result),
+    }
 }
 
 fn progressive_loading_enabled(config: &AppConfig) -> bool {
@@ -731,6 +834,13 @@ fn execute_edit_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
 }
 
 fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+    if let Some(session_id) = call.arguments["session_id"].as_str() {
+        print_tool_header("Bash", &format!("session {session_id}"));
+        let input = call.arguments["input"].as_str();
+        let close = call.arguments["close"].as_bool().unwrap_or(false);
+        return continue_bash_session(session_id, input, close);
+    }
+
     let command = call.arguments["command"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "Bash: missing 'command' argument"))?;
@@ -990,35 +1100,222 @@ fn validate_edit_inputs(path: &str, old_string: &str, new_string: &str) -> AppRe
 }
 
 fn tool_bash(command: &str) -> AppResult<String> {
-    let output = Command::new("bash")
-        .arg("-c")
+    let session_id = format!("bash_{}", Ulid::new());
+    let mut child = Command::new("bash")
+        .arg("-lc")
         .arg(command)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to execute bash: {err}")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut result = String::new();
-    if !stdout.is_empty() {
-        result.push_str(&stdout);
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "failed to capture bash stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "failed to capture bash stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "failed to capture bash stderr"))?;
+    let (sender, receiver) = mpsc::channel();
+    spawn_bash_reader(stdout, sender.clone(), false);
+    spawn_bash_reader(stderr, sender, true);
+
+    let mut session = InteractiveBashSession {
+        command: command.to_string(),
+        child,
+        stdin,
+        receiver,
+    };
+    let update = update_bash_session(&session_id, &mut session, None, false)?;
+    if matches!(update, BashSessionUpdate::Waiting(_)) {
+        bash_sessions()
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), session);
     }
-    if !stderr.is_empty() {
+    match update {
+        BashSessionUpdate::Completed(result) | BashSessionUpdate::Waiting(result) => Ok(result),
+    }
+}
+
+fn spawn_bash_reader<R>(mut reader: R, sender: mpsc::Sender<BashOutputChunk>, stderr: bool)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let chunk = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let message = if stderr {
+                        BashOutputChunk::Stderr(chunk)
+                    } else {
+                        BashOutputChunk::Stdout(chunk)
+                    };
+                    if sender.send(message).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn update_bash_session(
+    session_id: &str,
+    session: &mut InteractiveBashSession,
+    input: Option<&str>,
+    close: bool,
+) -> AppResult<BashSessionUpdate> {
+    if close {
+        let _ = session.child.kill();
+        let _ = session.child.wait();
+        return Ok(BashSessionUpdate::Completed(format!(
+            "terminated interactive bash session `{session_id}`"
+        )));
+    }
+
+    if let Some(input) = input {
+        session.stdin.write_all(input.as_bytes()).map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to write bash stdin: {err}"))
+        })?;
+        if !input.ends_with('\n') {
+            session.stdin.write_all(b"\n").map_err(|err| {
+                AppError::new(EXIT_ARGS, format!("failed to write bash stdin: {err}"))
+            })?;
+        }
+        session.stdin.flush().map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to flush bash stdin: {err}"))
+        })?;
+    }
+
+    let mut output = BashOutput::default();
+    let start = Instant::now();
+    let mut last_chunk_at = Instant::now();
+    let mut saw_chunk = false;
+    let wait_timeout = if input.is_some() {
+        BASH_SESSION_IDLE_TIMEOUT
+    } else {
+        BASH_SESSION_START_TIMEOUT
+    };
+
+    loop {
+        let drained = drain_bash_output(session, &mut output);
+        if drained {
+            saw_chunk = true;
+            last_chunk_at = Instant::now();
+        }
+
+        if let Some(status) = session.child.try_wait().map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to poll bash process: {err}"))
+        })? {
+            thread::sleep(BASH_SESSION_DRAIN_TIMEOUT);
+            drain_bash_output(session, &mut output);
+            return Ok(BashSessionUpdate::Completed(format_bash_output(
+                &output,
+                status.code(),
+            )));
+        }
+
+        if saw_chunk && last_chunk_at.elapsed() >= wait_timeout {
+            return Ok(BashSessionUpdate::Waiting(format_bash_waiting_message(
+                session_id,
+                &session.command,
+                &output,
+                "command is waiting for more input",
+            )));
+        }
+        if !saw_chunk && start.elapsed() >= wait_timeout {
+            return Ok(BashSessionUpdate::Waiting(format_bash_waiting_message(
+                session_id,
+                &session.command,
+                &output,
+                "command is still running without new output",
+            )));
+        }
+        if start.elapsed() >= BASH_SESSION_ABSOLUTE_TIMEOUT {
+            return Ok(BashSessionUpdate::Waiting(format_bash_waiting_message(
+                session_id,
+                &session.command,
+                &output,
+                "command is still running and was paused to avoid blocking the tool",
+            )));
+        }
+
+        thread::sleep(BASH_SESSION_POLL_INTERVAL);
+    }
+}
+
+fn drain_bash_output(session: &mut InteractiveBashSession, output: &mut BashOutput) -> bool {
+    let mut drained = false;
+    while let Ok(chunk) = session.receiver.try_recv() {
+        drained = true;
+        match chunk {
+            BashOutputChunk::Stdout(text) => append_bash_chunk(&mut output.stdout, &text),
+            BashOutputChunk::Stderr(text) => append_bash_chunk(&mut output.stderr, &text),
+        }
+    }
+    drained
+}
+
+fn append_bash_chunk(target: &mut String, chunk: &str) {
+    target.push_str(chunk);
+    if target.chars().count() > BASH_SESSION_MAX_OUTPUT_CHARS {
+        let keep_from = target
+            .char_indices()
+            .rev()
+            .nth(BASH_SESSION_MAX_OUTPUT_CHARS)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        *target = format!("...(truncated)\n{}", &target[keep_from..]);
+    }
+}
+
+fn format_bash_output(output: &BashOutput, exit_code: Option<i32>) -> String {
+    let mut result = String::new();
+    if !output.stdout.is_empty() {
+        result.push_str(&output.stdout);
+    }
+    if !output.stderr.is_empty() {
         if !result.is_empty() {
             result.push('\n');
         }
         result.push_str("[stderr]\n");
-        result.push_str(&stderr);
+        result.push_str(&output.stderr);
     }
-    if !output.status.success() {
-        result.push_str(&format!(
-            "\n[exit code: {}]",
-            output.status.code().unwrap_or(-1)
-        ));
+    if exit_code.is_some_and(|code| code != 0) {
+        result.push_str(&format!("\n[exit code: {}]", exit_code.unwrap_or(-1)));
     }
     if result.is_empty() {
         result = "(no output)".to_string();
     }
-    Ok(result)
+    result
+}
+
+fn format_bash_waiting_message(
+    session_id: &str,
+    command: &str,
+    output: &BashOutput,
+    reason: &str,
+) -> String {
+    let body = format_bash_output(output, None);
+    let rendered_output = if body == "(no output)" {
+        "(no new output yet)".to_string()
+    } else {
+        body
+    };
+    format!(
+        "interactive bash session is still running\nsession_id: {session_id}\ncommand: {command}\nstatus: waiting_for_input\nreason: {reason}\nnext_step: call Bash again with {{\"session_id\":\"{session_id}\",\"input\":\"...\"}} to continue, call it with only session_id to poll for more output, or set {{\"session_id\":\"{session_id}\",\"close\":true}} to terminate. If the model cannot continue safely, ask the user for the missing input.\n\n{rendered_output}"
+    )
 }
 
 fn tool_glob(pattern: &str, path: &str) -> AppResult<String> {
@@ -2462,6 +2759,38 @@ mod tests {
         assert!(stripped.contains("11 -     old_call();"));
         assert!(stripped.contains("11 +     new_call();"));
         assert!(stripped.contains("12 +     trace_call();"));
+    }
+
+    #[test]
+    fn bash_tool_can_continue_interactive_session() {
+        let first =
+            tool_bash("printf 'name: '; read name; printf 'hello %s\\n' \"$name\"").unwrap();
+        assert!(first.contains("interactive bash session is still running"));
+        let session_id = first
+            .lines()
+            .find_map(|line| line.strip_prefix("session_id: "))
+            .unwrap()
+            .to_string();
+        assert!(
+            list_bash_sessions()
+                .iter()
+                .any(|session| session.session_id == session_id)
+        );
+
+        let mut next = continue_bash_session(&session_id, Some("alice"), false).unwrap();
+        for _ in 0..3 {
+            if !next.contains("interactive bash session is still running") {
+                break;
+            }
+            next = continue_bash_session(&session_id, None, false).unwrap();
+        }
+
+        assert!(next.contains("hello alice"));
+        assert!(
+            !list_bash_sessions()
+                .iter()
+                .any(|session| session.session_id == session_id)
+        );
     }
 
     fn make_temp_dir(label: &str) -> PathBuf {

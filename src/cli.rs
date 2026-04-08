@@ -1,3 +1,4 @@
+use crate::media::MessageImage;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -85,6 +86,9 @@ pub struct AskArgs {
     #[arg(short = 'I', long)]
     pub clipboard_image: bool,
 
+    #[arg(skip)]
+    pub preloaded_images: Vec<MessageImage>,
+
     #[arg(long)]
     pub session: Option<String>,
 
@@ -150,6 +154,9 @@ pub struct ReplArgs {
 
     #[arg(long)]
     pub stream: bool,
+
+    #[arg(long)]
+    pub no_stream: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]

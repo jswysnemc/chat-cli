@@ -11,7 +11,7 @@ use crate::config::{
 use crate::error::{
     AppError, AppResult, EXIT_ARGS, EXIT_AUTH, EXIT_CONFIG, EXIT_MODEL, EXIT_PROVIDER,
 };
-use crate::media::{MessageImage, read_image_inputs};
+use crate::media::{MessageImage, read_clipboard_image, read_clipboard_text, read_image_inputs};
 use crate::output::{AskOutput, AssistantMessage, render_ask_output};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, send_chat, stream_chat, test_provider,
@@ -24,17 +24,27 @@ use crate::session::{
     set_current_session, short_id,
 };
 use crate::tool::{
-    execute_tool, initial_tool_definitions, lookup_tool_spec, parse_tool_call,
-    tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
-    tool_search_matches,
+    continue_bash_session, execute_tool, initial_tool_definitions, list_bash_sessions,
+    lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation, tool_call_side_effects,
+    tool_definitions_for_names, tool_search_matches,
 };
 use clap::CommandFactory;
+use crossterm::cursor::{self, MoveTo};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
+use crossterm::queue;
+use crossterm::terminal::{self, Clear, ClearType};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::cmp::min;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
@@ -644,6 +654,19 @@ fn session_turns_from_events(events: &[SessionEvent]) -> Vec<Vec<SessionMessage>
     turns
 }
 
+fn filter_session_turns_for_repl(turns: &[Vec<SessionMessage>]) -> Vec<Vec<SessionMessage>> {
+    turns
+        .iter()
+        .map(|turn| {
+            turn.iter()
+                .filter(|message| message.role != "system")
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|turn| !turn.is_empty())
+        .collect()
+}
+
 fn render_session_turns(
     config: &AppConfig,
     turns: &[Vec<SessionMessage>],
@@ -666,6 +689,51 @@ fn render_session_turns(
         })
         .collect::<Vec<_>>()
         .join(&format!("\n\n{DIM}{}{RESET}\n\n", "─".repeat(56)))
+}
+
+fn render_repl_session_history(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+) -> AppResult<String> {
+    let events = read_events(paths, config, session_id)?;
+    let turns = filter_session_turns_for_repl(&session_turns_from_events(&events));
+    Ok(render_session_turns(config, &turns, None))
+}
+
+fn render_repl_submission_preview(
+    stdout: &mut io::Stdout,
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    prompt: &str,
+    images: &[MessageImage],
+) -> AppResult<()> {
+    let history = render_repl_session_history(paths, config, session_id).unwrap_or_default();
+    let inline = join_inline_prompt_segments(&[
+        (!images.is_empty()).then(|| image_badges(images.len())),
+        (!prompt.trim().is_empty()).then(|| prompt.to_string()),
+    ]);
+    let body = if inline.is_empty() {
+        String::new()
+    } else {
+        render_markdown(&inline, config.defaults.collapse_thinking.unwrap_or(false))
+    };
+    let preview = render_user_message_block(&format!("{GREEN}User{RESET}"), &body);
+    if !history.trim().is_empty() {
+        writeln!(stdout, "{history}").map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to write REPL history: {err}"))
+        })?;
+        writeln!(stdout).map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to write REPL spacing: {err}"))
+        })?;
+    }
+    writeln!(stdout, "{preview}")
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write REPL preview: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush REPL preview: {err}")))?;
+    Ok(())
 }
 
 fn render_session_message(config: &AppConfig, message: &SessionMessage) -> String {
@@ -821,7 +889,8 @@ async fn handle_ask(
         } else {
             cli.output.clone()
         };
-        let result = execute_ask_with_tools(cli, paths, config, secrets, &args, output_fmt).await?;
+        let result =
+            execute_ask_with_tools(cli, paths, config, secrets, &args, output_fmt, true).await?;
         if !args.stream {
             let rendered = format_final_ask_output(config, &result, args.raw_provider_response)?;
             println!("{rendered}");
@@ -829,7 +898,7 @@ async fn handle_ask(
         return Ok(());
     }
     if args.stream {
-        execute_ask_stream(cli, paths, config, secrets, &args, cli.output.clone()).await?;
+        execute_ask_stream(cli, paths, config, secrets, &args, cli.output.clone(), true).await?;
         return Ok(());
     }
     let result = execute_ask(cli, paths, config, secrets, &args, cli.output.clone()).await?;
@@ -1735,7 +1804,7 @@ fn select_session_id(
     ephemeral: bool,
 ) -> AppResult<String> {
     if let Some(session_id) = session {
-        return resolve_session_id(paths, config, session_id);
+        return resolve_or_allow_unsaved_session_id(paths, config, session_id);
     }
     if let Some(session_id) = requested_session_id(new_session, temp, ephemeral) {
         return Ok(session_id);
@@ -1756,6 +1825,167 @@ fn requested_session_id(new_session: bool, temp: bool, ephemeral: bool) -> Optio
     }
 }
 
+fn resolve_or_allow_unsaved_session_id(
+    paths: &AppPaths,
+    config: &AppConfig,
+    input: &str,
+) -> AppResult<String> {
+    match resolve_session_id(paths, config, input) {
+        Ok(session_id) => Ok(session_id),
+        Err(err) if err.message.starts_with("no session matching `") => {
+            let state = load_state(paths)?;
+            let current = state.current_session.unwrap_or_default();
+            if current == input {
+                return Ok(current);
+            }
+            let bare = current
+                .strip_prefix("sess_")
+                .or_else(|| current.strip_prefix("tmp_"))
+                .unwrap_or(&current);
+            if current.starts_with(input) || bare.starts_with(input) {
+                return Ok(current);
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn ensure_repl_session_id(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &mut String,
+    temp: bool,
+) -> AppResult<bool> {
+    let current_exists = crate::session::session_file(paths, config, session_id).exists();
+    let state = load_state(paths)?;
+    let state_matches = state.current_session.as_deref() == Some(session_id.as_str());
+
+    if current_exists || state_matches {
+        if !state_matches {
+            set_current_session(paths, config, Some(session_id), temp)?;
+        }
+        return Ok(false);
+    }
+
+    let replacement = state.current_session.unwrap_or_else(|| {
+        if temp {
+            generate_temp_session_id()
+        } else {
+            generate_session_id()
+        }
+    });
+    let replacement_temp = is_temp_session(&replacement) || temp;
+    set_current_session(paths, config, Some(&replacement), replacement_temp)?;
+    *session_id = replacement;
+    Ok(true)
+}
+
+#[derive(Default)]
+struct ReplState {
+    stream: bool,
+}
+
+struct ReplInput {
+    prompt: String,
+    images: Vec<MessageImage>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct CollapsedPaste {
+    text: String,
+    line_count: usize,
+}
+
+#[derive(Default)]
+struct ReplEditorDraft {
+    buffer: String,
+    images: Vec<MessageImage>,
+    collapsed_pastes: Vec<CollapsedPaste>,
+    status: Option<String>,
+    cursor: usize,
+    transcript_scroll: usize,
+    esc_pending: bool,
+}
+
+enum ReplDirective {
+    Continue,
+    Exit,
+    Submit(ReplInput),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplSlashCommand {
+    Commands,
+    New,
+    Status,
+    Clear,
+    Stream,
+    Bash,
+    Quit,
+    Exit,
+    HelpAlias,
+}
+
+impl ReplSlashCommand {
+    fn command(self) -> &'static str {
+        match self {
+            ReplSlashCommand::Commands => "commands",
+            ReplSlashCommand::New => "new",
+            ReplSlashCommand::Status => "status",
+            ReplSlashCommand::Clear => "clear",
+            ReplSlashCommand::Stream => "stream",
+            ReplSlashCommand::Bash => "bash",
+            ReplSlashCommand::Quit => "quit",
+            ReplSlashCommand::Exit => "exit",
+            ReplSlashCommand::HelpAlias => "help",
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            ReplSlashCommand::Commands => "/commands",
+            ReplSlashCommand::New => "/new [temp]",
+            ReplSlashCommand::Status => "/status",
+            ReplSlashCommand::Clear => "/clear",
+            ReplSlashCommand::Stream => "/stream [on|off|toggle]",
+            ReplSlashCommand::Bash => "/bash ...",
+            ReplSlashCommand::Quit => "/quit",
+            ReplSlashCommand::Exit => "/exit",
+            ReplSlashCommand::HelpAlias => "/help",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            ReplSlashCommand::Commands => "show available REPL commands",
+            ReplSlashCommand::New => "start a new chat session",
+            ReplSlashCommand::Status => "show current REPL session and model state",
+            ReplSlashCommand::Clear => "clear the terminal output",
+            ReplSlashCommand::Stream => "toggle streaming output",
+            ReplSlashCommand::Bash => "inspect or continue interactive bash sessions",
+            ReplSlashCommand::Quit | ReplSlashCommand::Exit => "exit the REPL",
+            ReplSlashCommand::HelpAlias => "alias of /commands",
+        }
+    }
+
+    fn visible(self) -> bool {
+        !matches!(self, ReplSlashCommand::HelpAlias)
+    }
+}
+
+const REPL_SLASH_COMMANDS: &[ReplSlashCommand] = &[
+    ReplSlashCommand::Commands,
+    ReplSlashCommand::New,
+    ReplSlashCommand::Status,
+    ReplSlashCommand::Clear,
+    ReplSlashCommand::Stream,
+    ReplSlashCommand::Bash,
+    ReplSlashCommand::Quit,
+    ReplSlashCommand::Exit,
+    ReplSlashCommand::HelpAlias,
+];
+
 async fn handle_repl(
     cli: &Cli,
     paths: &AppPaths,
@@ -1769,7 +1999,7 @@ async fn handle_repl(
             "--new-session cannot be used together with --session",
         ));
     }
-    let session_id = select_session_id(
+    let mut session_id = select_session_id(
         paths,
         config,
         args.session.as_deref(),
@@ -1777,79 +2007,140 @@ async fn handle_repl(
         args.temp,
         args.ephemeral,
     )?;
+    let mut session_temp = is_temp_session(&session_id) || args.temp;
+    set_current_session(paths, config, Some(&session_id), session_temp)?;
     let mut first_turn = true;
+    let mut repl_state = ReplState {
+        stream: !args.no_stream || args.stream,
+    };
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     loop {
-        let prompt = read_repl_prompt(&stdin, &mut stdout, args.multiline)?;
-        let trimmed = prompt.trim();
-        if trimmed.is_empty() {
-            continue;
+        if ensure_repl_session_id(paths, config, &mut session_id, session_temp)? {
+            session_temp = is_temp_session(&session_id) || args.temp;
         }
-        if trimmed == "/exit" || trimmed == "/quit" {
-            break;
+        let input = read_repl_input(
+            &stdin,
+            &mut stdout,
+            args.multiline,
+            cli,
+            paths,
+            config,
+            &session_id,
+            &repl_state,
+        )?;
+        match handle_repl_directive(
+            input,
+            &mut repl_state,
+            &mut stdout,
+            cli,
+            paths,
+            config,
+            &mut session_id,
+            &mut first_turn,
+            args.temp,
+        )? {
+            ReplDirective::Continue => continue,
+            ReplDirective::Exit => break,
+            ReplDirective::Submit(input) => {
+                if ensure_repl_session_id(paths, config, &mut session_id, session_temp)? {
+                    session_temp = is_temp_session(&session_id) || args.temp;
+                }
+                render_repl_submission_preview(
+                    &mut stdout,
+                    paths,
+                    config,
+                    &session_id,
+                    &input.prompt,
+                    &input.images,
+                )?;
+                let ask_args = AskArgs {
+                    prompt: Some(input.prompt),
+                    stdin: false,
+                    system: if first_turn {
+                        args.system.clone()
+                    } else {
+                        None
+                    },
+                    attachments: Vec::new(),
+                    images: Vec::new(),
+                    clipboard_image: false,
+                    preloaded_images: input.images,
+                    session: Some(session_id.clone()),
+                    new_session: false,
+                    ephemeral: args.ephemeral,
+                    temp: args.temp,
+                    tools: args.tools,
+                    yes: args.yes,
+                    stream: repl_state.stream,
+                    temperature: None,
+                    max_output_tokens: None,
+                    params: Vec::new(),
+                    timeout: None,
+                    raw_provider_response: false,
+                };
+                let use_tools = ask_args.tools || config.defaults.tools.unwrap_or(false);
+                if use_tools {
+                    let result = execute_ask_with_tools(
+                        cli,
+                        paths,
+                        config,
+                        secrets,
+                        &ask_args,
+                        Some(OutputFormat::Text),
+                        false,
+                    )
+                    .await?;
+                    if !repl_state.stream {
+                        println!("{}", format_final_ask_output(config, &result, false)?);
+                    }
+                } else if repl_state.stream {
+                    execute_ask_stream(
+                        cli,
+                        paths,
+                        config,
+                        secrets,
+                        &ask_args,
+                        Some(OutputFormat::Text),
+                        false,
+                    )
+                    .await?;
+                } else {
+                    let result = execute_ask(
+                        cli,
+                        paths,
+                        config,
+                        secrets,
+                        &ask_args,
+                        Some(OutputFormat::Text),
+                    )
+                    .await?;
+                    println!("{}", format_final_ask_output(config, &result, false)?);
+                }
+                first_turn = false;
+            }
         }
-        let ask_args = AskArgs {
-            prompt: Some(prompt),
-            stdin: false,
-            system: if first_turn {
-                args.system.clone()
-            } else {
-                None
-            },
-            attachments: Vec::new(),
-            images: Vec::new(),
-            clipboard_image: false,
-            session: Some(session_id.clone()),
-            new_session: false,
-            ephemeral: args.ephemeral,
-            temp: args.temp,
-            tools: args.tools,
-            yes: args.yes,
-            stream: args.stream,
-            temperature: None,
-            max_output_tokens: None,
-            params: Vec::new(),
-            timeout: None,
-            raw_provider_response: false,
-        };
-        let use_tools = ask_args.tools || config.defaults.tools.unwrap_or(false);
-        if use_tools {
-            let result = execute_ask_with_tools(
-                cli,
-                paths,
-                config,
-                secrets,
-                &ask_args,
-                Some(OutputFormat::Text),
-            )
-            .await?;
-            println!("{}", format_final_ask_output(config, &result, false)?);
-        } else if args.stream {
-            execute_ask_stream(
-                cli,
-                paths,
-                config,
-                secrets,
-                &ask_args,
-                Some(OutputFormat::Text),
-            )
-            .await?;
-        } else {
-            let result = execute_ask(
-                cli,
-                paths,
-                config,
-                secrets,
-                &ask_args,
-                Some(OutputFormat::Text),
-            )
-            .await?;
-            println!("{}", render_markdown(&result.output.message.content, false));
-        }
-        first_turn = false;
     }
     Ok(())
+}
+
+fn read_repl_input(
+    stdin: &io::Stdin,
+    stdout: &mut io::Stdout,
+    multiline: bool,
+    cli: &Cli,
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    state: &ReplState,
+) -> AppResult<ReplInput> {
+    if stdin.is_terminal() && stdout.is_terminal() {
+        return read_repl_tui_input(stdout, cli, paths, config, session_id, state);
+    }
+    Ok(ReplInput {
+        prompt: read_repl_prompt(stdin, stdout, multiline)?,
+        images: Vec::new(),
+    })
 }
 
 fn read_repl_prompt(
@@ -1875,6 +2166,1087 @@ fn read_repl_prompt(
         lines.push(trimmed.to_string());
     }
     Ok(lines.join("\n"))
+}
+
+struct ReplTerminalGuard {
+    supports_keyboard_enhancement: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReplScreenView {
+    transcript: String,
+    provider_id: String,
+    model_id: String,
+    cwd_label: String,
+    session_short: String,
+    stream: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplLayout {
+    transcript_height: u16,
+    composer_top: u16,
+    composer_body_height: u16,
+    status_row: u16,
+}
+
+#[derive(Debug, Clone)]
+struct WrappedInput {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReplComposerView {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+impl ReplTerminalGuard {
+    fn enter(stdout: &mut io::Stdout) -> AppResult<Self> {
+        terminal::enable_raw_mode()
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to enable raw mode: {err}")))?;
+        let supports_keyboard_enhancement =
+            matches!(terminal::supports_keyboard_enhancement(), Ok(true));
+        execute!(stdout, EnableBracketedPaste).map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to initialize REPL terminal mode: {err}"),
+            )
+        })?;
+        if supports_keyboard_enhancement {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )
+            .map_err(|err| {
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("failed to enable keyboard enhancement flags: {err}"),
+                )
+            })?;
+        }
+        Ok(Self {
+            supports_keyboard_enhancement,
+        })
+    }
+}
+
+impl Drop for ReplTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        if self.supports_keyboard_enhancement {
+            let _ = queue!(stdout, PopKeyboardEnhancementFlags);
+        }
+        let _ = execute!(stdout, DisableBracketedPaste, cursor::Show);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn read_repl_tui_input(
+    stdout: &mut io::Stdout,
+    cli: &Cli,
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    state: &ReplState,
+) -> AppResult<ReplInput> {
+    let _guard = ReplTerminalGuard::enter(stdout)?;
+    let view = build_repl_screen_view(cli, paths, config, session_id, state);
+    let mut draft = ReplEditorDraft {
+        transcript_scroll: usize::MAX,
+        ..ReplEditorDraft::default()
+    };
+
+    loop {
+        render_repl_editor(stdout, &view, &draft)?;
+        let event = event::read().map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to read terminal event: {err}"))
+        })?;
+        match event {
+            Event::Resize(_, _) => {}
+            Event::Paste(text) => {
+                draft.esc_pending = false;
+                handle_pasted_text(&mut draft, text);
+            }
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let modifiers = key.modifiers;
+                match key.code {
+                    KeyCode::Enter if modifiers.is_empty() => {
+                        if draft.buffer.trim().is_empty()
+                            && draft.images.is_empty()
+                            && draft.collapsed_pastes.is_empty()
+                        {
+                            draft.status = Some("输入为空，按 Ctrl+V 可附加剪贴板图片".to_string());
+                            continue;
+                        }
+                        clear_repl_surface(stdout)?;
+                        return Ok(ReplInput {
+                            prompt: materialize_repl_prompt(&draft),
+                            images: draft.images,
+                        });
+                    }
+                    KeyCode::Enter
+                        if modifiers.contains(KeyModifiers::CONTROL)
+                            || modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        draft.esc_pending = false;
+                        insert_text_at_cursor(&mut draft, "\n");
+                        draft.status = None;
+                    }
+                    KeyCode::Char('j') | KeyCode::Char('J')
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        draft.esc_pending = false;
+                        insert_text_at_cursor(&mut draft, "\n");
+                        draft.status = None;
+                    }
+                    KeyCode::PageUp => {
+                        draft.esc_pending = false;
+                        let page = transcript_page_step()?;
+                        draft.transcript_scroll =
+                            transcript_scroll_page_up(&view.transcript, &draft, page)?;
+                    }
+                    KeyCode::PageDown => {
+                        draft.esc_pending = false;
+                        let page = transcript_page_step()?;
+                        draft.transcript_scroll =
+                            transcript_scroll_page_down(&view.transcript, &draft, page)?;
+                    }
+                    KeyCode::Up if modifiers.contains(KeyModifiers::CONTROL) => {
+                        draft.esc_pending = false;
+                        draft.transcript_scroll =
+                            transcript_scroll_page_up(&view.transcript, &draft, 3)?;
+                    }
+                    KeyCode::Down if modifiers.contains(KeyModifiers::CONTROL) => {
+                        draft.esc_pending = false;
+                        draft.transcript_scroll =
+                            transcript_scroll_page_down(&view.transcript, &draft, 3)?;
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C')
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        clear_repl_surface(stdout)?;
+                        return Ok(ReplInput {
+                            prompt: "/exit".to_string(),
+                            images: Vec::new(),
+                        });
+                    }
+                    KeyCode::Char('v') | KeyCode::Char('V')
+                        if modifiers.contains(KeyModifiers::CONTROL)
+                            && modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        draft.esc_pending = false;
+                        match read_clipboard_text() {
+                            Ok(text) => handle_pasted_text(&mut draft, text),
+                            Err(err) => draft.status = Some(err.message),
+                        }
+                    }
+                    KeyCode::Char('v') | KeyCode::Char('V')
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        draft.esc_pending = false;
+                        match read_clipboard_image() {
+                            Ok(image) => {
+                                draft.images.push(image);
+                                draft.status = None;
+                            }
+                            Err(err) => draft.status = Some(err.message),
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        draft.esc_pending = false;
+                        if delete_prev_char_at_cursor(&mut draft) {
+                            draft.status = None;
+                        } else if draft.collapsed_pastes.pop().is_some() {
+                            draft.status = Some(format!(
+                                "已移除一段粘贴文本，剩余 {} 段",
+                                draft.collapsed_pastes.len()
+                            ));
+                        } else if draft.images.pop().is_some() {
+                            draft.status =
+                                Some(format!("已移除一张图片，剩余 {} 张", draft.images.len()));
+                        }
+                    }
+                    KeyCode::Delete => {
+                        draft.esc_pending = false;
+                        if delete_char_at_cursor(&mut draft) {
+                            draft.status = None;
+                        }
+                    }
+                    KeyCode::Left => {
+                        draft.esc_pending = false;
+                        move_cursor_left(&mut draft);
+                    }
+                    KeyCode::Right => {
+                        draft.esc_pending = false;
+                        move_cursor_right(&mut draft);
+                    }
+                    KeyCode::Home => {
+                        draft.esc_pending = false;
+                        move_cursor_line_start(&mut draft);
+                    }
+                    KeyCode::End => {
+                        draft.esc_pending = false;
+                        move_cursor_line_end(&mut draft);
+                    }
+                    KeyCode::Tab => {
+                        draft.esc_pending = false;
+                        insert_text_at_cursor(&mut draft, "    ");
+                        draft.status = None;
+                    }
+                    KeyCode::Esc => {
+                        if draft.esc_pending {
+                            clear_repl_text_input(&mut draft);
+                            draft.status = Some("已清空输入".to_string());
+                        } else {
+                            draft.esc_pending = true;
+                            draft.status = Some("再次按 Esc 清空输入".to_string());
+                        }
+                    }
+                    KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                        draft.esc_pending = false;
+                        insert_char_at_cursor(&mut draft, ch);
+                        draft.status = None;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn build_repl_screen_view(
+    cli: &Cli,
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    state: &ReplState,
+) -> ReplScreenView {
+    let provider_id = cli
+        .provider
+        .clone()
+        .or_else(|| config.defaults.provider.clone())
+        .unwrap_or_else(|| "-".to_string());
+    let model_id = cli
+        .model
+        .clone()
+        .or_else(|| config.defaults.model.clone())
+        .or_else(|| {
+            config
+                .providers
+                .get(&provider_id)
+                .and_then(|provider| provider.default_model.clone())
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let cwd_label = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            cwd.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| ".".to_string());
+    ReplScreenView {
+        transcript: render_repl_session_history(paths, config, session_id).unwrap_or_default(),
+        provider_id,
+        model_id,
+        cwd_label,
+        session_short: short_id(session_id),
+        stream: state.stream,
+    }
+}
+
+fn render_repl_editor(
+    stdout: &mut io::Stdout,
+    view: &ReplScreenView,
+    draft: &ReplEditorDraft,
+) -> AppResult<()> {
+    let (cols, rows) = terminal::size()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
+
+    let layout = compute_repl_layout(cols, rows, draft);
+    let transcript_lines = clipped_repl_transcript_lines(
+        &view.transcript,
+        cols,
+        layout.transcript_height,
+        draft.transcript_scroll,
+    );
+    let composer_view = repl_composer_view(draft, cols, layout.composer_body_height);
+    let status_bar = build_repl_status_bar(view, draft, cols);
+
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to draw REPL editor: {err}")))?;
+
+    for (row, line) in transcript_lines.iter().enumerate() {
+        write_repl_line(stdout, row as u16, line)?;
+    }
+
+    draw_repl_composer(stdout, cols, &layout, &composer_view)?;
+    write_repl_line(stdout, layout.status_row, &status_bar)?;
+
+    let cursor = repl_cursor_position(cols, &layout, &composer_view);
+    execute!(stdout, MoveTo(cursor.0, cursor.1), cursor::Show)
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to place REPL cursor: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush REPL editor: {err}")))?;
+    Ok(())
+}
+
+fn compute_repl_layout(cols: u16, rows: u16, draft: &ReplEditorDraft) -> ReplLayout {
+    let composer_view = repl_composer_view(draft, cols, u16::MAX);
+    let max_body = min(8usize, rows.saturating_sub(4) as usize).max(3);
+    let composer_body_height = min(composer_view.lines.len(), max_body).max(3) as u16;
+    let status_row = rows.saturating_sub(1);
+    let composer_top = rows.saturating_sub(composer_body_height + 3);
+    let transcript_height = composer_top;
+    ReplLayout {
+        transcript_height,
+        composer_top,
+        composer_body_height,
+        status_row,
+    }
+}
+
+fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> ReplComposerView {
+    let inner_width = cols.saturating_sub(4).max(8) as usize;
+    let mut lines = Vec::new();
+    if let Some(status) = &draft.status {
+        lines.extend(wrap_plain_lines(
+            &format!("{DIM}{status}{RESET}"),
+            inner_width,
+        ));
+    }
+
+    let badges = repl_attachment_badges(draft);
+    let prompt_prefix = if badges.is_empty() {
+        "❯ ".to_string()
+    } else {
+        format!("❯ {badges} ")
+    };
+    let prefix_width = display_width(&prompt_prefix);
+    let wrapped_input = wrap_editor_input(
+        &draft.buffer,
+        draft.cursor.min(draft.buffer.len()),
+        inner_width.saturating_sub(prefix_width).max(1),
+    );
+    let fixed_lines = lines.len();
+    let (cursor_row, cursor_col) = if draft.buffer.is_empty() {
+        lines.push(format!(
+            "{prompt_prefix}{DIM}输入消息，按 /commands 查看命令{RESET}"
+        ));
+        (fixed_lines, prefix_width)
+    } else {
+        for (index, line) in wrapped_input.lines.iter().enumerate() {
+            let prefix = if index == 0 {
+                prompt_prefix.as_str()
+            } else {
+                "  "
+            };
+            lines.push(format!("{prefix}{line}"));
+        }
+        (
+            fixed_lines + wrapped_input.cursor_row,
+            prefix_width + wrapped_input.cursor_col,
+        )
+    };
+
+    let max_lines = max_lines as usize;
+    if lines.len() > max_lines {
+        let start = cursor_row.saturating_sub(max_lines.saturating_sub(1));
+        let end = min(start + max_lines, lines.len());
+        ReplComposerView {
+            lines: lines[start..end].to_vec(),
+            cursor_row: cursor_row.saturating_sub(start),
+            cursor_col,
+        }
+    } else {
+        ReplComposerView {
+            lines,
+            cursor_row,
+            cursor_col,
+        }
+    }
+}
+
+fn clipped_repl_transcript_lines(
+    transcript: &str,
+    cols: u16,
+    height: u16,
+    scroll_top: usize,
+) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let lines = transcript_screen_lines(transcript, cols);
+    let top = resolve_transcript_scroll(lines.len(), height as usize, scroll_top);
+    lines.into_iter().skip(top).take(height as usize).collect()
+}
+
+fn write_repl_line(stdout: &mut io::Stdout, row: u16, text: &str) -> AppResult<()> {
+    execute!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to position REPL line: {err}")))?;
+    write!(stdout, "{text}")
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write REPL line: {err}")))?;
+    Ok(())
+}
+
+fn clear_repl_surface(stdout: &mut io::Stdout) -> AppResult<()> {
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to clear REPL surface: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush REPL surface: {err}")))?;
+    Ok(())
+}
+
+fn draw_repl_composer(
+    stdout: &mut io::Stdout,
+    cols: u16,
+    layout: &ReplLayout,
+    composer_view: &ReplComposerView,
+) -> AppResult<()> {
+    let inner_width = cols.saturating_sub(2) as usize;
+    let top_border = format!("╭{}╮", "─".repeat(inner_width));
+    let bottom_border = format!("╰{}╯", "─".repeat(inner_width));
+    write_repl_line(stdout, layout.composer_top, &top_border)?;
+
+    for index in 0..layout.composer_body_height as usize {
+        let content = composer_view.lines.get(index).cloned().unwrap_or_default();
+        let truncated = ansi_truncate(&content, inner_width);
+        let padding = inner_width.saturating_sub(visible_width(&truncated));
+        let row = layout.composer_top + 1 + index as u16;
+        let line = format!("│{truncated}{}│", " ".repeat(padding));
+        write_repl_line(stdout, row, &line)?;
+    }
+    write_repl_line(
+        stdout,
+        layout.composer_top + layout.composer_body_height + 1,
+        &bottom_border,
+    )?;
+    Ok(())
+}
+
+fn repl_cursor_position(
+    cols: u16,
+    layout: &ReplLayout,
+    composer_view: &ReplComposerView,
+) -> (u16, u16) {
+    let max_x = cols.saturating_sub(2);
+    (
+        (1 + composer_view.cursor_col as u16).min(max_x),
+        layout.composer_top + 1 + composer_view.cursor_row as u16,
+    )
+}
+
+fn build_repl_status_bar(view: &ReplScreenView, draft: &ReplEditorDraft, cols: u16) -> String {
+    let prompt_chars = materialize_repl_prompt(draft).chars().count();
+    let left = format!(
+        "{} │ {} │ {} │ {}",
+        view.model_id, view.cwd_label, view.provider_id, view.session_short
+    );
+    let right_text = format!(
+        "{} images │ {} paste(s) │ {} chars │ stream {}",
+        draft.images.len(),
+        draft.collapsed_pastes.len(),
+        prompt_chars,
+        if view.stream { "on" } else { "off" }
+    );
+    let content = pad_status_bar_plain(&left, &right_text, cols as usize);
+    format!("\x1b[48;5;236m\x1b[38;5;252m{content}\x1b[0m")
+}
+
+fn pad_status_bar_plain(left: &str, right: &str, width: usize) -> String {
+    let left = format!(" {left} ");
+    let right = format!(" {right} ");
+    let left_width = display_width(&left);
+    let right_width = display_width(&right);
+    if left_width + right_width >= width {
+        return truncate_plain_to_width(&left, width);
+    }
+    format!(
+        "{left}{}{}",
+        " ".repeat(width - left_width - right_width),
+        right
+    )
+}
+
+fn image_badges(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("[Image #{index}]"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn paste_badges(pastes: &[CollapsedPaste], image_offset: usize) -> String {
+    pastes
+        .iter()
+        .enumerate()
+        .map(|(index, paste)| {
+            format!(
+                "[Pasted text #{} +{} lines]",
+                image_offset + index + 1,
+                paste.line_count.saturating_sub(1)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn repl_attachment_badges(draft: &ReplEditorDraft) -> String {
+    let mut parts = Vec::new();
+    if !draft.images.is_empty() {
+        parts.push(image_badges(draft.images.len()));
+    }
+    if !draft.collapsed_pastes.is_empty() {
+        parts.push(paste_badges(&draft.collapsed_pastes, draft.images.len()));
+    }
+    parts.join(" ")
+}
+
+fn join_inline_prompt_segments(segments: &[Option<String>]) -> String {
+    segments
+        .iter()
+        .filter_map(|segment| segment.as_deref())
+        .filter(|segment| !segment.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn wrap_plain_lines(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        push_wrapped_plain_line(&mut lines, raw_line, width);
+    }
+    lines
+}
+
+fn ansi_truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut rendered = String::new();
+    let mut visible = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            rendered.push(ch);
+            while let Some(next) = chars.next() {
+                rendered.push(next);
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let ch_width = display_width_char(ch);
+        if visible + ch_width > width {
+            break;
+        }
+        rendered.push(ch);
+        visible += ch_width;
+    }
+    if rendered.contains('\x1b') && !rendered.ends_with(RESET) {
+        rendered.push_str(RESET);
+    }
+    rendered
+}
+
+fn visible_width(text: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            while let Some(next) = chars.next() {
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += display_width_char(ch);
+    }
+    width
+}
+
+fn wrap_editor_input(buffer: &str, cursor: usize, width: usize) -> WrappedInput {
+    let mut lines = vec![String::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut cursor_set = cursor == 0;
+
+    for (index, ch) in buffer.char_indices() {
+        if !cursor_set && index == cursor {
+            cursor_row = row;
+            cursor_col = col;
+            cursor_set = true;
+        }
+
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            lines.push(String::new());
+            continue;
+        }
+
+        let ch_width = display_width_char(ch);
+        if !lines[row].is_empty() && col + ch_width > width {
+            row += 1;
+            col = 0;
+            lines.push(String::new());
+        }
+
+        lines[row].push(ch);
+        col += ch_width;
+
+        let next = index + ch.len_utf8();
+        if !cursor_set && next == cursor {
+            cursor_row = row;
+            cursor_col = col;
+            cursor_set = true;
+        }
+    }
+
+    if !cursor_set {
+        cursor_row = row;
+        cursor_col = col;
+    }
+
+    WrappedInput {
+        lines,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+fn transcript_screen_lines(transcript: &str, cols: u16) -> Vec<String> {
+    let width = cols as usize;
+    if transcript.trim().is_empty() {
+        return vec![format!(
+            "{DIM}No conversation yet. Start with a prompt below.{RESET}"
+        )];
+    }
+    transcript
+        .lines()
+        .map(|line| ansi_truncate(line, width))
+        .collect()
+}
+
+fn resolve_transcript_scroll(total_lines: usize, height: usize, requested: usize) -> usize {
+    let max_top = total_lines.saturating_sub(height);
+    if requested == usize::MAX {
+        max_top
+    } else {
+        requested.min(max_top)
+    }
+}
+
+fn transcript_page_step() -> AppResult<usize> {
+    let (_, rows) = terminal::size()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
+    Ok(rows.saturating_sub(8).max(1) as usize)
+}
+
+fn transcript_scroll_page_up(
+    transcript: &str,
+    draft: &ReplEditorDraft,
+    amount: usize,
+) -> AppResult<usize> {
+    let (cols, rows) = terminal::size()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
+    let total = transcript_screen_lines(transcript, cols).len();
+    let height = compute_repl_layout(cols, rows, draft).transcript_height as usize;
+    let current = resolve_transcript_scroll(total, height, draft.transcript_scroll);
+    Ok(current.saturating_sub(amount.max(1)))
+}
+
+fn transcript_scroll_page_down(
+    transcript: &str,
+    draft: &ReplEditorDraft,
+    amount: usize,
+) -> AppResult<usize> {
+    let (cols, rows) = terminal::size()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
+    let total = transcript_screen_lines(transcript, cols).len();
+    let height = compute_repl_layout(cols, rows, draft).transcript_height as usize;
+    let current = resolve_transcript_scroll(total, height, draft.transcript_scroll);
+    Ok(current
+        .saturating_add(amount.max(1))
+        .min(total.saturating_sub(height)))
+}
+
+fn handle_pasted_text(draft: &mut ReplEditorDraft, text: String) {
+    if should_collapse_pasted_text(&text) {
+        let line_count = text.lines().count().max(1);
+        draft
+            .collapsed_pastes
+            .push(CollapsedPaste { text, line_count });
+        draft.status = None;
+    } else {
+        insert_text_at_cursor(draft, &text);
+        draft.status = None;
+    }
+}
+
+fn should_collapse_pasted_text(text: &str) -> bool {
+    let line_count = text.lines().count();
+    line_count > 8 || text.chars().count() > 320
+}
+
+fn materialize_repl_prompt(draft: &ReplEditorDraft) -> String {
+    let mut prompt = draft.buffer.clone();
+    for paste in &draft.collapsed_pastes {
+        if !prompt.is_empty() && !prompt.ends_with('\n') {
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(&paste.text);
+    }
+    prompt
+}
+
+fn clear_repl_text_input(draft: &mut ReplEditorDraft) {
+    draft.buffer.clear();
+    draft.cursor = 0;
+    draft.collapsed_pastes.clear();
+    draft.esc_pending = false;
+}
+
+fn insert_text_at_cursor(draft: &mut ReplEditorDraft, text: &str) {
+    draft.buffer.insert_str(draft.cursor, text);
+    draft.cursor += text.len();
+}
+
+fn insert_char_at_cursor(draft: &mut ReplEditorDraft, ch: char) {
+    draft.buffer.insert(draft.cursor, ch);
+    draft.cursor += ch.len_utf8();
+}
+
+fn delete_prev_char_at_cursor(draft: &mut ReplEditorDraft) -> bool {
+    if draft.cursor == 0 {
+        return false;
+    }
+    let prev = previous_char_boundary(&draft.buffer, draft.cursor);
+    draft.buffer.replace_range(prev..draft.cursor, "");
+    draft.cursor = prev;
+    true
+}
+
+fn delete_char_at_cursor(draft: &mut ReplEditorDraft) -> bool {
+    if draft.cursor >= draft.buffer.len() {
+        return false;
+    }
+    let next = next_char_boundary(&draft.buffer, draft.cursor);
+    draft.buffer.replace_range(draft.cursor..next, "");
+    true
+}
+
+fn move_cursor_left(draft: &mut ReplEditorDraft) {
+    if draft.cursor > 0 {
+        draft.cursor = previous_char_boundary(&draft.buffer, draft.cursor);
+    }
+}
+
+fn move_cursor_right(draft: &mut ReplEditorDraft) {
+    if draft.cursor < draft.buffer.len() {
+        draft.cursor = next_char_boundary(&draft.buffer, draft.cursor);
+    }
+}
+
+fn move_cursor_line_start(draft: &mut ReplEditorDraft) {
+    draft.cursor = line_start_boundary(&draft.buffer, draft.cursor);
+}
+
+fn move_cursor_line_end(draft: &mut ReplEditorDraft) {
+    draft.cursor = line_end_boundary(&draft.buffer, draft.cursor);
+}
+
+fn previous_char_boundary(text: &str, index: usize) -> usize {
+    text[..index]
+        .char_indices()
+        .last()
+        .map(|(offset, _)| offset)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    text[index..]
+        .chars()
+        .next()
+        .map(|ch| index + ch.len_utf8())
+        .unwrap_or(index)
+}
+
+fn line_start_boundary(text: &str, index: usize) -> usize {
+    text[..index]
+        .rfind('\n')
+        .map(|offset| offset + 1)
+        .unwrap_or(0)
+}
+
+fn line_end_boundary(text: &str, index: usize) -> usize {
+    text[index..]
+        .find('\n')
+        .map(|offset| index + offset)
+        .unwrap_or(text.len())
+}
+
+fn push_wrapped_plain_line(lines: &mut Vec<String>, raw_line: &str, width: usize) {
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in raw_line.chars() {
+        let ch_width = display_width_char(ch);
+        if !current.is_empty() && current_width + ch_width > width {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    lines.push(current);
+}
+
+fn truncate_plain_to_width(text: &str, width: usize) -> String {
+    let mut rendered = String::new();
+    let mut current_width = 0usize;
+    for ch in text.chars() {
+        let ch_width = display_width_char(ch);
+        if current_width + ch_width > width {
+            break;
+        }
+        rendered.push(ch);
+        current_width += ch_width;
+    }
+    rendered
+}
+
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn display_width_char(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn handle_repl_directive(
+    input: ReplInput,
+    state: &mut ReplState,
+    stdout: &mut io::Stdout,
+    cli: &Cli,
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &mut String,
+    first_turn: &mut bool,
+    temp: bool,
+) -> AppResult<ReplDirective> {
+    let trimmed = input.prompt.trim();
+    if trimmed.is_empty() && input.images.is_empty() {
+        return Ok(ReplDirective::Continue);
+    }
+    if !input.images.is_empty() {
+        return Ok(ReplDirective::Submit(input));
+    }
+
+    if let Some((command, rest)) = parse_repl_slash_command(trimmed) {
+        match command {
+            ReplSlashCommand::Commands | ReplSlashCommand::HelpAlias => {
+                print_repl_commands();
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Exit | ReplSlashCommand::Quit => {
+                return Ok(ReplDirective::Exit);
+            }
+            ReplSlashCommand::Clear => {
+                execute!(stdout, Clear(ClearType::All), MoveTo(0, 0)).map_err(|err| {
+                    AppError::new(EXIT_ARGS, format!("failed to clear terminal: {err}"))
+                })?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Stream => {
+                handle_repl_stream_command(state, rest);
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Bash => {
+                handle_repl_bash_command(rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Status => {
+                print_repl_status(cli, config, session_id, state);
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::New => {
+                handle_repl_new_session(paths, config, session_id, first_turn, temp, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+        }
+    }
+    Ok(ReplDirective::Submit(input))
+}
+
+fn handle_repl_bash_command(rest: &str) -> AppResult<()> {
+    match rest {
+        "" | "help" => {
+            println!("/bash sessions");
+            println!("/bash read <session_id>");
+            println!("/bash input <session_id> <text>");
+            println!("/bash close <session_id>");
+        }
+        "sessions" => {
+            let sessions = list_bash_sessions();
+            if sessions.is_empty() {
+                println!("no interactive bash sessions");
+            } else {
+                for session in sessions {
+                    println!("{} {}", session.session_id, session.command);
+                }
+            }
+        }
+        _ if rest.starts_with("read ") => {
+            let session_id = rest["read ".len()..].trim();
+            println!("{}", continue_bash_session(session_id, None, false)?);
+        }
+        _ if rest.starts_with("close ") => {
+            let session_id = rest["close ".len()..].trim();
+            println!("{}", continue_bash_session(session_id, None, true)?);
+        }
+        _ if rest.starts_with("input ") => {
+            let args = rest["input ".len()..].trim();
+            let (session_id, text) = args.split_once(' ').ok_or_else(|| {
+                AppError::new(EXIT_ARGS, "usage: /bash input <session_id> <text>")
+            })?;
+            println!("{}", continue_bash_session(session_id, Some(text), false)?);
+        }
+        _ => println!("unknown /bash command; use /bash help"),
+    }
+    Ok(())
+}
+
+fn parse_repl_slash_command(input: &str) -> Option<(ReplSlashCommand, &str)> {
+    let stripped = input.strip_prefix('/')?;
+    let (name, rest) = match stripped.find(char::is_whitespace) {
+        Some(index) => (&stripped[..index], stripped[index..].trim()),
+        None => (stripped, ""),
+    };
+    let command = match name {
+        "" | "commands" => ReplSlashCommand::Commands,
+        "help" => ReplSlashCommand::HelpAlias,
+        "new" => ReplSlashCommand::New,
+        "status" => ReplSlashCommand::Status,
+        "clear" => ReplSlashCommand::Clear,
+        "stream" => ReplSlashCommand::Stream,
+        "bash" => ReplSlashCommand::Bash,
+        "quit" => ReplSlashCommand::Quit,
+        "exit" => ReplSlashCommand::Exit,
+        _ => return None,
+    };
+    Some((command, rest))
+}
+
+fn visible_repl_slash_commands() -> Vec<ReplSlashCommand> {
+    REPL_SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.visible())
+        .collect()
+}
+
+fn print_repl_commands() {
+    for command in visible_repl_slash_commands() {
+        println!("{:<24} {}", command.usage(), command.description());
+    }
+}
+
+fn handle_repl_stream_command(state: &mut ReplState, mode: &str) {
+    match mode {
+        "" => println!("stream: {}", if state.stream { "on" } else { "off" }),
+        "on" => {
+            state.stream = true;
+            println!("stream enabled");
+        }
+        "off" => {
+            state.stream = false;
+            println!("stream disabled");
+        }
+        "toggle" => {
+            state.stream = !state.stream;
+            println!("stream: {}", if state.stream { "on" } else { "off" });
+        }
+        _ => println!("usage: {}", ReplSlashCommand::Stream.usage()),
+    }
+}
+
+fn print_repl_status(cli: &Cli, config: &AppConfig, session_id: &str, state: &ReplState) {
+    let provider_id = cli
+        .provider
+        .clone()
+        .or_else(|| config.defaults.provider.clone())
+        .unwrap_or_else(|| "-".to_string());
+    let model_id = cli
+        .model
+        .clone()
+        .or_else(|| config.defaults.model.clone())
+        .or_else(|| {
+            config
+                .providers
+                .get(&provider_id)
+                .and_then(|provider| provider.default_model.clone())
+        })
+        .unwrap_or_else(|| "-".to_string());
+    println!("session {}", short_id(session_id));
+    println!("provider {provider_id}");
+    println!("model {model_id}");
+    println!("stream {}", if state.stream { "on" } else { "off" });
+}
+
+fn handle_repl_new_session(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &mut String,
+    first_turn: &mut bool,
+    temp: bool,
+    args: &str,
+) -> AppResult<()> {
+    let new_temp = match args {
+        "" => false,
+        "temp" => true,
+        _ => {
+            println!("usage: {}", ReplSlashCommand::New.usage());
+            return Ok(());
+        }
+    };
+    let next = if new_temp {
+        generate_temp_session_id()
+    } else if temp {
+        generate_temp_session_id()
+    } else {
+        generate_session_id()
+    };
+    set_current_session(paths, config, Some(&next), new_temp || temp)?;
+    *session_id = next.clone();
+    *first_turn = true;
+    println!("new session {}", short_id(&next));
+    Ok(())
 }
 
 fn read_single_repl_line(
@@ -2003,6 +3375,7 @@ async fn execute_ask_with_tools(
     secrets: &SecretsConfig,
     args: &AskArgs,
     output_override: Option<OutputFormat>,
+    show_static_status_bar: bool,
 ) -> AppResult<AskExecution> {
     let mut prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     let mut loaded_tool_names = BTreeSet::new();
@@ -2024,7 +3397,7 @@ async fn execute_ask_with_tools(
             let mut status = None;
 
             // Status bar on first round
-            if round == 0 && use_stream {
+            if round == 0 && use_stream && show_static_status_bar {
                 print_status_bar(
                     &prepared.request.provider_id,
                     &prepared.request.model_id,
@@ -2033,6 +3406,8 @@ async fn execute_ask_with_tools(
                 .map_err(|err| {
                     AppError::new(EXIT_ARGS, format!("failed to write stdout: {err}"))
                 })?;
+                status = Some(StreamStatus::start(StreamPhase::Waiting));
+            } else if round == 0 && use_stream {
                 status = Some(StreamStatus::start(StreamPhase::Waiting));
             }
 
@@ -2250,6 +3625,7 @@ async fn execute_ask_stream(
     secrets: &SecretsConfig,
     args: &AskArgs,
     output_override: Option<OutputFormat>,
+    show_static_status_bar: bool,
 ) -> AppResult<()> {
     let prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     let format = prepared.format.clone();
@@ -2270,7 +3646,7 @@ async fn execute_ask_stream(
     }
 
     // Status bar
-    if format == OutputFormat::Text {
+    if format == OutputFormat::Text && show_static_status_bar {
         print_status_bar(
             &prepared.request.provider_id,
             &prepared.request.model_id,
@@ -2699,7 +4075,8 @@ fn build_input(args: &AskArgs) -> AppResult<BuiltInput> {
         })?;
         parts.push(format!("File: {}\n{}", attachment.display(), content));
     }
-    let images = read_image_inputs(&args.images, args.clipboard_image)?;
+    let mut images = read_image_inputs(&args.images, args.clipboard_image)?;
+    images.extend(args.preloaded_images.clone());
     if parts.is_empty() && images.is_empty() {
         return Err(AppError::new(
             EXIT_ARGS,
@@ -2901,6 +4278,7 @@ mod tests {
             attachments: Vec::new(),
             images: Vec::new(),
             clipboard_image: false,
+            preloaded_images: Vec::new(),
             session: None,
             new_session: false,
             ephemeral: false,
@@ -2916,10 +4294,249 @@ mod tests {
         }
     }
 
+    fn repl_test_context() -> (Cli, AppPaths, AppConfig, String, bool) {
+        let (paths, _base_dir) = test_paths();
+        let cli = test_cli();
+        let config = test_config();
+        let session_id = "sess_test_repl".to_string();
+        (cli, paths, config, session_id, true)
+    }
+
+    #[test]
+    fn repl_stream_command_toggles_runtime_state() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState { stream: true };
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/stream off".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(directive, ReplDirective::Continue));
+        assert!(!state.stream);
+    }
+
+    #[test]
+    fn repl_unknown_slash_command_is_sent_to_model() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState { stream: true };
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/explain /tmp".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        match directive {
+            ReplDirective::Submit(input) => assert_eq!(input.prompt, "/explain /tmp"),
+            _ => panic!("unexpected repl directive"),
+        }
+    }
+
+    #[test]
+    fn visible_repl_commands_exclude_help() {
+        let commands = visible_repl_slash_commands()
+            .into_iter()
+            .map(|command| command.command())
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&"commands"));
+        assert!(commands.contains(&"status"));
+        assert!(!commands.contains(&"help"));
+    }
+
+    #[test]
+    fn parse_repl_slash_command_maps_help_to_alias() {
+        let (command, rest) = parse_repl_slash_command("/help").unwrap();
+        assert_eq!(command, ReplSlashCommand::HelpAlias);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn display_width_counts_wide_chars() {
+        assert_eq!(display_width("你好"), 4);
+        assert_eq!(display_width("你a"), 3);
+    }
+
+    #[test]
+    fn wrap_editor_input_tracks_wide_char_cursor_columns() {
+        let wrapped = wrap_editor_input("你a", '你'.len_utf8(), 10);
+        assert_eq!(wrapped.lines, vec!["你a"]);
+        assert_eq!(wrapped.cursor_row, 0);
+        assert_eq!(wrapped.cursor_col, 2);
+    }
+
+    #[test]
+    fn wrap_editor_input_moves_cursor_to_next_line_after_newline() {
+        let wrapped = wrap_editor_input("ab\n", 3, 10);
+        assert_eq!(wrapped.lines, vec!["ab", ""]);
+        assert_eq!(wrapped.cursor_row, 1);
+        assert_eq!(wrapped.cursor_col, 0);
+    }
+
+    #[test]
+    fn resolve_transcript_scroll_defaults_to_bottom() {
+        assert_eq!(resolve_transcript_scroll(100, 10, usize::MAX), 90);
+        assert_eq!(resolve_transcript_scroll(5, 10, usize::MAX), 0);
+    }
+
+    #[test]
+    fn large_pasted_text_is_collapsed_into_badge_payload() {
+        let mut draft = ReplEditorDraft::default();
+        handle_pasted_text(&mut draft, "a\nb\nc\nd\ne\nf\ng\nh\ni".to_string());
+        assert!(draft.buffer.is_empty());
+        assert_eq!(draft.collapsed_pastes.len(), 1);
+        assert_eq!(materialize_repl_prompt(&draft), "a\nb\nc\nd\ne\nf\ng\nh\ni");
+        assert!(repl_attachment_badges(&draft).contains("[Pasted text #1 +8 lines]"));
+        assert!(draft.status.is_none());
+    }
+
+    #[test]
+    fn clear_repl_text_input_keeps_images_but_drops_text_payloads() {
+        let mut draft = ReplEditorDraft {
+            buffer: "hello".to_string(),
+            images: vec![MessageImage {
+                media_type: "image/png".to_string(),
+                data: "abc".to_string(),
+            }],
+            collapsed_pastes: vec![CollapsedPaste {
+                text: "world".to_string(),
+                line_count: 1,
+            }],
+            status: None,
+            cursor: 5,
+            transcript_scroll: 0,
+            esc_pending: true,
+        };
+        clear_repl_text_input(&mut draft);
+        assert_eq!(draft.buffer, "");
+        assert_eq!(draft.cursor, 0);
+        assert_eq!(draft.collapsed_pastes.len(), 0);
+        assert_eq!(draft.images.len(), 1);
+        assert!(!draft.esc_pending);
+    }
+
+    #[test]
+    fn join_inline_prompt_segments_compacts_badges_and_text() {
+        let inline = join_inline_prompt_segments(&[
+            Some("[Image #1]".to_string()),
+            Some("[Pasted text #2 +5 lines]".to_string()),
+            Some("你好".to_string()),
+        ]);
+        assert_eq!(inline, "[Image #1] [Pasted text #2 +5 lines] 你好");
+    }
+
+    #[test]
+    fn repl_composer_view_keeps_attachment_badges_inline() {
+        let draft = ReplEditorDraft {
+            buffer: "你好".to_string(),
+            images: vec![MessageImage {
+                media_type: "image/png".to_string(),
+                data: "abc".to_string(),
+            }],
+            collapsed_pastes: Vec::new(),
+            status: None,
+            cursor: "你好".len(),
+            transcript_scroll: 0,
+            esc_pending: false,
+        };
+        let view = repl_composer_view(&draft, 80, 8);
+        assert!(view.lines[0].contains("❯ [Image #1] 你好"));
+    }
+
     #[test]
     fn requested_session_id_prefers_temp_over_new_session() {
         let session_id = requested_session_id(true, true, false).unwrap();
         assert!(session_id.starts_with("tmp_"));
+    }
+
+    #[test]
+    fn select_session_id_accepts_unsaved_current_session_when_explicit() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        let expected = "sess_unsaved_explicit".to_string();
+        set_current_session(&paths, &config, Some(&expected), false).unwrap();
+
+        let selected = select_session_id(
+            &paths,
+            &config,
+            Some(expected.as_str()),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(selected, expected);
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn select_session_id_accepts_unsaved_current_session_by_short_id() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        let expected = format!("sess_{}", ulid::Ulid::new());
+        let short = short_id(&expected);
+        set_current_session(&paths, &config, Some(&expected), false).unwrap();
+
+        let selected =
+            select_session_id(&paths, &config, Some(&short), false, false, false).unwrap();
+        assert_eq!(selected, expected);
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn ensure_repl_session_id_keeps_unsaved_current_session() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        let mut session_id = "sess_unsaved".to_string();
+        set_current_session(&paths, &config, Some(&session_id), false).unwrap();
+
+        let switched = ensure_repl_session_id(&paths, &config, &mut session_id, false).unwrap();
+        assert!(!switched);
+        assert_eq!(session_id, "sess_unsaved");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn ensure_repl_session_id_replaces_deleted_session() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        let deleted = "sess_deleted".to_string();
+        set_current_session(&paths, &config, Some(&deleted), false).unwrap();
+        set_current_session(&paths, &config, None, false).unwrap();
+
+        let mut session_id = deleted.clone();
+        let switched = ensure_repl_session_id(&paths, &config, &mut session_id, false).unwrap();
+        assert!(switched);
+        assert_ne!(session_id, deleted);
+        assert!(session_id.starts_with("sess_"));
+        assert_eq!(
+            load_state(&paths).unwrap().current_session.as_deref(),
+            Some(session_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -2937,6 +4554,15 @@ mod tests {
     #[test]
     fn session_turns_group_messages_by_user_turn() {
         let events = vec![
+            SessionEvent::Message(SessionMessage {
+                role: "system".to_string(),
+                content: "系统提示".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
             SessionEvent::Message(SessionMessage {
                 role: "user".to_string(),
                 content: "first question".to_string(),
@@ -2985,11 +4611,16 @@ mod tests {
         ];
 
         let turns = session_turns_from_events(&events);
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].len(), 3);
-        assert_eq!(turns[1].len(), 2);
-        assert_eq!(turns[0][0].content, "first question");
-        assert_eq!(turns[1][0].content, "second question");
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].len(), 1);
+        assert_eq!(turns[1].len(), 3);
+        assert_eq!(turns[2].len(), 2);
+        assert_eq!(turns[0][0].role, "system");
+        let repl_turns = filter_session_turns_for_repl(&turns);
+        assert_eq!(repl_turns.len(), 2);
+        assert_eq!(repl_turns[0][0].role, "user");
+        assert_eq!(turns[1][0].content, "first question");
+        assert_eq!(turns[2][0].content, "second question");
     }
 
     #[test]
