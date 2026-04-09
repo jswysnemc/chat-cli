@@ -42,7 +42,7 @@ const BASH_LIST_COMMANDS: &[&str] = &["ls", "tree", "du"];
 const BASH_NEUTRAL_COMMANDS: &[&str] = &["echo", "printf", "true", "false", ":"];
 const BASH_SESSION_IDLE_TIMEOUT: Duration = Duration::from_millis(350);
 const BASH_SESSION_START_TIMEOUT: Duration = Duration::from_millis(900);
-const BASH_SESSION_DRAIN_TIMEOUT: Duration = Duration::from_millis(120);
+const BASH_SESSION_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const BASH_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const BASH_SESSION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(2);
 const BASH_SESSION_MAX_OUTPUT_CHARS: usize = 16 * 1024;
@@ -1215,7 +1215,7 @@ fn update_bash_session(
             // The process can exit before the stdout/stderr reader threads have forwarded
             // the final chunk into the channel. Keep draining until the channel goes quiet
             // or disconnects so short-lived commands do not lose their trailing output.
-            drain_bash_output_until_quiet(session, &mut output, BASH_SESSION_DRAIN_TIMEOUT);
+            drain_bash_output_after_exit(session, &mut output, BASH_SESSION_EXIT_DRAIN_TIMEOUT);
             return Ok(BashSessionUpdate::Completed(format_bash_output(
                 &output,
                 status.code(),
@@ -1260,23 +1260,22 @@ fn drain_bash_output(session: &mut InteractiveBashSession, output: &mut BashOutp
     drained
 }
 
-fn drain_bash_output_until_quiet(
+fn drain_bash_output_after_exit(
     session: &mut InteractiveBashSession,
     output: &mut BashOutput,
-    quiet_timeout: Duration,
+    max_wait: Duration,
 ) {
-    let mut last_chunk_at = Instant::now();
+    let deadline = Instant::now() + max_wait;
     loop {
-        match session.receiver.recv_timeout(BASH_SESSION_POLL_INTERVAL) {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let wait = remaining.min(BASH_SESSION_POLL_INTERVAL);
+        match session.receiver.recv_timeout(wait) {
             Ok(chunk) => {
                 append_bash_output_chunk(output, chunk);
-                last_chunk_at = Instant::now();
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if last_chunk_at.elapsed() >= quiet_timeout {
-                    break;
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
