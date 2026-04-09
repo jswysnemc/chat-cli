@@ -16,7 +16,10 @@ use crate::output::{AskOutput, AssistantMessage, render_ask_output};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, send_chat, stream_chat, test_provider,
 };
-use crate::render::{StreamPhase, StreamRenderer, StreamStatus, print_status_bar, render_markdown};
+use crate::render::{
+    StreamPhase, StreamRenderer, StreamStatus, print_status_bar, render_markdown,
+    wrap_ansi_to_width,
+};
 use crate::session::{
     SessionAudit, SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions,
     delete_session, gc_sessions, generate_session_id, generate_temp_session_id, is_temp_session,
@@ -699,6 +702,138 @@ fn render_repl_session_history(
     let events = read_events(paths, config, session_id)?;
     let turns = filter_session_turns_for_repl(&session_turns_from_events(&events));
     Ok(render_session_turns(config, &turns, None))
+}
+
+fn render_repl_transcript(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    panels: &[ReplRuntimePanel],
+    transient_panel: Option<&ReplRuntimePanel>,
+) -> String {
+    let history = render_repl_session_history(paths, config, session_id).unwrap_or_default();
+    let mut rendered_panels = panels
+        .iter()
+        .map(render_repl_runtime_panel)
+        .collect::<Vec<_>>();
+    if let Some(panel) = transient_panel {
+        rendered_panels.push(render_repl_runtime_panel(panel));
+    }
+    let panel_text = rendered_panels.join(&format!("\n\n{DIM}{}{RESET}\n\n", "─".repeat(56)));
+    match (history.trim().is_empty(), panel_text.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => history,
+        (true, false) => panel_text,
+        (false, false) => format!(
+            "{history}\n\n{DIM}{}{RESET}\n\n{panel_text}",
+            "─".repeat(56)
+        ),
+    }
+}
+
+fn render_repl_runtime_panel(panel: &ReplRuntimePanel) -> String {
+    match panel.kind {
+        ReplRuntimePanelKind::User => render_user_message_block(&panel.title, &panel.body),
+        ReplRuntimePanelKind::Status => render_runtime_panel(&panel.title, &panel.body, CYAN),
+        ReplRuntimePanelKind::Error => render_runtime_panel(&panel.title, &panel.body, RED),
+    }
+}
+
+fn render_runtime_panel(title: &str, body: &str, accent: &str) -> String {
+    let lines = if body.trim().is_empty() {
+        vec![String::new()]
+    } else {
+        body.lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    };
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            if line.is_empty() {
+                format!("{accent}│{RESET}")
+            } else {
+                format!("{accent}│{RESET} {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{accent}{title}{RESET}\n{rendered}")
+}
+
+fn push_repl_panel(state: &mut ReplState, panel: ReplRuntimePanel) {
+    state.panels.push(panel);
+    if state.panels.len() > 12 {
+        let drop_count = state.panels.len() - 12;
+        state.panels.drain(..drop_count);
+    }
+}
+
+fn set_repl_transient_panel(state: &mut ReplState, panel: ReplRuntimePanel) {
+    state.transient_panel = Some(panel);
+}
+
+fn clear_repl_transient_panel(state: &mut ReplState) {
+    state.transient_panel = None;
+}
+
+fn build_repl_status_panel(
+    cli: &Cli,
+    config: &AppConfig,
+    session_id: &str,
+    state: &ReplState,
+) -> ReplRuntimePanel {
+    let provider_id =
+        repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string());
+    let model_id = repl_effective_model_id(cli, config, state).unwrap_or_else(|| "-".to_string());
+    let mut sections = vec![
+        format!("session: {}", short_id(session_id)),
+        format!("provider: {provider_id}"),
+        format!("model: {model_id}"),
+        format!("stream: {}", if state.stream { "on" } else { "off" }),
+        format!("tools: {}", if state.tools { "on" } else { "off" }),
+    ];
+    sections.push(String::new());
+    sections.push("quick actions:".to_string());
+    sections.push("/provider  choose provider".to_string());
+    sections.push("/model     choose model".to_string());
+    sections.push("/stream    toggle streaming".to_string());
+    sections.push("/tools     toggle tool calling".to_string());
+    sections.push("/new       create a new session".to_string());
+    ReplRuntimePanel {
+        kind: ReplRuntimePanelKind::Status,
+        title: "Status".to_string(),
+        body: sections.join("\n"),
+    }
+}
+
+fn build_repl_error_panel(message: &str) -> ReplRuntimePanel {
+    ReplRuntimePanel {
+        kind: ReplRuntimePanelKind::Error,
+        title: "Error".to_string(),
+        body: message.to_string(),
+    }
+}
+
+fn build_repl_user_panel(
+    config: &AppConfig,
+    prompt: &str,
+    images: &[MessageImage],
+) -> ReplRuntimePanel {
+    let inline = join_inline_prompt_segments(&[
+        (!images.is_empty()).then(|| image_badges(images.len())),
+        (!prompt.trim().is_empty()).then(|| prompt.to_string()),
+    ]);
+    let body = if inline.is_empty() {
+        String::new()
+    } else {
+        render_markdown(&inline, config.defaults.collapse_thinking.unwrap_or(false))
+    };
+    ReplRuntimePanel {
+        kind: ReplRuntimePanelKind::User,
+        title: format!("{GREEN}User{RESET}"),
+        body,
+    }
 }
 
 fn render_repl_submission_preview(
@@ -1887,6 +2022,8 @@ struct ReplState {
     tools: bool,
     provider_override: Option<String>,
     model_override: Option<String>,
+    panels: Vec<ReplRuntimePanel>,
+    transient_panel: Option<ReplRuntimePanel>,
 }
 
 struct ReplInput {
@@ -1909,6 +2046,9 @@ struct ReplEditorDraft {
     cursor: usize,
     transcript_scroll: usize,
     esc_pending: bool,
+    popup_selected: usize,
+    popup_signature: Option<String>,
+    slash_mode: Option<ReplSlashMode>,
 }
 
 enum ReplDirective {
@@ -2033,6 +2173,8 @@ async fn handle_repl(
         tools: args.tools || config.defaults.tools.unwrap_or(false),
         provider_override: None,
         model_override: None,
+        panels: Vec::new(),
+        transient_panel: None,
     };
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2048,7 +2190,7 @@ async fn handle_repl(
             paths,
             config,
             &session_id,
-            &repl_state,
+            &mut repl_state,
         )?;
         match handle_repl_directive(
             input,
@@ -2075,6 +2217,8 @@ async fn handle_repl(
                     &input.prompt,
                     &input.images,
                 )?;
+                let submitted_prompt = input.prompt.clone();
+                let submitted_images = input.images.clone();
                 let ask_args = AskArgs {
                     prompt: Some(input.prompt),
                     stdin: false,
@@ -2102,8 +2246,8 @@ async fn handle_repl(
                 };
                 let use_tools = ask_args.tools;
                 let turn_cli = repl_runtime_cli(cli, config, &repl_state);
-                if use_tools {
-                    let result = execute_ask_with_tools(
+                let execution: AppResult<()> = if use_tools {
+                    match execute_ask_with_tools(
                         &turn_cli,
                         paths,
                         config,
@@ -2112,9 +2256,15 @@ async fn handle_repl(
                         Some(OutputFormat::Text),
                         false,
                     )
-                    .await?;
-                    if !repl_state.stream {
-                        println!("{}", format_final_ask_output(config, &result, false)?);
+                    .await
+                    {
+                        Ok(result) => {
+                            if !repl_state.stream {
+                                println!("{}", format_final_ask_output(config, &result, false)?);
+                            }
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
                     }
                 } else if repl_state.stream {
                     execute_ask_stream(
@@ -2126,9 +2276,9 @@ async fn handle_repl(
                         Some(OutputFormat::Text),
                         false,
                     )
-                    .await?;
+                    .await
                 } else {
-                    let result = execute_ask(
+                    match execute_ask(
                         &turn_cli,
                         paths,
                         config,
@@ -2136,10 +2286,27 @@ async fn handle_repl(
                         &ask_args,
                         Some(OutputFormat::Text),
                     )
-                    .await?;
-                    println!("{}", format_final_ask_output(config, &result, false)?);
+                    .await
+                    {
+                        Ok(result) => {
+                            println!("{}", format_final_ask_output(config, &result, false)?);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                match execution {
+                    Ok(()) => {
+                        first_turn = false;
+                    }
+                    Err(err) => {
+                        push_repl_panel(
+                            &mut repl_state,
+                            build_repl_user_panel(config, &submitted_prompt, &submitted_images),
+                        );
+                        push_repl_panel(&mut repl_state, build_repl_error_panel(&err.message));
+                    }
                 }
-                first_turn = false;
             }
         }
     }
@@ -2154,7 +2321,7 @@ fn read_repl_input(
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
-    state: &ReplState,
+    state: &mut ReplState,
 ) -> AppResult<ReplInput> {
     if stdin.is_terminal() && stdout.is_terminal() {
         return read_repl_tui_input(stdout, cli, paths, config, session_id, state);
@@ -2205,6 +2372,20 @@ struct ReplScreenView {
     tools: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplRuntimePanelKind {
+    Status,
+    Error,
+    User,
+}
+
+#[derive(Debug, Clone)]
+struct ReplRuntimePanel {
+    kind: ReplRuntimePanelKind,
+    title: String,
+    body: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReplLayout {
     transcript_height: u16,
@@ -2233,6 +2414,66 @@ struct ReplComposerView {
 struct ReplSlashPopupView {
     lines: Vec<String>,
 }
+
+#[derive(Debug, Clone)]
+enum ReplPopupAction {
+    EnterSlashMode(ReplSlashMode),
+    SubmitPrompt(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplSlashMode {
+    Commands,
+    Model,
+    Provider,
+    Stream,
+    Tools,
+    Bash,
+}
+
+impl ReplSlashMode {
+    fn command(self) -> Option<&'static str> {
+        match self {
+            Self::Commands => None,
+            Self::Model => Some("model"),
+            Self::Provider => Some("provider"),
+            Self::Stream => Some("stream"),
+            Self::Tools => Some("tools"),
+            Self::Bash => Some("bash"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.command().unwrap_or("commands")
+    }
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            Self::Commands => "筛选斜杠命令，Enter 确认",
+            Self::Model => "筛选模型，Enter 确认",
+            Self::Provider => "筛选 provider，Enter 确认",
+            Self::Stream => "筛选 stream 选项，Enter 确认",
+            Self::Tools => "筛选 tools 选项，Enter 确认",
+            Self::Bash => "筛选 bash 子命令，Enter 确认",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReplPopupItem {
+    label: String,
+    detail: String,
+    action: ReplPopupAction,
+}
+
+#[derive(Debug, Clone)]
+struct ReplPopupModel {
+    signature: String,
+    items: Vec<ReplPopupItem>,
+}
+
+const REPL_MIN_TRANSCRIPT_HEIGHT: u16 = 3;
+const REPL_MAX_VISIBLE_POPUP_LINES: usize = 8;
 
 impl ReplTerminalGuard {
     fn enter(stdout: &mut io::Stdout) -> AppResult<Self> {
@@ -2284,7 +2525,7 @@ fn read_repl_tui_input(
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
-    state: &ReplState,
+    state: &mut ReplState,
 ) -> AppResult<ReplInput> {
     let _guard = ReplTerminalGuard::enter(stdout)?;
     let view = build_repl_screen_view(cli, paths, config, session_id, state);
@@ -2294,20 +2535,87 @@ fn read_repl_tui_input(
     };
 
     loop {
-        render_repl_editor(stdout, &view, &draft)?;
+        let popup_model = repl_popup_model(&draft, cli, config, state);
+        sync_repl_popup_selection(&mut draft, popup_model.as_ref());
+        render_repl_editor(stdout, &view, &draft, popup_model.as_ref())?;
         let event = event::read().map_err(|err| {
             AppError::new(EXIT_ARGS, format!("failed to read terminal event: {err}"))
         })?;
         match event {
             Event::Resize(_, _) => {}
             Event::Paste(text) => {
+                clear_repl_transient_panel(state);
                 draft.esc_pending = false;
                 handle_pasted_text(&mut draft, text);
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                clear_repl_transient_panel(state);
                 let modifiers = key.modifiers;
                 match key.code {
+                    KeyCode::Char('/')
+                        if modifiers.is_empty()
+                            && draft.slash_mode.is_none()
+                            && draft.buffer.is_empty()
+                            && draft.images.is_empty()
+                            && draft.collapsed_pastes.is_empty() =>
+                    {
+                        draft.esc_pending = false;
+                        enter_repl_slash_mode(&mut draft, ReplSlashMode::Commands);
+                    }
+                    KeyCode::Up if modifiers.is_empty() && popup_model.is_some() => {
+                        draft.esc_pending = false;
+                        move_repl_popup_selection(&mut draft, popup_model.as_ref(), -1);
+                    }
+                    KeyCode::Down if modifiers.is_empty() && popup_model.is_some() => {
+                        draft.esc_pending = false;
+                        move_repl_popup_selection(&mut draft, popup_model.as_ref(), 1);
+                    }
+                    KeyCode::Tab if modifiers.is_empty() && popup_model.is_some() => {
+                        draft.esc_pending = false;
+                        if let Some(action) =
+                            accept_repl_popup_selection(&draft, popup_model.as_ref())
+                        {
+                            match action {
+                                ReplPopupAction::EnterSlashMode(mode) => {
+                                    enter_repl_slash_mode(&mut draft, mode);
+                                    draft.status = None;
+                                }
+                                ReplPopupAction::SubmitPrompt(prompt) => {
+                                    clear_repl_surface(stdout)?;
+                                    return Ok(ReplInput {
+                                        prompt,
+                                        images: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     KeyCode::Enter if modifiers.is_empty() => {
+                        if let Some(action) =
+                            accept_repl_popup_selection(&draft, popup_model.as_ref())
+                        {
+                            match action {
+                                ReplPopupAction::EnterSlashMode(mode) => {
+                                    enter_repl_slash_mode(&mut draft, mode);
+                                    draft.status = None;
+                                    continue;
+                                }
+                                ReplPopupAction::SubmitPrompt(prompt) => {
+                                    clear_repl_surface(stdout)?;
+                                    return Ok(ReplInput {
+                                        prompt,
+                                        images: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(prompt) = manual_repl_slash_prompt(&draft) {
+                            clear_repl_surface(stdout)?;
+                            return Ok(ReplInput {
+                                prompt,
+                                images: Vec::new(),
+                            });
+                        }
                         if draft.buffer.trim().is_empty()
                             && draft.images.is_empty()
                             && draft.collapsed_pastes.is_empty()
@@ -2393,6 +2701,10 @@ fn read_repl_tui_input(
                         draft.esc_pending = false;
                         if delete_prev_char_at_cursor(&mut draft) {
                             draft.status = None;
+                        } else if draft.slash_mode.take().is_some() {
+                            draft.status = None;
+                            draft.popup_selected = 0;
+                            draft.popup_signature = None;
                         } else if draft.collapsed_pastes.pop().is_some() {
                             draft.status = Some(format!(
                                 "已移除一段粘贴文本，剩余 {} 段",
@@ -2427,8 +2739,10 @@ fn read_repl_tui_input(
                     }
                     KeyCode::Tab => {
                         draft.esc_pending = false;
-                        insert_text_at_cursor(&mut draft, "    ");
-                        draft.status = None;
+                        if draft.slash_mode.is_none() {
+                            insert_text_at_cursor(&mut draft, "    ");
+                            draft.status = None;
+                        }
                     }
                     KeyCode::Esc => {
                         if draft.esc_pending {
@@ -2436,7 +2750,11 @@ fn read_repl_tui_input(
                             draft.status = Some("已清空输入".to_string());
                         } else {
                             draft.esc_pending = true;
-                            draft.status = Some("再次按 Esc 清空输入".to_string());
+                            if draft.slash_mode.is_some() {
+                                draft.status = Some("再次按 Esc 退出斜杠模式".to_string());
+                            } else {
+                                draft.status = Some("再次按 Esc 清空输入".to_string());
+                            }
                         }
                     }
                     KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2469,8 +2787,15 @@ fn build_repl_screen_view(
                 .map(|name| name.to_string_lossy().to_string())
         })
         .unwrap_or_else(|| ".".to_string());
+    let transcript = render_repl_transcript(
+        paths,
+        config,
+        session_id,
+        &state.panels,
+        state.transient_panel.as_ref(),
+    );
     ReplScreenView {
-        transcript: render_repl_session_history(paths, config, session_id).unwrap_or_default(),
+        transcript,
         provider_id,
         model_id,
         cwd_label,
@@ -2484,6 +2809,7 @@ fn render_repl_editor(
     stdout: &mut io::Stdout,
     view: &ReplScreenView,
     draft: &ReplEditorDraft,
+    popup_model: Option<&ReplPopupModel>,
 ) -> AppResult<()> {
     let (cols, rows) = terminal::size()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
@@ -2491,14 +2817,16 @@ fn render_repl_editor(
         return Ok(());
     }
 
-    let layout = compute_repl_layout(cols, rows, draft);
+    let composer_body_height = repl_composer_body_height(cols, rows, draft);
+    let popup_max_height = max_repl_popup_height(rows, composer_body_height) as usize;
+    let popup_view = repl_slash_popup_view(popup_model, draft, cols, popup_max_height);
+    let layout = compute_repl_layout(rows, composer_body_height, popup_view.lines.len() as u16);
     let transcript_lines = clipped_repl_transcript_lines(
         &view.transcript,
         cols,
         layout.transcript_height,
         draft.transcript_scroll,
     );
-    let popup_view = repl_slash_popup_view(draft, cols);
     let composer_view = repl_composer_view(draft, cols, layout.composer_body_height);
     let status_bar = build_repl_status_bar(view, draft, cols);
 
@@ -2522,16 +2850,21 @@ fn render_repl_editor(
     Ok(())
 }
 
-fn compute_repl_layout(cols: u16, rows: u16, draft: &ReplEditorDraft) -> ReplLayout {
-    let popup_view = repl_slash_popup_view(draft, cols);
+fn repl_composer_body_height(cols: u16, rows: u16, draft: &ReplEditorDraft) -> u16 {
     let composer_view = repl_composer_view(draft, cols, u16::MAX);
     let max_body = min(8usize, rows.saturating_sub(4) as usize).max(3);
-    let composer_body_height = min(composer_view.lines.len(), max_body).max(3) as u16;
+    min(composer_view.lines.len(), max_body).max(3) as u16
+}
+
+fn max_repl_popup_height(rows: u16, composer_body_height: u16) -> u16 {
+    rows.saturating_sub(composer_body_height + 3 + REPL_MIN_TRANSCRIPT_HEIGHT)
+}
+
+fn compute_repl_layout(rows: u16, composer_body_height: u16, popup_height: u16) -> ReplLayout {
     let status_row = rows.saturating_sub(1);
-    let popup_height = popup_view.lines.len() as u16;
-    let composer_top = rows.saturating_sub(composer_body_height + 3);
-    let popup_top = composer_top.saturating_sub(popup_height);
-    let transcript_height = popup_top;
+    let composer_top = rows.saturating_sub(composer_body_height + 3 + popup_height);
+    let popup_top = composer_top + composer_body_height + 2;
+    let transcript_height = composer_top;
     ReplLayout {
         transcript_height,
         popup_top,
@@ -2545,18 +2878,26 @@ fn compute_repl_layout(cols: u16, rows: u16, draft: &ReplEditorDraft) -> ReplLay
 fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> ReplComposerView {
     let inner_width = cols.saturating_sub(4).max(8) as usize;
     let mut lines = Vec::new();
-    if let Some(status) = &draft.status {
-        lines.extend(wrap_plain_lines(
-            &format!("{DIM}{status}{RESET}"),
-            inner_width,
-        ));
-    }
 
     let badges = repl_attachment_badges(draft);
+    let slash_badge = draft
+        .slash_mode
+        .and_then(|mode| {
+            mode.command()
+                .map(|command| format!("{DIM}/{command}{RESET} "))
+        })
+        .unwrap_or_default();
     let prompt_prefix = if badges.is_empty() {
+        format!("❯ {slash_badge}")
+    } else if slash_badge.is_empty() {
+        format!("❯ {badges} ")
+    } else {
+        format!("❯ {badges} {slash_badge}")
+    };
+    let prompt_prefix = if prompt_prefix.trim().is_empty() {
         "❯ ".to_string()
     } else {
-        format!("❯ {badges} ")
+        prompt_prefix
     };
     let prefix_width = display_width(&prompt_prefix);
     let wrapped_input = wrap_editor_input(
@@ -2566,9 +2907,11 @@ fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> Rep
     );
     let fixed_lines = lines.len();
     let (cursor_row, cursor_col) = if draft.buffer.is_empty() {
-        lines.push(format!(
-            "{prompt_prefix}{DIM}输入消息，按 /commands 查看命令{RESET}"
-        ));
+        let placeholder = draft
+            .slash_mode
+            .map(ReplSlashMode::placeholder)
+            .unwrap_or("输入消息，按 /commands 查看命令");
+        lines.push(format!("{prompt_prefix}{DIM}{placeholder}{RESET}"));
         (fixed_lines, prefix_width)
     } else {
         for (index, line) in wrapped_input.lines.iter().enumerate() {
@@ -2603,28 +2946,280 @@ fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> Rep
     }
 }
 
-fn repl_slash_popup_view(draft: &ReplEditorDraft, cols: u16) -> ReplSlashPopupView {
+fn repl_slash_popup_view(
+    popup_model: Option<&ReplPopupModel>,
+    draft: &ReplEditorDraft,
+    cols: u16,
+    max_lines: usize,
+) -> ReplSlashPopupView {
     let width = cols.saturating_sub(4).max(12) as usize;
-    let Some(query) = repl_slash_query(draft) else {
+    let Some(popup_model) = popup_model else {
         return ReplSlashPopupView { lines: Vec::new() };
     };
-    let matches = filtered_repl_slash_commands(&query);
-    if matches.is_empty() {
+    if popup_model.items.is_empty() || max_lines == 0 {
         return ReplSlashPopupView {
-            lines: vec![format!("{DIM}  no matching commands{RESET}")],
+            lines: vec![format!("{DIM}  no matching options{RESET}")],
         };
     }
 
+    let visible_count = popup_model
+        .items
+        .len()
+        .min(max_lines)
+        .min(REPL_MAX_VISIBLE_POPUP_LINES);
+    let start = popup_window_start(draft.popup_selected, popup_model.items.len(), visible_count);
     let mut lines = Vec::new();
-    for command in matches.into_iter().take(6) {
-        let line = format!(
-            "{CYAN}/{:<12}{RESET} {DIM}{}{RESET}",
-            command.command(),
-            command.description()
-        );
+    for (index, item) in popup_model
+        .items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_count)
+    {
+        let selected = index == draft.popup_selected;
+        let line = if selected {
+            format!(
+                "\x1b[48;5;240m\x1b[38;5;231m› {:<14}{}\x1b[0m",
+                item.label, item.detail
+            )
+        } else {
+            format!(
+                "{CYAN}  {:<12}{RESET} {DIM}{}{RESET}",
+                item.label, item.detail
+            )
+        };
         lines.push(ansi_truncate(&line, width));
     }
     ReplSlashPopupView { lines }
+}
+
+fn popup_window_start(selected: usize, total_items: usize, visible_count: usize) -> usize {
+    if total_items <= visible_count || visible_count == 0 {
+        return 0;
+    }
+    selected
+        .saturating_sub(visible_count / 2)
+        .min(total_items - visible_count)
+}
+
+fn repl_popup_model(
+    draft: &ReplEditorDraft,
+    cli: &Cli,
+    config: &AppConfig,
+    state: &ReplState,
+) -> Option<ReplPopupModel> {
+    if let Some(mode) = draft.slash_mode {
+        let query = draft.buffer.trim();
+        let items = match mode {
+            ReplSlashMode::Commands => filtered_repl_slash_commands(query)
+                .into_iter()
+                .map(|command| ReplPopupItem {
+                    label: format!("/{}", command.command()),
+                    detail: command.description().to_string(),
+                    action: match command {
+                        ReplSlashCommand::Model => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Model)
+                        }
+                        ReplSlashCommand::Provider => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Provider)
+                        }
+                        ReplSlashCommand::Stream => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Stream)
+                        }
+                        ReplSlashCommand::Tools => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Tools)
+                        }
+                        ReplSlashCommand::Bash => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Bash)
+                        }
+                        _ => ReplPopupAction::SubmitPrompt(format!("/{}", command.command())),
+                    },
+                })
+                .collect::<Vec<_>>(),
+            ReplSlashMode::Provider => build_repl_provider_popup_items(cli, config, state, query),
+            ReplSlashMode::Model => build_repl_model_popup_items(config, query),
+            ReplSlashMode::Stream => build_repl_toggle_popup_items("stream", state.stream, query),
+            ReplSlashMode::Tools => build_repl_toggle_popup_items("tools", state.tools, query),
+            ReplSlashMode::Bash => build_repl_bash_popup_items(query),
+        };
+        if items.is_empty() {
+            return None;
+        }
+        return Some(ReplPopupModel {
+            signature: format!("slash:{mode:?}:{query}"),
+            items,
+        });
+    }
+
+    let first_line = draft.buffer.lines().next().unwrap_or_default();
+    let stripped = first_line.strip_prefix('/')?;
+    let items = filtered_repl_slash_commands(stripped)
+        .into_iter()
+        .map(|command| ReplPopupItem {
+            label: format!("/{}", command.command()),
+            detail: command.description().to_string(),
+            action: match command {
+                ReplSlashCommand::Model => ReplPopupAction::EnterSlashMode(ReplSlashMode::Model),
+                ReplSlashCommand::Provider => {
+                    ReplPopupAction::EnterSlashMode(ReplSlashMode::Provider)
+                }
+                ReplSlashCommand::Stream => ReplPopupAction::EnterSlashMode(ReplSlashMode::Stream),
+                ReplSlashCommand::Tools => ReplPopupAction::EnterSlashMode(ReplSlashMode::Tools),
+                ReplSlashCommand::Bash => ReplPopupAction::EnterSlashMode(ReplSlashMode::Bash),
+                _ => ReplPopupAction::SubmitPrompt(format!("/{}", command.command())),
+            },
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return None;
+    }
+    Some(ReplPopupModel {
+        signature: first_line.to_string(),
+        items,
+    })
+}
+
+fn build_repl_bash_popup_items(query: &str) -> Vec<ReplPopupItem> {
+    [
+        ("help", "show bash REPL subcommands"),
+        ("sessions", "list interactive bash sessions"),
+    ]
+    .into_iter()
+    .filter(|(label, _)| matches_popup_query(label, query))
+    .map(|(label, detail)| ReplPopupItem {
+        label: label.to_string(),
+        detail: detail.to_string(),
+        action: ReplPopupAction::SubmitPrompt(format!("/bash {label}")),
+    })
+    .collect()
+}
+
+fn build_repl_provider_popup_items(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &ReplState,
+    query: &str,
+) -> Vec<ReplPopupItem> {
+    let current = repl_effective_provider_id(cli, config, state);
+    let mut items = vec![ReplPopupItem {
+        label: "reset".to_string(),
+        detail: "use CLI/config default provider".to_string(),
+        action: ReplPopupAction::SubmitPrompt("/provider reset".to_string()),
+    }];
+    let mut providers = config.providers.iter().collect::<Vec<_>>();
+    providers.sort_by(|left, right| left.0.cmp(right.0));
+    for (provider_id, provider) in providers {
+        if !matches_popup_query(provider_id, query) {
+            continue;
+        }
+        let detail = if current.as_deref() == Some(provider_id.as_str()) {
+            format!("current · {}", provider.kind)
+        } else {
+            provider.kind.clone()
+        };
+        items.push(ReplPopupItem {
+            label: provider_id.clone(),
+            detail,
+            action: ReplPopupAction::SubmitPrompt(format!("/provider {provider_id}")),
+        });
+    }
+    items
+}
+
+fn build_repl_model_popup_items(config: &AppConfig, query: &str) -> Vec<ReplPopupItem> {
+    let mut items = vec![ReplPopupItem {
+        label: "reset".to_string(),
+        detail: "use CLI/config/default provider model".to_string(),
+        action: ReplPopupAction::SubmitPrompt("/model reset".to_string()),
+    }];
+    let mut models = config.models.iter().collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        format_model_list_entry(left.1)
+            .cmp(&format_model_list_entry(right.1))
+            .then_with(|| left.0.cmp(right.0))
+    });
+    for (model_id, model) in models {
+        let label = format!("{}/{}", model.provider, model.remote_name);
+        if !matches_popup_query(&label, query) && !matches_popup_query(model_id, query) {
+            continue;
+        }
+        items.push(ReplPopupItem {
+            label,
+            detail: format!("id={model_id}"),
+            action: ReplPopupAction::SubmitPrompt(format!("/model {model_id}")),
+        });
+    }
+    items
+}
+
+fn build_repl_toggle_popup_items(name: &str, current: bool, query: &str) -> Vec<ReplPopupItem> {
+    ["on", "off", "toggle"]
+        .into_iter()
+        .filter(|value| matches_popup_query(value, query))
+        .map(|value| ReplPopupItem {
+            label: value.to_string(),
+            detail: if (value == "on" && current) || (value == "off" && !current) {
+                "current".to_string()
+            } else {
+                "set runtime option".to_string()
+            },
+            action: ReplPopupAction::SubmitPrompt(format!("/{name} {value}")),
+        })
+        .collect()
+}
+
+fn matches_popup_query(candidate: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let candidate = candidate.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    candidate.starts_with(&query) || candidate.contains(&query)
+}
+
+fn sync_repl_popup_selection(draft: &mut ReplEditorDraft, popup_model: Option<&ReplPopupModel>) {
+    let Some(popup_model) = popup_model else {
+        draft.popup_selected = 0;
+        draft.popup_signature = None;
+        return;
+    };
+    if draft.popup_signature.as_deref() != Some(popup_model.signature.as_str()) {
+        draft.popup_selected = 0;
+        draft.popup_signature = Some(popup_model.signature.clone());
+    }
+    if draft.popup_selected >= popup_model.items.len() {
+        draft.popup_selected = 0;
+    }
+}
+
+fn move_repl_popup_selection(
+    draft: &mut ReplEditorDraft,
+    popup_model: Option<&ReplPopupModel>,
+    delta: isize,
+) {
+    let Some(popup_model) = popup_model else {
+        return;
+    };
+    let len = popup_model.items.len();
+    if len == 0 {
+        draft.popup_selected = 0;
+        return;
+    }
+    let current = draft.popup_selected % len;
+    let next = ((current as isize + delta).rem_euclid(len as isize)) as usize;
+    draft.popup_selected = next;
+}
+
+fn accept_repl_popup_selection(
+    draft: &ReplEditorDraft,
+    popup_model: Option<&ReplPopupModel>,
+) -> Option<ReplPopupAction> {
+    let popup_model = popup_model?;
+    popup_model
+        .items
+        .get(draft.popup_selected)
+        .map(|item| item.action.clone())
 }
 
 fn clipped_repl_transcript_lines(
@@ -2665,8 +3260,8 @@ fn draw_repl_composer(
     composer_view: &ReplComposerView,
 ) -> AppResult<()> {
     let inner_width = cols.saturating_sub(2) as usize;
-    let top_border = format!("╭{}╮", "─".repeat(inner_width));
-    let bottom_border = format!("╰{}╯", "─".repeat(inner_width));
+    let top_border = full_width_rule(cols);
+    let bottom_border = full_width_rule(cols);
     write_repl_line(stdout, layout.composer_top, &top_border)?;
 
     for index in 0..layout.composer_body_height as usize {
@@ -2674,7 +3269,7 @@ fn draw_repl_composer(
         let truncated = ansi_truncate(&content, inner_width);
         let padding = inner_width.saturating_sub(visible_width(&truncated));
         let row = layout.composer_top + 1 + index as u16;
-        let line = format!("│{truncated}{}│", " ".repeat(padding));
+        let line = format!(" {truncated}{}", " ".repeat(padding));
         write_repl_line(stdout, row, &line)?;
     }
     write_repl_line(
@@ -2683,6 +3278,11 @@ fn draw_repl_composer(
         &bottom_border,
     )?;
     Ok(())
+}
+
+fn full_width_rule(cols: u16) -> String {
+    let width = cols.saturating_sub(1).max(1) as usize;
+    format!("{DIM}{}{RESET}", "─".repeat(width))
 }
 
 fn draw_repl_slash_popup(
@@ -2724,14 +3324,26 @@ fn build_repl_status_bar(view: &ReplScreenView, draft: &ReplEditorDraft, cols: u
         "{} │ {} │ {} │ {}",
         view.model_id, view.cwd_label, view.provider_id, view.session_short
     );
-    let right_text = format!(
+    let mode_text = draft
+        .slash_mode
+        .map(|mode| format!("slash /{}", mode.label()))
+        .unwrap_or_default();
+    let mut right_parts = Vec::new();
+    if let Some(status) = &draft.status {
+        right_parts.push(status.clone());
+    }
+    if !mode_text.is_empty() {
+        right_parts.push(mode_text);
+    }
+    right_parts.push(format!(
         "{} images │ {} paste(s) │ {} chars │ stream {} │ tools {}",
         draft.images.len(),
         draft.collapsed_pastes.len(),
         prompt_chars,
         if view.stream { "on" } else { "off" },
         if view.tools { "on" } else { "off" }
-    );
+    ));
+    let right_text = right_parts.join(" │ ");
     let content = pad_status_bar_plain(&left, &right_text, cols as usize);
     format!("\x1b[48;5;236m\x1b[38;5;252m{content}\x1b[0m")
 }
@@ -2791,24 +3403,6 @@ fn join_inline_prompt_segments(segments: &[Option<String>]) -> String {
         .filter(|segment| !segment.trim().is_empty())
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn wrap_plain_lines(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut lines = Vec::new();
-    for raw_line in text.split('\n') {
-        if raw_line.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-        push_wrapped_plain_line(&mut lines, raw_line, width);
-    }
-    lines
 }
 
 fn ansi_truncate(text: &str, width: usize) -> String {
@@ -2912,7 +3506,7 @@ fn wrap_editor_input(buffer: &str, cursor: usize, width: usize) -> WrappedInput 
 }
 
 fn transcript_screen_lines(transcript: &str, cols: u16) -> Vec<String> {
-    let width = cols as usize;
+    let width = cols.max(1) as usize;
     if transcript.trim().is_empty() {
         return vec![format!(
             "{DIM}No conversation yet. Start with a prompt below.{RESET}"
@@ -2920,7 +3514,7 @@ fn transcript_screen_lines(transcript: &str, cols: u16) -> Vec<String> {
     }
     transcript
         .lines()
-        .map(|line| ansi_truncate(line, width))
+        .flat_map(|line| wrap_ansi_to_width(line, width))
         .collect()
 }
 
@@ -2947,7 +3541,8 @@ fn transcript_scroll_page_up(
     let (cols, rows) = terminal::size()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
     let total = transcript_screen_lines(transcript, cols).len();
-    let height = compute_repl_layout(cols, rows, draft).transcript_height as usize;
+    let composer_body_height = repl_composer_body_height(cols, rows, draft);
+    let height = compute_repl_layout(rows, composer_body_height, 0).transcript_height as usize;
     let current = resolve_transcript_scroll(total, height, draft.transcript_scroll);
     Ok(current.saturating_sub(amount.max(1)))
 }
@@ -2960,7 +3555,8 @@ fn transcript_scroll_page_down(
     let (cols, rows) = terminal::size()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
     let total = transcript_screen_lines(transcript, cols).len();
-    let height = compute_repl_layout(cols, rows, draft).transcript_height as usize;
+    let composer_body_height = repl_composer_body_height(cols, rows, draft);
+    let height = compute_repl_layout(rows, composer_body_height, 0).transcript_height as usize;
     let current = resolve_transcript_scroll(total, height, draft.transcript_scroll);
     Ok(current
         .saturating_add(amount.max(1))
@@ -3001,6 +3597,32 @@ fn clear_repl_text_input(draft: &mut ReplEditorDraft) {
     draft.cursor = 0;
     draft.collapsed_pastes.clear();
     draft.esc_pending = false;
+    draft.popup_selected = 0;
+    draft.popup_signature = None;
+    draft.slash_mode = None;
+}
+
+fn enter_repl_slash_mode(draft: &mut ReplEditorDraft, mode: ReplSlashMode) {
+    draft.slash_mode = Some(mode);
+    draft.buffer.clear();
+    draft.cursor = 0;
+    draft.popup_selected = 0;
+    draft.popup_signature = None;
+}
+
+fn manual_repl_slash_prompt(draft: &ReplEditorDraft) -> Option<String> {
+    let mode = draft.slash_mode?;
+    let query = draft.buffer.trim();
+    match mode {
+        ReplSlashMode::Commands => (!query.is_empty()).then(|| format!("/{query}")),
+        _ => mode.command().map(|command| {
+            if query.is_empty() {
+                format!("/{command}")
+            } else {
+                format!("/{command} {query}")
+            }
+        }),
+    }
 }
 
 fn insert_text_at_cursor(draft: &mut ReplEditorDraft, text: &str) {
@@ -3082,22 +3704,6 @@ fn line_end_boundary(text: &str, index: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn push_wrapped_plain_line(lines: &mut Vec<String>, raw_line: &str, width: usize) {
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    for ch in raw_line.chars() {
-        let ch_width = display_width_char(ch);
-        if !current.is_empty() && current_width + ch_width > width {
-            lines.push(current);
-            current = String::new();
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width += ch_width;
-    }
-    lines.push(current);
-}
-
 fn truncate_plain_to_width(text: &str, width: usize) -> String {
     let mut rendered = String::new();
     let mut current_width = 0usize;
@@ -3175,7 +3781,10 @@ fn handle_repl_directive(
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::Status => {
-                print_repl_status(cli, config, session_id, state);
+                set_repl_transient_panel(
+                    state,
+                    build_repl_status_panel(cli, config, session_id, state),
+                );
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::New => {
@@ -3255,15 +3864,6 @@ fn visible_repl_slash_commands() -> Vec<ReplSlashCommand> {
         .copied()
         .filter(|command| command.visible())
         .collect()
-}
-
-fn repl_slash_query(draft: &ReplEditorDraft) -> Option<String> {
-    let first_line = draft.buffer.lines().next().unwrap_or_default();
-    let stripped = first_line.strip_prefix('/')?;
-    if stripped.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(stripped.to_string())
 }
 
 fn filtered_repl_slash_commands(query: &str) -> Vec<ReplSlashCommand> {
@@ -3505,17 +4105,6 @@ fn repl_runtime_cli(cli: &Cli, config: &AppConfig, state: &ReplState) -> Cli {
     runtime.provider = repl_effective_provider_id(cli, config, state);
     runtime.model = repl_effective_model_id(cli, config, state);
     runtime
-}
-
-fn print_repl_status(cli: &Cli, config: &AppConfig, session_id: &str, state: &ReplState) {
-    let provider_id =
-        repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string());
-    let model_id = repl_effective_model_id(cli, config, state).unwrap_or_else(|| "-".to_string());
-    println!("session {}", short_id(session_id));
-    println!("provider {provider_id}");
-    println!("model {model_id}");
-    println!("stream {}", if state.stream { "on" } else { "off" });
-    println!("tools {}", if state.tools { "on" } else { "off" });
 }
 
 fn handle_repl_new_session(
@@ -4818,6 +5407,205 @@ mod tests {
     }
 
     #[test]
+    fn repl_popup_model_shows_provider_choices_for_provider_input() {
+        let cli = test_cli();
+        let config = test_config();
+        let state = ReplState::default();
+        let draft = ReplEditorDraft {
+            slash_mode: Some(ReplSlashMode::Provider),
+            ..ReplEditorDraft::default()
+        };
+        let popup = repl_popup_model(&draft, &cli, &config, &state).unwrap();
+        let labels = popup
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"reset"));
+        assert!(labels.contains(&"cpap"));
+        assert!(labels.contains(&"deepseek"));
+    }
+
+    #[test]
+    fn repl_popup_accepts_model_command_into_second_stage() {
+        let cli = test_cli();
+        let config = test_config();
+        let state = ReplState::default();
+        let draft = ReplEditorDraft {
+            buffer: "/mo".to_string(),
+            ..ReplEditorDraft::default()
+        };
+        let popup = repl_popup_model(&draft, &cli, &config, &state).unwrap();
+        let action = accept_repl_popup_selection(&draft, Some(&popup)).unwrap();
+        match action {
+            ReplPopupAction::EnterSlashMode(mode) => assert_eq!(mode, ReplSlashMode::Model),
+            other => panic!("unexpected popup action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repl_popup_accepts_provider_choice_as_submit_prompt() {
+        let cli = test_cli();
+        let config = test_config();
+        let state = ReplState::default();
+        let mut draft = ReplEditorDraft {
+            slash_mode: Some(ReplSlashMode::Provider),
+            ..ReplEditorDraft::default()
+        };
+        let popup = repl_popup_model(&draft, &cli, &config, &state).unwrap();
+        draft.popup_selected = popup
+            .items
+            .iter()
+            .position(|item| item.label == "deepseek")
+            .unwrap();
+        let action = accept_repl_popup_selection(&draft, Some(&popup)).unwrap();
+        match action {
+            ReplPopupAction::SubmitPrompt(prompt) => assert_eq!(prompt, "/provider deepseek"),
+            other => panic!("unexpected popup action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_repl_slash_mode_clears_input_and_tracks_mode() {
+        let mut draft = ReplEditorDraft {
+            buffer: "stale".to_string(),
+            cursor: 5,
+            ..ReplEditorDraft::default()
+        };
+        enter_repl_slash_mode(&mut draft, ReplSlashMode::Model);
+        assert_eq!(draft.slash_mode, Some(ReplSlashMode::Model));
+        assert!(draft.buffer.is_empty());
+        assert_eq!(draft.cursor, 0);
+    }
+
+    #[test]
+    fn repl_popup_view_scrolls_to_keep_selected_item_visible() {
+        let popup = ReplPopupModel {
+            signature: "/model ".to_string(),
+            items: (0..12)
+                .map(|index| ReplPopupItem {
+                    label: format!("item-{index}"),
+                    detail: "detail".to_string(),
+                    action: ReplPopupAction::SubmitPrompt(format!("/model item-{index}")),
+                })
+                .collect(),
+        };
+        let draft = ReplEditorDraft {
+            popup_selected: 9,
+            ..ReplEditorDraft::default()
+        };
+        let view = repl_slash_popup_view(Some(&popup), &draft, 120, 4);
+        assert_eq!(view.lines.len(), 4);
+        assert!(view.lines.iter().any(|line| line.contains("item-9")));
+        assert!(!view.lines.iter().any(|line| line.contains("item-0")));
+    }
+
+    #[test]
+    fn repl_popup_height_is_capped_to_preserve_transcript_space() {
+        let popup_height = max_repl_popup_height(20, 5);
+        assert_eq!(popup_height, 9);
+        let layout = compute_repl_layout(20, 5, popup_height);
+        assert_eq!(layout.transcript_height, REPL_MIN_TRANSCRIPT_HEIGHT);
+        assert_eq!(layout.popup_height, 9);
+    }
+
+    #[test]
+    fn repl_status_panel_contains_runtime_configuration() {
+        let cli = test_cli();
+        let config = test_config();
+        let state = ReplState {
+            stream: true,
+            tools: false,
+            provider_override: Some("deepseek".to_string()),
+            model_override: Some("deepseek-reasoner-search".to_string()),
+            panels: Vec::new(),
+            transient_panel: None,
+        };
+        let panel = build_repl_status_panel(&cli, &config, "sess_test_repl", &state);
+        assert_eq!(panel.kind, ReplRuntimePanelKind::Status);
+        assert!(panel.body.contains("provider: deepseek"));
+        assert!(panel.body.contains("model: deepseek-reasoner-search"));
+        assert!(panel.body.contains("tools: off"));
+        assert!(panel.body.contains("/model"));
+    }
+
+    #[test]
+    fn repl_runtime_transcript_appends_panels_after_history() {
+        let (paths, _base_dir) = test_paths();
+        let config = test_config();
+        let panels = vec![ReplRuntimePanel {
+            kind: ReplRuntimePanelKind::Error,
+            title: "Error".to_string(),
+            body: "boom".to_string(),
+        }];
+        let transcript = render_repl_transcript(&paths, &config, "missing_session", &panels, None);
+        assert!(transcript.contains("Error"));
+        assert!(transcript.contains("boom"));
+    }
+
+    #[test]
+    fn repl_transient_panel_is_rendered_separately() {
+        let (paths, _base_dir) = test_paths();
+        let config = test_config();
+        let panels = vec![ReplRuntimePanel {
+            kind: ReplRuntimePanelKind::Error,
+            title: "Error".to_string(),
+            body: "persistent".to_string(),
+        }];
+        let transient = ReplRuntimePanel {
+            kind: ReplRuntimePanelKind::Status,
+            title: "Status".to_string(),
+            body: "temporary".to_string(),
+        };
+        let transcript = render_repl_transcript(
+            &paths,
+            &config,
+            "missing_session",
+            &panels,
+            Some(&transient),
+        );
+        assert!(transcript.contains("persistent"));
+        assert!(transcript.contains("temporary"));
+    }
+
+    #[test]
+    fn full_width_rule_uses_visible_terminal_width() {
+        let rendered = full_width_rule(20);
+        assert_eq!(visible_width(&rendered), 19);
+    }
+
+    #[test]
+    fn transcript_screen_lines_wrap_long_plain_lines() {
+        let lines = transcript_screen_lines("abcdefgh", 4);
+        assert_eq!(lines, vec!["abcd".to_string(), "efgh".to_string()]);
+    }
+
+    #[test]
+    fn transcript_screen_lines_wrap_ansi_and_wide_text() {
+        let transcript = format!("{DIM}你好abcd{RESET}");
+        let lines = transcript_screen_lines(&transcript, 4);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(visible_width(&lines[0]), 4);
+        assert_eq!(visible_width(&lines[1]), 4);
+        assert!(lines[0].starts_with(DIM));
+        assert!(lines[1].starts_with(DIM));
+        assert!(lines.iter().all(|line| line.ends_with(RESET)));
+    }
+
+    #[test]
+    fn repl_composer_view_does_not_render_status_inside_input_box() {
+        let draft = ReplEditorDraft {
+            status: Some("已移除一张图片，剩余 0 张".to_string()),
+            slash_mode: Some(ReplSlashMode::Model),
+            ..ReplEditorDraft::default()
+        };
+        let view = repl_composer_view(&draft, 80, 8);
+        assert_eq!(view.lines.len(), 1);
+        assert!(view.lines[0].contains("筛选模型"));
+        assert!(!view.lines[0].contains("已移除一张图片"));
+    }
+
+    #[test]
     fn display_width_counts_wide_chars() {
         assert_eq!(display_width("你好"), 4);
         assert_eq!(display_width("你a"), 3);
@@ -4872,6 +5660,7 @@ mod tests {
             cursor: 5,
             transcript_scroll: 0,
             esc_pending: true,
+            ..ReplEditorDraft::default()
         };
         clear_repl_text_input(&mut draft);
         assert_eq!(draft.buffer, "");
@@ -4904,6 +5693,7 @@ mod tests {
             cursor: "你好".len(),
             transcript_scroll: 0,
             esc_pending: false,
+            ..ReplEditorDraft::default()
         };
         let view = repl_composer_view(&draft, 80, 8);
         assert!(view.lines[0].contains("❯ [Image #1] 你好"));

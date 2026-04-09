@@ -9,6 +9,7 @@
 /// - Horizontal rules
 /// - <think>...</think> tag collapsing
 use crate::session::{is_temp_session, short_id};
+use crossterm::terminal;
 use std::path::{Path, PathBuf};
 
 // ANSI escape codes
@@ -32,6 +33,8 @@ const CURSOR_UP: &str = "\x1b[A";
 const SAVE_CURSOR: &str = "\x1b7";
 const RESTORE_CURSOR: &str = "\x1b8";
 const DELETE_LINE: &str = "\x1b[M";
+const DEFAULT_RENDER_WIDTH: usize = 80;
+const MIN_TABLE_COLUMN_WIDTH: usize = 4;
 
 /// Path to store the last thinking content.
 pub fn thinking_file_path() -> PathBuf {
@@ -143,6 +146,10 @@ pub fn render_markdown(input: &str, _collapse_thinking: bool) -> String {
 }
 
 fn render_markdown_inner(input: &str) -> String {
+    render_markdown_inner_with_width(input, terminal_render_width())
+}
+
+fn render_markdown_inner_with_width(input: &str, width: usize) -> String {
     let lines: Vec<&str> = input.lines().collect();
     let mut output = String::new();
     let mut i = 0;
@@ -174,14 +181,14 @@ fn render_markdown_inner(input: &str) -> String {
         if line.contains('|') && is_table_start(&lines, i) {
             let table_end = find_table_end(&lines, i);
             let table_lines = &lines[i..table_end];
-            output.push_str(&render_table(table_lines));
+            output.push_str(&render_table_with_width(table_lines, width));
             i = table_end;
             continue;
         }
 
         // Horizontal rule
         if is_horizontal_rule(line) {
-            output.push_str(&format!("{DIM}{}{RESET}\n", "─".repeat(48)));
+            output.push_str(&render_horizontal_rule(width));
             i += 1;
             continue;
         }
@@ -195,6 +202,19 @@ fn render_markdown_inner(input: &str) -> String {
         output.pop();
     }
     output
+}
+
+fn terminal_render_width() -> usize {
+    terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .ok()
+        .filter(|width| *width >= 20)
+        .unwrap_or(DEFAULT_RENDER_WIDTH)
+}
+
+fn render_horizontal_rule(width: usize) -> String {
+    let rule_width = width.saturating_sub(1).max(3);
+    format!("{DIM}{}{RESET}\n", "─".repeat(rule_width))
 }
 
 fn render_header(line: &str) -> Option<String> {
@@ -706,6 +726,10 @@ fn find_table_end(lines: &[&str], start: usize) -> usize {
 }
 
 fn render_table(lines: &[&str]) -> String {
+    render_table_with_width(lines, terminal_render_width())
+}
+
+fn render_table_with_width(lines: &[&str], max_width: usize) -> String {
     if lines.is_empty() {
         return String::new();
     }
@@ -764,6 +788,7 @@ fn render_table(lines: &[&str]) -> String {
             }
         }
     }
+    clamp_table_widths(&mut col_widths, max_width);
 
     let mut output = String::new();
 
@@ -771,20 +796,35 @@ fn render_table(lines: &[&str]) -> String {
     output.push_str(&table_border(&col_widths, '┌', '┬', '┐'));
     output.push_str(&format!("{RESET}\n"));
 
-    for row in &rendered_rows {
-        output.push_str(&format!("{DIM}│{RESET}"));
-        for (j, width) in col_widths.iter().enumerate() {
-            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            let display_len = strip_ansi_len(cell);
-            let padding = width.saturating_sub(display_len);
-            output.push_str(&format!(" {cell}"));
-            output.push_str(&" ".repeat(padding));
-            output.push_str(&format!(" {DIM}│{RESET}"));
+    for (row_index, row) in rendered_rows.iter().enumerate() {
+        let wrapped_cells = col_widths
+            .iter()
+            .enumerate()
+            .map(|(j, width)| {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                wrap_ansi_to_width(cell, *width)
+            })
+            .collect::<Vec<_>>();
+        let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
+
+        for line_index in 0..row_height {
+            output.push_str(&format!("{DIM}│{RESET}"));
+            for (j, width) in col_widths.iter().enumerate() {
+                let cell = wrapped_cells[j]
+                    .get(line_index)
+                    .map(|line| line.as_str())
+                    .unwrap_or("");
+                let display_len = strip_ansi_len(cell);
+                let padding = width.saturating_sub(display_len);
+                output.push_str(&format!(" {cell}"));
+                output.push_str(&" ".repeat(padding));
+                output.push_str(&format!(" {DIM}│{RESET}"));
+            }
+            output.push('\n');
         }
-        output.push('\n');
 
         // After the first row (header), draw separator if present
-        if std::ptr::eq(row, &rendered_rows[0]) && separator_idx.is_some() {
+        if row_index == 0 && separator_idx.is_some() {
             output.push_str(&format!("{DIM}"));
             output.push_str(&table_border(&col_widths, '├', '┼', '┤'));
             output.push_str(&format!("{RESET}\n"));
@@ -796,6 +836,92 @@ fn render_table(lines: &[&str]) -> String {
     output.push_str(&format!("{RESET}\n"));
 
     output
+}
+
+fn clamp_table_widths(widths: &mut [usize], max_width: usize) {
+    if widths.is_empty() {
+        return;
+    }
+    let border_width = 3 * widths.len() + 1;
+    let Some(mut available_content_width) = max_width.checked_sub(border_width) else {
+        return;
+    };
+    available_content_width = available_content_width.max(widths.len());
+    let min_width = (available_content_width / widths.len())
+        .max(1)
+        .min(MIN_TABLE_COLUMN_WIDTH);
+    let mut total_content_width = widths.iter().sum::<usize>();
+    while total_content_width > available_content_width {
+        let Some((_, width)) = widths
+            .iter_mut()
+            .enumerate()
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        if *width <= min_width {
+            break;
+        }
+        *width -= 1;
+        total_content_width -= 1;
+    }
+}
+
+pub(crate) fn wrap_ansi_to_width(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() || width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut active_styles = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            let mut seq = String::from(ch);
+            while let Some(next) = chars.next() {
+                seq.push(next);
+                if next == 'm' {
+                    break;
+                }
+            }
+            current.push_str(&seq);
+            if seq == RESET || seq == "\x1b[m" {
+                active_styles.clear();
+            } else {
+                active_styles.push_str(&seq);
+            }
+            continue;
+        }
+
+        let ch_width = if is_wide_char(ch) { 2 } else { 1 };
+        if current_width > 0 && current_width + ch_width > width {
+            if !active_styles.is_empty() && !current.ends_with(RESET) {
+                current.push_str(RESET);
+            }
+            lines.push(current);
+            current = active_styles.clone();
+            current_width = 0;
+        }
+
+        current.push(ch);
+        current_width += ch_width;
+    }
+
+    if !current.is_empty() {
+        if !active_styles.is_empty() && !current.ends_with(RESET) {
+            current.push_str(RESET);
+        }
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
 }
 
 fn table_border(widths: &[usize], left: char, mid: char, right: char) -> String {
@@ -1579,6 +1705,36 @@ mod tests {
         assert!(rendered.contains(&format!("{BOLD}{CYAN}let{RESET}")));
         assert!(rendered.contains(&format!("{YELLOW}\"hi\"")));
         assert!(rendered.contains(&format!("{GREEN}// note")));
+    }
+
+    #[test]
+    fn render_table_respects_max_width() {
+        let rendered = render_table_with_width(
+            &[
+                "| Name | Description |",
+                "| --- | --- |",
+                "| alpha | this is a very long cell that should be constrained by terminal width |",
+            ],
+            32,
+        );
+        let max_line = rendered.lines().map(strip_ansi_len).max().unwrap_or(0);
+        assert!(max_line <= 32, "table width exceeded: {max_line}");
+    }
+
+    #[test]
+    fn render_table_wraps_long_cells_without_ellipsis() {
+        let rendered = render_table_with_width(
+            &[
+                "| Name | Description |",
+                "| --- | --- |",
+                "| alpha | this is a very long cell that should wrap across multiple rendered rows |",
+            ],
+            36,
+        );
+        assert!(!rendered.contains("…"));
+        assert!(rendered.lines().count() > 4);
+        assert!(rendered.contains("alpha"));
+        assert!(rendered.contains("multiple"));
     }
 
     #[test]
