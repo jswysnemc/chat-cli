@@ -235,6 +235,20 @@ api_key = "<redacted>"
 
 运行时会把这些 prompt 文件复制到配置目录下的 `prompts/` 目录，方便继续调试和修改。
 
+脱敏后的审核基准测试数据放在 [`assets/testdata/`](./assets/testdata/) 下。当前仓库提供了 100 条合成 case、展开后的请求模板，以及生成、批量运行、评测三个辅助脚本。
+
+```bash
+python scripts/build_audit_subagent_requests.py
+python scripts/run_audit_subagent_benchmark.py --model minimax-m2-7 --output assets/testdata/audit-subagent-predictions.jsonl
+python scripts/eval_audit_subagent.py --predictions assets/testdata/audit-subagent-predictions.jsonl --failures assets/testdata/audit-subagent-failures.jsonl
+```
+
+建议：
+
+- 对外共享测试数据前继续做脱敏，统一使用占位路径、占位域名和占位标识，不要提交真实对话、密钥或用户专属 home 路径。
+- 调整 `audit.model` 或任一审核 prompt 文件前，先用这 100 条 case 跑一遍基准，避免 prompt 回归。
+- 如果预测结果里可能包含 provider 返回内容、内部环境信息或运行上下文，建议把输出文件只保留在本地。
+
 ## 会话管理
 
 会话自动使用 ULID 标识符创建，并保存到 `sessions/<session_id>.jsonl`。普通消息会包含：

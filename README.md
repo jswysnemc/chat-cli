@@ -232,6 +232,20 @@ The canonical default audit prompt templates are versioned in [`assets/prompts/`
 
 Runtime copies of those prompt files are created under the config directory's `prompts/` folder so they can still be edited directly during prompt tuning.
 
+Sanitized audit benchmark fixtures live under [`assets/testdata/`](./assets/testdata/). The current set includes 100 synthetic cases, expanded request templates, and helper scripts for generation, batch execution, and scoring.
+
+```bash
+python scripts/build_audit_subagent_requests.py
+python scripts/run_audit_subagent_benchmark.py --model minimax-m2-7 --output assets/testdata/audit-subagent-predictions.jsonl
+python scripts/eval_audit_subagent.py --predictions assets/testdata/audit-subagent-predictions.jsonl --failures assets/testdata/audit-subagent-failures.jsonl
+```
+
+Recommendations:
+
+- Keep benchmark inputs sanitized before sharing. Use placeholder paths, hosts, and identifiers, and never commit real transcripts, secrets, or user-specific home paths.
+- Run the benchmark and evaluator before changing `audit.model` or any audit prompt file so prompt regressions can be caught with the same 100-case suite.
+- Store prediction outputs as local-only artifacts when they may include provider responses, internal environment details, or operational context.
+
 ## Session Management
 
 Sessions are automatically created with a ULID identifier and persisted to `sessions/<session_id>.jsonl`. Regular messages include:
