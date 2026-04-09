@@ -149,7 +149,7 @@ pub async fn test_provider(
 
 async fn execute_healthcheck(request: reqwest::RequestBuilder, provider_id: &str) -> AppResult<()> {
     let response =
-        send_request_with_retry(request, format!("provider `{provider_id}` request")).await?;
+        send_request_with_retry(request, format!("provider `{provider_id}` request"), None).await?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -171,6 +171,7 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
     let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
+        timeout_secs,
     )
     .await?;
     let status = response.status();
@@ -237,6 +238,7 @@ where
     let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
+        timeout_secs,
     )
     .await?;
     let status = response.status();
@@ -327,6 +329,7 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
     let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
+        timeout_secs,
     )
     .await?;
     let status = response.status();
@@ -390,6 +393,7 @@ where
     let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
+        timeout_secs,
     )
     .await?;
     let status = response.status();
@@ -463,6 +467,7 @@ async fn send_ollama(request: ChatRequest) -> AppResult<ChatResponse> {
     let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
+        timeout_secs,
     )
     .await?;
     let status = response.status();
@@ -515,6 +520,7 @@ where
     let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
+        timeout_secs,
     )
     .await?;
     let status = response.status();
@@ -626,6 +632,7 @@ fn reqwest_error_details(err: &reqwest::Error) -> String {
 async fn send_request_with_retry(
     request: reqwest::RequestBuilder,
     context: String,
+    timeout_secs: Option<u64>,
 ) -> AppResult<reqwest::Response> {
     let retry_request = request.try_clone();
     match request.send().await {
@@ -634,16 +641,37 @@ async fn send_request_with_retry(
             let Some(retry_request) = retry_request else {
                 return Err(AppError::new(
                     EXIT_NETWORK,
-                    format!("{context} failed: {first_err}"),
+                    format_provider_send_error(&context, &first_err, timeout_secs, false),
                 ));
             };
             retry_request.send().await.map_err(|retry_err| {
                 AppError::new(
                     EXIT_NETWORK,
-                    format!("{context} failed after retry: {retry_err}"),
+                    format_provider_send_error(&context, &retry_err, timeout_secs, true),
                 )
             })
         }
+    }
+}
+
+fn format_provider_send_error(
+    context: &str,
+    err: &reqwest::Error,
+    timeout_secs: Option<u64>,
+    after_retry: bool,
+) -> String {
+    let stage = if after_retry {
+        "failed after retry"
+    } else {
+        "failed"
+    };
+    let details = reqwest_error_details(err);
+    match request_timeout(effective_request_timeout_secs(timeout_secs)) {
+        Some(timeout) if err.is_timeout() => format!(
+            "{context} {stage}: request timed out after {}s while sending or waiting for response headers: {details}",
+            timeout.as_secs()
+        ),
+        _ => format!("{context} {stage}: {details}"),
     }
 }
 
