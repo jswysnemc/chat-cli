@@ -1884,6 +1884,9 @@ fn ensure_repl_session_id(
 #[derive(Default)]
 struct ReplState {
     stream: bool,
+    tools: bool,
+    provider_override: Option<String>,
+    model_override: Option<String>,
 }
 
 struct ReplInput {
@@ -1917,10 +1920,13 @@ enum ReplDirective {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplSlashCommand {
     Commands,
-    New,
-    Status,
-    Clear,
+    Model,
+    Provider,
     Stream,
+    Tools,
+    Status,
+    New,
+    Clear,
     Bash,
     Quit,
     Exit,
@@ -1931,10 +1937,13 @@ impl ReplSlashCommand {
     fn command(self) -> &'static str {
         match self {
             ReplSlashCommand::Commands => "commands",
-            ReplSlashCommand::New => "new",
-            ReplSlashCommand::Status => "status",
-            ReplSlashCommand::Clear => "clear",
+            ReplSlashCommand::Model => "model",
+            ReplSlashCommand::Provider => "provider",
             ReplSlashCommand::Stream => "stream",
+            ReplSlashCommand::Tools => "tools",
+            ReplSlashCommand::Status => "status",
+            ReplSlashCommand::New => "new",
+            ReplSlashCommand::Clear => "clear",
             ReplSlashCommand::Bash => "bash",
             ReplSlashCommand::Quit => "quit",
             ReplSlashCommand::Exit => "exit",
@@ -1945,10 +1954,13 @@ impl ReplSlashCommand {
     fn usage(self) -> &'static str {
         match self {
             ReplSlashCommand::Commands => "/commands",
-            ReplSlashCommand::New => "/new [temp]",
-            ReplSlashCommand::Status => "/status",
-            ReplSlashCommand::Clear => "/clear",
+            ReplSlashCommand::Model => "/model [list [provider]|reset|<id>|<provider>/<model>]",
+            ReplSlashCommand::Provider => "/provider [list|reset|<id>]",
             ReplSlashCommand::Stream => "/stream [on|off|toggle]",
+            ReplSlashCommand::Tools => "/tools [on|off|toggle]",
+            ReplSlashCommand::Status => "/status",
+            ReplSlashCommand::New => "/new [temp]",
+            ReplSlashCommand::Clear => "/clear",
             ReplSlashCommand::Bash => "/bash ...",
             ReplSlashCommand::Quit => "/quit",
             ReplSlashCommand::Exit => "/exit",
@@ -1959,10 +1971,13 @@ impl ReplSlashCommand {
     fn description(self) -> &'static str {
         match self {
             ReplSlashCommand::Commands => "show available REPL commands",
-            ReplSlashCommand::New => "start a new chat session",
-            ReplSlashCommand::Status => "show current REPL session and model state",
-            ReplSlashCommand::Clear => "clear the terminal output",
+            ReplSlashCommand::Model => "choose the model for new turns",
+            ReplSlashCommand::Provider => "choose the provider for new turns",
             ReplSlashCommand::Stream => "toggle streaming output",
+            ReplSlashCommand::Tools => "toggle tool calling for new turns",
+            ReplSlashCommand::Status => "show current REPL session and runtime config",
+            ReplSlashCommand::New => "start a new chat session",
+            ReplSlashCommand::Clear => "clear the terminal output",
             ReplSlashCommand::Bash => "inspect or continue interactive bash sessions",
             ReplSlashCommand::Quit | ReplSlashCommand::Exit => "exit the REPL",
             ReplSlashCommand::HelpAlias => "alias of /commands",
@@ -1976,10 +1991,13 @@ impl ReplSlashCommand {
 
 const REPL_SLASH_COMMANDS: &[ReplSlashCommand] = &[
     ReplSlashCommand::Commands,
-    ReplSlashCommand::New,
-    ReplSlashCommand::Status,
-    ReplSlashCommand::Clear,
+    ReplSlashCommand::Model,
+    ReplSlashCommand::Provider,
     ReplSlashCommand::Stream,
+    ReplSlashCommand::Tools,
+    ReplSlashCommand::Status,
+    ReplSlashCommand::New,
+    ReplSlashCommand::Clear,
     ReplSlashCommand::Bash,
     ReplSlashCommand::Quit,
     ReplSlashCommand::Exit,
@@ -2012,6 +2030,9 @@ async fn handle_repl(
     let mut first_turn = true;
     let mut repl_state = ReplState {
         stream: !args.no_stream || args.stream,
+        tools: args.tools || config.defaults.tools.unwrap_or(false),
+        provider_override: None,
+        model_override: None,
     };
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2070,7 +2091,7 @@ async fn handle_repl(
                     new_session: false,
                     ephemeral: args.ephemeral,
                     temp: args.temp,
-                    tools: args.tools,
+                    tools: repl_state.tools,
                     yes: args.yes,
                     stream: repl_state.stream,
                     temperature: None,
@@ -2079,10 +2100,11 @@ async fn handle_repl(
                     timeout: None,
                     raw_provider_response: false,
                 };
-                let use_tools = ask_args.tools || config.defaults.tools.unwrap_or(false);
+                let use_tools = ask_args.tools;
+                let turn_cli = repl_runtime_cli(cli, config, &repl_state);
                 if use_tools {
                     let result = execute_ask_with_tools(
-                        cli,
+                        &turn_cli,
                         paths,
                         config,
                         secrets,
@@ -2096,7 +2118,7 @@ async fn handle_repl(
                     }
                 } else if repl_state.stream {
                     execute_ask_stream(
-                        cli,
+                        &turn_cli,
                         paths,
                         config,
                         secrets,
@@ -2107,7 +2129,7 @@ async fn handle_repl(
                     .await?;
                 } else {
                     let result = execute_ask(
-                        cli,
+                        &turn_cli,
                         paths,
                         config,
                         secrets,
@@ -2180,6 +2202,7 @@ struct ReplScreenView {
     cwd_label: String,
     session_short: String,
     stream: bool,
+    tools: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2436,22 +2459,9 @@ fn build_repl_screen_view(
     session_id: &str,
     state: &ReplState,
 ) -> ReplScreenView {
-    let provider_id = cli
-        .provider
-        .clone()
-        .or_else(|| config.defaults.provider.clone())
-        .unwrap_or_else(|| "-".to_string());
-    let model_id = cli
-        .model
-        .clone()
-        .or_else(|| config.defaults.model.clone())
-        .or_else(|| {
-            config
-                .providers
-                .get(&provider_id)
-                .and_then(|provider| provider.default_model.clone())
-        })
-        .unwrap_or_else(|| "-".to_string());
+    let provider_id =
+        repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string());
+    let model_id = repl_effective_model_id(cli, config, state).unwrap_or_else(|| "-".to_string());
     let cwd_label = std::env::current_dir()
         .ok()
         .and_then(|cwd| {
@@ -2466,6 +2476,7 @@ fn build_repl_screen_view(
         cwd_label,
         session_short: short_id(session_id),
         stream: state.stream,
+        tools: state.tools,
     }
 }
 
@@ -2714,11 +2725,12 @@ fn build_repl_status_bar(view: &ReplScreenView, draft: &ReplEditorDraft, cols: u
         view.model_id, view.cwd_label, view.provider_id, view.session_short
     );
     let right_text = format!(
-        "{} images │ {} paste(s) │ {} chars │ stream {}",
+        "{} images │ {} paste(s) │ {} chars │ stream {} │ tools {}",
         draft.images.len(),
         draft.collapsed_pastes.len(),
         prompt_chars,
-        if view.stream { "on" } else { "off" }
+        if view.stream { "on" } else { "off" },
+        if view.tools { "on" } else { "off" }
     );
     let content = pad_status_bar_plain(&left, &right_text, cols as usize);
     format!("\x1b[48;5;236m\x1b[38;5;252m{content}\x1b[0m")
@@ -3146,6 +3158,18 @@ fn handle_repl_directive(
                 handle_repl_stream_command(state, rest);
                 return Ok(ReplDirective::Continue);
             }
+            ReplSlashCommand::Tools => {
+                handle_repl_tools_command(state, rest);
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Provider => {
+                handle_repl_provider_command(cli, config, state, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Model => {
+                handle_repl_model_command(cli, config, state, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
             ReplSlashCommand::Bash => {
                 handle_repl_bash_command(rest)?;
                 return Ok(ReplDirective::Continue);
@@ -3210,10 +3234,13 @@ fn parse_repl_slash_command(input: &str) -> Option<(ReplSlashCommand, &str)> {
     let command = match name {
         "" | "commands" => ReplSlashCommand::Commands,
         "help" => ReplSlashCommand::HelpAlias,
-        "new" => ReplSlashCommand::New,
-        "status" => ReplSlashCommand::Status,
-        "clear" => ReplSlashCommand::Clear,
+        "model" => ReplSlashCommand::Model,
+        "provider" => ReplSlashCommand::Provider,
         "stream" => ReplSlashCommand::Stream,
+        "tools" => ReplSlashCommand::Tools,
+        "status" => ReplSlashCommand::Status,
+        "new" => ReplSlashCommand::New,
+        "clear" => ReplSlashCommand::Clear,
         "bash" => ReplSlashCommand::Bash,
         "quit" => ReplSlashCommand::Quit,
         "exit" => ReplSlashCommand::Exit,
@@ -3278,27 +3305,217 @@ fn handle_repl_stream_command(state: &mut ReplState, mode: &str) {
     }
 }
 
-fn print_repl_status(cli: &Cli, config: &AppConfig, session_id: &str, state: &ReplState) {
-    let provider_id = cli
-        .provider
-        .clone()
-        .or_else(|| config.defaults.provider.clone())
-        .unwrap_or_else(|| "-".to_string());
-    let model_id = cli
-        .model
-        .clone()
-        .or_else(|| config.defaults.model.clone())
-        .or_else(|| {
-            config
-                .providers
-                .get(&provider_id)
-                .and_then(|provider| provider.default_model.clone())
+fn handle_repl_tools_command(state: &mut ReplState, mode: &str) {
+    match mode {
+        "" => println!("tools: {}", if state.tools { "on" } else { "off" }),
+        "on" => {
+            state.tools = true;
+            println!("tools enabled");
+        }
+        "off" => {
+            state.tools = false;
+            println!("tools disabled");
+        }
+        "toggle" => {
+            state.tools = !state.tools;
+            println!("tools: {}", if state.tools { "on" } else { "off" });
+        }
+        _ => println!("usage: {}", ReplSlashCommand::Tools.usage()),
+    }
+}
+
+fn handle_repl_provider_command(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &mut ReplState,
+    rest: &str,
+) -> AppResult<()> {
+    match rest {
+        "" | "list" => {
+            print_repl_provider_choices(cli, config, state);
+            Ok(())
+        }
+        "reset" => {
+            state.provider_override = None;
+            state.model_override = None;
+            println!(
+                "provider reset to {}",
+                repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string())
+            );
+            Ok(())
+        }
+        provider_id => {
+            if !config.providers.contains_key(provider_id) {
+                return Err(AppError::new(
+                    EXIT_PROVIDER,
+                    format!("provider `{provider_id}` does not exist"),
+                ));
+            }
+            state.provider_override = Some(provider_id.to_string());
+            if state.model_override.as_ref().is_some_and(|model_id| {
+                config
+                    .models
+                    .get(model_id)
+                    .is_some_and(|model| model.provider != provider_id)
+            }) {
+                state.model_override = None;
+            }
+            match repl_effective_model_id(cli, config, state) {
+                Some(model_id) => println!("provider set to {provider_id} model={model_id}"),
+                None => println!("provider set to {provider_id}; no model resolved, use /model"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_repl_model_command(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &mut ReplState,
+    rest: &str,
+) -> AppResult<()> {
+    match rest {
+        "" => {
+            print_repl_model_choices(cli, config, state, None);
+            Ok(())
+        }
+        "reset" => {
+            state.model_override = None;
+            println!(
+                "model reset to {}",
+                repl_effective_model_id(cli, config, state).unwrap_or_else(|| "-".to_string())
+            );
+            Ok(())
+        }
+        "list" => {
+            print_repl_model_choices(cli, config, state, None);
+            Ok(())
+        }
+        _ if rest.starts_with("list ") => {
+            let provider_id = rest["list ".len()..].trim();
+            print_repl_model_choices(cli, config, state, Some(provider_id));
+            Ok(())
+        }
+        target => {
+            let (provider_id, model_id) = resolve_model_use_target(config, target)?;
+            state.provider_override = Some(provider_id.clone());
+            state.model_override = Some(model_id.clone());
+            println!("model set to {model_id} provider={provider_id}");
+            Ok(())
+        }
+    }
+}
+
+fn print_repl_provider_choices(cli: &Cli, config: &AppConfig, state: &ReplState) {
+    let current = repl_effective_provider_id(cli, config, state);
+    println!(
+        "provider {}",
+        current.clone().unwrap_or_else(|| "-".to_string())
+    );
+    let mut providers = config.providers.keys().cloned().collect::<Vec<_>>();
+    providers.sort();
+    for provider_id in providers {
+        let marker = if current.as_deref() == Some(provider_id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!("{marker} {provider_id}");
+    }
+}
+
+fn print_repl_model_choices(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &ReplState,
+    provider_filter: Option<&str>,
+) {
+    let current_provider = provider_filter
+        .map(|value| value.to_string())
+        .or_else(|| repl_effective_provider_id(cli, config, state));
+    let current_model = repl_effective_model_id(cli, config, state);
+    println!(
+        "model {}",
+        current_model.clone().unwrap_or_else(|| "-".to_string())
+    );
+    if let Some(provider_id) = &current_provider {
+        println!("provider {provider_id}");
+    }
+    let mut entries = config
+        .models
+        .iter()
+        .filter(|(_, model)| {
+            current_provider
+                .as_deref()
+                .is_none_or(|provider_id| model.provider == provider_id)
         })
-        .unwrap_or_else(|| "-".to_string());
+        .map(|(id, model)| (id.clone(), format_model_list_entry(model)))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    if entries.is_empty() {
+        println!("no models available");
+        return;
+    }
+    for (id, label) in entries {
+        let marker = if current_model.as_deref() == Some(id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!("{marker} {label} [id={id}]");
+    }
+}
+
+fn repl_effective_provider_id(cli: &Cli, config: &AppConfig, state: &ReplState) -> Option<String> {
+    state
+        .provider_override
+        .clone()
+        .or_else(|| cli.provider.clone())
+        .or_else(|| config.defaults.provider.clone())
+}
+
+fn repl_effective_model_id(cli: &Cli, config: &AppConfig, state: &ReplState) -> Option<String> {
+    let provider_id = repl_effective_provider_id(cli, config, state);
+    let selected = state
+        .model_override
+        .clone()
+        .or_else(|| cli.model.clone())
+        .or_else(|| config.defaults.model.clone());
+    if let Some(model_id) = selected {
+        if provider_id.as_deref().is_none_or(|provider_id| {
+            config
+                .models
+                .get(&model_id)
+                .is_some_and(|model| model.provider == provider_id)
+        }) {
+            return Some(model_id);
+        }
+    }
+    provider_id.and_then(|provider_id| {
+        config
+            .providers
+            .get(&provider_id)
+            .and_then(|provider| provider.default_model.clone())
+    })
+}
+
+fn repl_runtime_cli(cli: &Cli, config: &AppConfig, state: &ReplState) -> Cli {
+    let mut runtime = cli.clone();
+    runtime.provider = repl_effective_provider_id(cli, config, state);
+    runtime.model = repl_effective_model_id(cli, config, state);
+    runtime
+}
+
+fn print_repl_status(cli: &Cli, config: &AppConfig, session_id: &str, state: &ReplState) {
+    let provider_id =
+        repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string());
+    let model_id = repl_effective_model_id(cli, config, state).unwrap_or_else(|| "-".to_string());
     println!("session {}", short_id(session_id));
     println!("provider {provider_id}");
     println!("model {model_id}");
     println!("stream {}", if state.stream { "on" } else { "off" });
+    println!("tools {}", if state.tools { "on" } else { "off" });
 }
 
 fn handle_repl_new_session(
@@ -4330,6 +4547,15 @@ mod tests {
             "cpap".to_string(),
             ProviderConfig {
                 kind: "openai_compatible".to_string(),
+                default_model: Some("team-gpt-5-4".to_string()),
+                ..ProviderConfig::default()
+            },
+        );
+        config.providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                default_model: Some("deepseek-reasoner-search".to_string()),
                 ..ProviderConfig::default()
             },
         );
@@ -4347,6 +4573,20 @@ mod tests {
                 patches: ModelPatchConfig {
                     system_to_user: Some(true),
                 },
+            },
+        );
+        config.models.insert(
+            "deepseek-reasoner-search".to_string(),
+            ModelConfig {
+                provider: "deepseek".to_string(),
+                remote_name: "deepseek-reasoner-search".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
             },
         );
         config
@@ -4387,7 +4627,10 @@ mod tests {
     #[test]
     fn repl_stream_command_toggles_runtime_state() {
         let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
-        let mut state = ReplState { stream: true };
+        let mut state = ReplState {
+            stream: true,
+            ..ReplState::default()
+        };
         let mut stdout = io::stdout();
         let directive = handle_repl_directive(
             ReplInput {
@@ -4409,9 +4652,95 @@ mod tests {
     }
 
     #[test]
+    fn repl_tools_command_toggles_runtime_state() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState {
+            tools: true,
+            ..ReplState::default()
+        };
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/tools off".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(directive, ReplDirective::Continue));
+        assert!(!state.tools);
+    }
+
+    #[test]
+    fn repl_provider_command_updates_runtime_target() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState::default();
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/provider deepseek".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(directive, ReplDirective::Continue));
+        assert_eq!(state.provider_override.as_deref(), Some("deepseek"));
+        assert_eq!(
+            repl_effective_model_id(&cli, &config, &state).as_deref(),
+            Some("deepseek-reasoner-search")
+        );
+    }
+
+    #[test]
+    fn repl_model_command_updates_runtime_target() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState::default();
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/model deepseek/deepseek-reasoner-search".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(directive, ReplDirective::Continue));
+        assert_eq!(state.provider_override.as_deref(), Some("deepseek"));
+        assert_eq!(
+            state.model_override.as_deref(),
+            Some("deepseek-reasoner-search")
+        );
+    }
+
+    #[test]
     fn repl_unknown_slash_command_is_sent_to_model() {
         let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
-        let mut state = ReplState { stream: true };
+        let mut state = ReplState {
+            stream: true,
+            ..ReplState::default()
+        };
         let mut stdout = io::stdout();
         let directive = handle_repl_directive(
             ReplInput {
@@ -4441,7 +4770,10 @@ mod tests {
             .map(|command| command.command())
             .collect::<Vec<_>>();
         assert!(commands.contains(&"commands"));
+        assert!(commands.contains(&"model"));
+        assert!(commands.contains(&"provider"));
         assert!(commands.contains(&"status"));
+        assert!(commands.contains(&"tools"));
         assert!(!commands.contains(&"help"));
     }
 
@@ -4473,6 +4805,16 @@ mod tests {
         assert!(commands.contains(&"status"));
         assert!(commands.contains(&"stream"));
         assert!(!commands.contains(&"clear"));
+    }
+
+    #[test]
+    fn filtered_repl_slash_commands_matches_model_prefix() {
+        let commands = filtered_repl_slash_commands("mo")
+            .into_iter()
+            .map(|command| command.command())
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&"model"));
+        assert!(!commands.contains(&"provider"));
     }
 
     #[test]
