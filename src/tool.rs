@@ -1212,8 +1212,10 @@ fn update_bash_session(
         if let Some(status) = session.child.try_wait().map_err(|err| {
             AppError::new(EXIT_ARGS, format!("failed to poll bash process: {err}"))
         })? {
-            thread::sleep(BASH_SESSION_DRAIN_TIMEOUT);
-            drain_bash_output(session, &mut output);
+            // The process can exit before the stdout/stderr reader threads have forwarded
+            // the final chunk into the channel. Keep draining until the channel goes quiet
+            // or disconnects so short-lived commands do not lose their trailing output.
+            drain_bash_output_until_quiet(session, &mut output, BASH_SESSION_DRAIN_TIMEOUT);
             return Ok(BashSessionUpdate::Completed(format_bash_output(
                 &output,
                 status.code(),
@@ -1253,12 +1255,39 @@ fn drain_bash_output(session: &mut InteractiveBashSession, output: &mut BashOutp
     let mut drained = false;
     while let Ok(chunk) = session.receiver.try_recv() {
         drained = true;
-        match chunk {
-            BashOutputChunk::Stdout(text) => append_bash_chunk(&mut output.stdout, &text),
-            BashOutputChunk::Stderr(text) => append_bash_chunk(&mut output.stderr, &text),
-        }
+        append_bash_output_chunk(output, chunk);
     }
     drained
+}
+
+fn drain_bash_output_until_quiet(
+    session: &mut InteractiveBashSession,
+    output: &mut BashOutput,
+    quiet_timeout: Duration,
+) {
+    let mut last_chunk_at = Instant::now();
+    loop {
+        match session.receiver.recv_timeout(BASH_SESSION_POLL_INTERVAL) {
+            Ok(chunk) => {
+                append_bash_output_chunk(output, chunk);
+                last_chunk_at = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_chunk_at.elapsed() >= quiet_timeout {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    drain_bash_output(session, output);
+}
+
+fn append_bash_output_chunk(output: &mut BashOutput, chunk: BashOutputChunk) {
+    match chunk {
+        BashOutputChunk::Stdout(text) => append_bash_chunk(&mut output.stdout, &text),
+        BashOutputChunk::Stderr(text) => append_bash_chunk(&mut output.stderr, &text),
+    }
 }
 
 fn append_bash_chunk(target: &mut String, chunk: &str) {
