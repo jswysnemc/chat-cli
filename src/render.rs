@@ -909,13 +909,6 @@ impl LineRenderer {
         result
     }
 
-    fn can_render_partial_inline(&self, partial: &str) -> bool {
-        !self.in_code_block
-            && !self.in_table
-            && !partial.trim_start().starts_with("```")
-            && !partial.trim_start().starts_with('>')
-    }
-
     fn render_single_line(&self, line: &str) -> String {
         if is_horizontal_rule(line) {
             return format!("{DIM}{}{RESET}\n", "─".repeat(48));
@@ -1197,37 +1190,6 @@ impl StreamRenderer {
     fn push_thinking_line(&mut self, output: &mut String, line: &str) {
         let rendered = self.thinking_renderer.process_line(line);
         self.push_thinking_rendered(output, &rendered);
-    }
-
-    fn push_partial_thinking_inline(&mut self, output: &mut String) {
-        if self.collapse_thinking
-            || self.buffer.is_empty()
-            || !self
-                .thinking_renderer
-                .can_render_partial_inline(&self.buffer)
-        {
-            return;
-        }
-
-        let partial = std::mem::take(&mut self.buffer);
-        self.thinking_content.push_str(&partial);
-        let rendered = render_inline(&partial);
-        if !rendered.is_empty() {
-            output.push_str(&sticky_style(DIM, &rendered));
-        }
-    }
-
-    fn push_partial_normal_inline(&mut self, output: &mut String) {
-        if self.buffer.is_empty() || !self.normal_renderer.can_render_partial_inline(&self.buffer) {
-            return;
-        }
-
-        let partial = std::mem::take(&mut self.buffer);
-        let rendered = render_inline(&partial);
-        if !rendered.is_empty() {
-            self.note_phase(StreamPhase::Answering);
-            output.push_str(&rendered);
-        }
     }
 
     fn flush_thinking_renderer(&mut self) -> String {

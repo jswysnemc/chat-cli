@@ -93,12 +93,6 @@ pub struct ToolSpec {
     pub definition: fn() -> Value,
 }
 
-impl ToolSpec {
-    pub fn is_parallel_safe(&self) -> bool {
-        self.parallelism == ToolParallelism::ParallelSafe
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ToolRuntimeContext<'a> {
     auto_confirm: bool,
@@ -2462,6 +2456,42 @@ fn command_base_name(segment: &str) -> Option<&str> {
     segment.split_whitespace().next()
 }
 
+fn segment_has_mutating_redirection(segment: &str) -> bool {
+    let tokens = segment.split_whitespace().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if !token.contains('>') {
+            index += 1;
+            continue;
+        }
+
+        let next = tokens.get(index + 1).copied();
+        let Some((target, consumed_next)) = redirection_target(token, next) else {
+            return true;
+        };
+        if !is_non_mutating_redirection_target(target) {
+            return true;
+        }
+
+        index += if consumed_next { 2 } else { 1 };
+    }
+    false
+}
+
+fn redirection_target<'a>(token: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    let redirection = token.rfind('>')?;
+    let inline_target = &token[redirection + 1..];
+    if !inline_target.is_empty() {
+        return Some((inline_target, false));
+    }
+    next.map(|target| (target, true))
+}
+
+fn is_non_mutating_redirection_target(target: &str) -> bool {
+    matches!(target, "/dev/null" | "&1" | "&2")
+}
+
 fn is_read_only_bash_command(command: &str) -> bool {
     let segments = split_command_segments(command);
     if segments.is_empty() {
@@ -2470,7 +2500,7 @@ fn is_read_only_bash_command(command: &str) -> bool {
 
     let mut has_non_neutral = false;
     for segment in segments {
-        if segment.contains('>') || segment.contains(">>") {
+        if segment_has_mutating_redirection(&segment) {
             return false;
         }
         let Some(base) = command_base_name(&segment) else {
@@ -2602,7 +2632,7 @@ mod tests {
     fn lookup_tool_spec_exposes_registry_metadata() {
         let grep = lookup_tool_spec("grep").unwrap();
         assert_eq!(grep.side_effects, ToolSideEffects::ReadOnly);
-        assert!(grep.is_parallel_safe());
+        assert_eq!(grep.parallelism, ToolParallelism::ParallelSafe);
         assert!(!grep.requires_confirmation);
         assert_eq!(grep.name, "Grep");
 
@@ -2659,7 +2689,12 @@ mod tests {
     fn bash_read_only_detection_distinguishes_safe_and_mutating_commands() {
         assert!(is_read_only_bash_command("ls -la"));
         assert!(is_read_only_bash_command("pwd && date && uname -a"));
+        assert!(is_read_only_bash_command(
+            "ls /__chat_cli_missing__/ 2>/dev/null && echo \"exists\" || echo \"checking pwd\" && pwd"
+        ));
+        assert!(is_read_only_bash_command("ls >/dev/null 2>&1 && pwd"));
         assert!(!is_read_only_bash_command("echo hi > /tmp/x"));
+        assert!(!is_read_only_bash_command("ls >/tmp/out && pwd"));
         assert!(!is_read_only_bash_command("rm -f /tmp/x"));
     }
 
@@ -2791,6 +2826,17 @@ mod tests {
                 .iter()
                 .any(|session| session.session_id == session_id)
         );
+    }
+
+    #[test]
+    fn bash_tool_finishes_missing_directory_probe_without_waiting() {
+        let output = tool_bash(
+            "ls /__chat_cli_missing__/ 2>/dev/null && echo \"exists\" || echo \"checking pwd\" && pwd",
+        )
+        .unwrap();
+        assert!(output.contains("checking pwd"));
+        assert!(output.contains(&std::env::current_dir().unwrap().display().to_string()));
+        assert!(!output.contains("interactive bash session is still running"));
     }
 
     fn make_temp_dir(label: &str) -> PathBuf {

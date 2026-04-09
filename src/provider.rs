@@ -6,7 +6,11 @@ use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::error::Error as _;
+use std::time::{Duration, Instant};
+
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 0;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -158,7 +162,8 @@ async fn execute_healthcheck(request: reqwest::RequestBuilder, provider_id: &str
 async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse> {
     let base_url = provider_base_url(&request.provider)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let client = build_client(request.timeout_secs.or(request.provider.timeout))?;
+    let timeout_secs = request.timeout_secs.or(request.provider.timeout);
+    let client = build_client(timeout_secs)?;
     let headers = build_openai_headers(&request.provider, &request.api_key)?;
     let body = build_openai_body(&request, false);
 
@@ -172,7 +177,7 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
     let text = response.text().await.map_err(|err| {
         AppError::new(
             EXIT_NETWORK,
-            format!("failed to read provider response: {err}"),
+            format_provider_read_error("response", &err, timeout_secs),
         )
     })?;
     if !status.is_success() {
@@ -223,12 +228,13 @@ where
 {
     let base_url = provider_base_url(&request.provider)?;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let client = build_client(request.timeout_secs.or(request.provider.timeout))?;
+    let timeout_secs = request.timeout_secs.or(request.provider.timeout);
+    let client = build_client(timeout_secs)?;
     let headers = build_openai_headers(&request.provider, &request.api_key)?;
     let body = build_openai_body(&request, true);
 
     let started = Instant::now();
-    let mut response = send_request_with_retry(
+    let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
     )
@@ -253,7 +259,7 @@ where
         let chunk = chunk_result.map_err(|err| {
             AppError::new(
                 EXIT_NETWORK,
-                format!("failed to read provider stream chunk: {err}"),
+                format_provider_read_error("stream chunk", &err, timeout_secs),
             )
         })?;
         for payload in parser.push_bytes(&chunk)? {
@@ -312,7 +318,8 @@ where
 async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
     let base_url = provider_base_url(&request.provider)?;
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
-    let client = build_client(request.timeout_secs.or(request.provider.timeout))?;
+    let timeout_secs = request.timeout_secs.or(request.provider.timeout);
+    let client = build_client(timeout_secs)?;
     let headers = build_anthropic_headers(&request.provider, &request.api_key)?;
     let body = build_anthropic_body(&request, false);
 
@@ -326,7 +333,7 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
     let text = response.text().await.map_err(|err| {
         AppError::new(
             EXIT_NETWORK,
-            format!("failed to read provider response: {err}"),
+            format_provider_read_error("response", &err, timeout_secs),
         )
     })?;
     if !status.is_success() {
@@ -374,12 +381,13 @@ where
 {
     let base_url = provider_base_url(&request.provider)?;
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
-    let client = build_client(request.timeout_secs.or(request.provider.timeout))?;
+    let timeout_secs = request.timeout_secs.or(request.provider.timeout);
+    let client = build_client(timeout_secs)?;
     let headers = build_anthropic_headers(&request.provider, &request.api_key)?;
     let body = build_anthropic_body(&request, true);
 
     let started = Instant::now();
-    let mut response = send_request_with_retry(
+    let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
     )
@@ -401,7 +409,7 @@ where
         let chunk = chunk_result.map_err(|err| {
             AppError::new(
                 EXIT_NETWORK,
-                format!("failed to read provider stream chunk: {err}"),
+                format_provider_read_error("stream chunk", &err, timeout_secs),
             )
         })?;
         for payload in parser.push_bytes(&chunk)? {
@@ -446,7 +454,8 @@ where
 async fn send_ollama(request: ChatRequest) -> AppResult<ChatResponse> {
     let base_url = provider_base_url(&request.provider)?;
     let url = format!("{}/chat", base_url.trim_end_matches('/'));
-    let client = build_client(request.timeout_secs.or(request.provider.timeout))?;
+    let timeout_secs = request.timeout_secs.or(request.provider.timeout);
+    let client = build_client(timeout_secs)?;
     let headers = build_ollama_headers(&request.provider, &request.api_key)?;
     let body = build_ollama_body(&request, false);
 
@@ -460,7 +469,7 @@ async fn send_ollama(request: ChatRequest) -> AppResult<ChatResponse> {
     let text = response.text().await.map_err(|err| {
         AppError::new(
             EXIT_NETWORK,
-            format!("failed to read provider response: {err}"),
+            format_provider_read_error("response", &err, timeout_secs),
         )
     })?;
     if !status.is_success() {
@@ -497,12 +506,13 @@ where
 {
     let base_url = provider_base_url(&request.provider)?;
     let url = format!("{}/chat", base_url.trim_end_matches('/'));
-    let client = build_client(request.timeout_secs.or(request.provider.timeout))?;
+    let timeout_secs = request.timeout_secs.or(request.provider.timeout);
+    let client = build_client(timeout_secs)?;
     let headers = build_ollama_headers(&request.provider, &request.api_key)?;
     let body = build_ollama_body(&request, true);
 
     let started = Instant::now();
-    let mut response = send_request_with_retry(
+    let response = send_request_with_retry(
         client.post(url).headers(headers).json(&body),
         "chat request".to_string(),
     )
@@ -524,7 +534,7 @@ where
         let chunk = chunk_result.map_err(|err| {
             AppError::new(
                 EXIT_NETWORK,
-                format!("failed to read provider stream chunk: {err}"),
+                format_provider_read_error("stream chunk", &err, timeout_secs),
             )
         })?;
         for payload in parser.push_bytes(&chunk)? {
@@ -567,11 +577,50 @@ where
 }
 
 fn build_client(timeout_secs: Option<u64>) -> AppResult<reqwest::Client> {
-    let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(120));
-    reqwest::Client::builder()
-        .timeout(timeout)
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS));
+    if let Some(timeout) = request_timeout(effective_request_timeout_secs(timeout_secs)) {
+        builder = builder.timeout(timeout);
+    }
+    builder
         .build()
         .map_err(|err| AppError::new(EXIT_NETWORK, format!("failed to build HTTP client: {err}")))
+}
+
+fn effective_request_timeout_secs(timeout_secs: Option<u64>) -> u64 {
+    timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
+}
+
+fn request_timeout(timeout_secs: u64) -> Option<Duration> {
+    (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs))
+}
+
+fn format_provider_read_error(
+    kind: &str,
+    err: &reqwest::Error,
+    timeout_secs: Option<u64>,
+) -> String {
+    let details = reqwest_error_details(err);
+    match request_timeout(effective_request_timeout_secs(timeout_secs)) {
+        Some(timeout) if err.is_timeout() => format!(
+            "failed to read provider {kind}: request timed out after {}s: {details}",
+            timeout.as_secs()
+        ),
+        _ => format!("failed to read provider {kind}: {details}"),
+    }
+}
+
+fn reqwest_error_details(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !text.is_empty() && !parts.iter().any(|part| part == &text) {
+            parts.push(text);
+        }
+        source = inner.source();
+    }
+    parts.join(": ")
 }
 
 async fn send_request_with_retry(
@@ -1784,5 +1833,14 @@ mod tests {
 
         let events = parser.push_bytes(b": keep-alive\n\n").unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn request_timeout_is_disabled_by_default() {
+        assert_eq!(effective_request_timeout_secs(None), 0);
+        assert_eq!(effective_request_timeout_secs(Some(0)), 0);
+        assert_eq!(effective_request_timeout_secs(Some(600)), 600);
+        assert_eq!(request_timeout(0), None);
+        assert_eq!(request_timeout(600), Some(Duration::from_secs(600)));
     }
 }

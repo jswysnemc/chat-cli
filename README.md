@@ -165,7 +165,7 @@ api_key_env = "DEEPSEEK_API_KEY"                # env var name, not the secret v
 # org = "example-org"                           # optional organization id
 # project = "example-project"                   # optional project id
 default_model = "deepseek-reasoner-search"      # fallback local model id
-# timeout = 120                                 # optional timeout in seconds
+# timeout = 0                                   # optional total request timeout in seconds; defaults to 0 (disabled)
 
 [models.deepseek-reasoner-search]
 provider = "deepseek"                           # provider id from [providers.*]

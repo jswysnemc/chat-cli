@@ -167,7 +167,7 @@ api_key_env = "DEEPSEEK_API_KEY"                # 环境变量名，不是密钥
 # org = "example-org"                           # 可选，组织 id
 # project = "example-project"                   # 可选，项目 id
 default_model = "deepseek-reasoner-search"      # provider 级默认 model，本地 id
-# timeout = 120                                 # 可选，超时时间（秒）
+# timeout = 0                                   # 可选，请求总超时时间（秒）；默认 0，表示不限制总时长
 
 [models.deepseek-reasoner-search]
 provider = "deepseek"                           # 关联的 provider id
