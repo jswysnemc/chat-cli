@@ -479,7 +479,7 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             Ok(())
         }
         SessionCommand::Show { id } => {
-            let resolved = resolve_session_id(paths, config, &id)?;
+            let resolved = resolve_session_or_current(paths, config, id.as_deref(), "show")?;
             let events = read_events(paths, config, &resolved)?;
             let mut messages = 0;
             let mut responses = 0;
@@ -545,7 +545,7 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
                     "--last must be greater than 0",
                 ));
             }
-            let resolved = resolve_render_session_id(paths, config, id.as_deref())?;
+            let resolved = resolve_session_or_current(paths, config, id.as_deref(), "render")?;
             let events = read_events(paths, config, &resolved)?;
             let turns = session_turns_from_events(&events);
             if turns.is_empty() {
@@ -610,10 +610,11 @@ fn format_session_list_entry(summary: &crate::session::SessionSummary) -> String
     )
 }
 
-fn resolve_render_session_id(
+fn resolve_session_or_current(
     paths: &AppPaths,
     config: &AppConfig,
     requested: Option<&str>,
+    command: &str,
 ) -> AppResult<String> {
     if let Some(id) = requested {
         return resolve_session_id(paths, config, id);
@@ -621,7 +622,7 @@ fn resolve_render_session_id(
     load_state(paths)?.current_session.ok_or_else(|| {
         AppError::new(
             crate::error::EXIT_SESSION,
-            "no active session; use `chat session render <id>` or switch to one first",
+            format!("no active session; use `chat session {command} <id>` or switch to one first"),
         )
     })
 }
@@ -6064,8 +6065,22 @@ mod tests {
         let config = test_config();
         set_current_session(&paths, &config, Some("sess_render"), false).unwrap();
 
-        let resolved = resolve_render_session_id(&paths, &config, None).unwrap();
+        let resolved = resolve_session_or_current(&paths, &config, None, "render").unwrap();
         assert_eq!(resolved, "sess_render");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn resolve_session_or_current_reports_command_specific_hint() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+
+        let err = resolve_session_or_current(&paths, &config, None, "show").unwrap_err();
+        assert!(
+            err.message
+                .contains("no active session; use `chat session show <id>`")
+        );
 
         let _ = fs::remove_dir_all(base_dir);
     }

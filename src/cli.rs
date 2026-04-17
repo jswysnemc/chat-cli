@@ -178,7 +178,7 @@ pub enum SessionCommand {
         temp: bool,
     },
     Show {
-        id: String,
+        id: Option<String>,
     },
     Render {
         id: Option<String>,
@@ -400,6 +400,29 @@ mod tests {
                     assert!(all);
                 }
                 other => panic!("expected session render command, got {other:?}"),
+            },
+            other => panic!("expected session command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_show_parses_optional_id() {
+        let cli = Cli::try_parse_from(["chat", "session", "show"])
+            .expect("cli should parse session show without id");
+        match cli.command {
+            Commands::Session { command } => match command {
+                super::SessionCommand::Show { id } => assert_eq!(id, None),
+                other => panic!("expected session show command, got {other:?}"),
+            },
+            other => panic!("expected session command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["chat", "session", "show", "sess_abc"])
+            .expect("cli should parse session show with id");
+        match cli.command {
+            Commands::Session { command } => match command {
+                super::SessionCommand::Show { id } => assert_eq!(id.as_deref(), Some("sess_abc")),
+                other => panic!("expected session show command, got {other:?}"),
             },
             other => panic!("expected session command, got {other:?}"),
         }
