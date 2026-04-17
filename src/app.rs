@@ -27,13 +27,13 @@ use crate::session::{
     list_session_summaries, load_state, now_rfc3339, read_events, resolve_session_id,
     set_current_session, short_id,
 };
-use crate::tool::{
-    continue_bash_session, execute_tool_with_context, initial_tool_definitions,
-    list_bash_sessions, lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation,
-    tool_call_side_effects, tool_definitions_for_names, tool_search_matches,
-};
 #[cfg(test)]
 use crate::tool::execute_tool;
+use crate::tool::{
+    continue_bash_session, execute_tool_with_context, initial_tool_definitions, list_bash_sessions,
+    lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation, tool_call_side_effects,
+    tool_definitions_for_names, tool_search_matches,
+};
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
 use crossterm::event::{
@@ -3465,7 +3465,7 @@ fn draw_repl_composer(
 }
 
 fn full_width_rule(cols: u16) -> String {
-    let width = cols.saturating_sub(1).max(1) as usize;
+    let width = cols.max(1) as usize;
     format!("{DIM}{}{RESET}", "─".repeat(width))
 }
 
@@ -5857,7 +5857,7 @@ mod tests {
     #[test]
     fn full_width_rule_uses_visible_terminal_width() {
         let rendered = full_width_rule(20);
-        assert_eq!(visible_width(&rendered), 19);
+        assert_eq!(visible_width(&rendered), 20);
     }
 
     #[test]
