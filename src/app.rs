@@ -19,7 +19,7 @@ use crate::provider::{
 };
 use crate::render::{
     StreamPhase, StreamRenderer, StreamStatus, print_status_bar, render_markdown,
-    wrap_ansi_to_width,
+    render_markdown_with_width, wrap_ansi_to_width,
 };
 use crate::session::{
     SessionAudit, SessionEvent, SessionMessage, SessionResponse, append_events, clear_sessions,
@@ -680,6 +680,15 @@ fn render_session_turns(
     turns: &[Vec<SessionMessage>],
     last: Option<usize>,
 ) -> String {
+    render_session_turns_with_width(config, turns, last, None)
+}
+
+fn render_session_turns_with_width(
+    config: &AppConfig,
+    turns: &[Vec<SessionMessage>],
+    last: Option<usize>,
+    width: Option<usize>,
+) -> String {
     let slice = match last {
         Some(last) => {
             let start = turns.len().saturating_sub(last);
@@ -691,7 +700,7 @@ fn render_session_turns(
         .iter()
         .map(|turn| {
             turn.iter()
-                .map(|message| render_session_message(config, message))
+                .map(|message| render_session_message(config, message, width))
                 .collect::<Vec<_>>()
                 .join("\n\n")
         })
@@ -703,20 +712,27 @@ fn render_repl_session_history(
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
+    width: usize,
 ) -> AppResult<String> {
     let events = read_events(paths, config, session_id)?;
     let turns = filter_session_turns_for_repl(&session_turns_from_events(&events));
-    Ok(render_session_turns(config, &turns, None))
+    Ok(render_session_turns_with_width(
+        config,
+        &turns,
+        None,
+        Some(width),
+    ))
 }
 
 fn render_repl_transcript(
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
+    width: usize,
     panels: &[ReplRuntimePanel],
     transient_panel: Option<&ReplRuntimePanel>,
 ) -> String {
-    let history = render_repl_session_history(paths, config, session_id).unwrap_or_default();
+    let history = render_repl_session_history(paths, config, session_id, width).unwrap_or_default();
     let mut rendered_panels = panels
         .iter()
         .map(render_repl_runtime_panel)
@@ -886,10 +902,11 @@ fn render_repl_submission_preview(
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
+    width: usize,
     prompt: &str,
     images: &[MessageImage],
 ) -> AppResult<()> {
-    let history = render_repl_session_history(paths, config, session_id).unwrap_or_default();
+    let history = render_repl_session_history(paths, config, session_id, width).unwrap_or_default();
     let inline = join_inline_prompt_segments(&[
         (!images.is_empty()).then(|| image_badges(images.len())),
         (!prompt.trim().is_empty()).then(|| prompt.to_string()),
@@ -897,7 +914,11 @@ fn render_repl_submission_preview(
     let body = if inline.is_empty() {
         String::new()
     } else {
-        render_markdown(&inline, config.defaults.collapse_thinking.unwrap_or(false))
+        render_markdown_with_width(
+            &inline,
+            config.defaults.collapse_thinking.unwrap_or(false),
+            width,
+        )
     };
     let preview = render_user_message_block(&format!("{GREEN}User{RESET}"), &body);
     if !history.trim().is_empty() {
@@ -916,9 +937,13 @@ fn render_repl_submission_preview(
     Ok(())
 }
 
-fn render_session_message(config: &AppConfig, message: &SessionMessage) -> String {
+fn render_session_message(
+    config: &AppConfig,
+    message: &SessionMessage,
+    width: Option<usize>,
+) -> String {
     let label = session_message_label(message);
-    let body = render_session_message_body(config, message);
+    let body = render_session_message_body(config, message, width);
 
     match message.role.as_str() {
         "user" => render_user_message_block(&label, &body),
@@ -940,12 +965,19 @@ fn session_message_label(message: &SessionMessage) -> String {
     }
 }
 
-fn render_session_message_body(config: &AppConfig, message: &SessionMessage) -> String {
+fn render_session_message_body(
+    config: &AppConfig,
+    message: &SessionMessage,
+    width: Option<usize>,
+) -> String {
     let mut sections = Vec::new();
     let collapse = config.defaults.collapse_thinking.unwrap_or(false);
 
     if !message.content.is_empty() {
-        sections.push(render_markdown(&message.content, collapse));
+        sections.push(match width {
+            Some(width) => render_markdown_with_width(&message.content, collapse, width),
+            None => render_markdown(&message.content, collapse),
+        });
     }
 
     if !message.tool_calls.is_empty() {
@@ -2396,6 +2428,9 @@ async fn handle_repl(
                     paths,
                     config,
                     &session_id,
+                    terminal::size()
+                        .map(|(cols, _)| cols.max(1) as usize)
+                        .unwrap_or(80),
                     &input.prompt,
                     &input.images,
                 )?;
@@ -2712,7 +2747,9 @@ fn read_repl_tui_input(
     state: &mut ReplState,
 ) -> AppResult<ReplInput> {
     let _guard = ReplTerminalGuard::enter(stdout)?;
-    let view = build_repl_screen_view(cli, paths, config, session_id, state);
+    let (cols, _) = terminal::size()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
+    let view = build_repl_screen_view(cli, paths, config, session_id, cols, state);
     let mut draft = ReplEditorDraft {
         transcript_scroll: usize::MAX,
         ..ReplEditorDraft::default()
@@ -2959,6 +2996,7 @@ fn build_repl_screen_view(
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
+    cols: u16,
     state: &ReplState,
 ) -> ReplScreenView {
     let provider_id =
@@ -2975,6 +3013,7 @@ fn build_repl_screen_view(
         paths,
         config,
         session_id,
+        cols.max(1) as usize,
         &state.panels,
         state.transient_panel.as_ref(),
     );
@@ -5784,7 +5823,8 @@ mod tests {
             title: "Error".to_string(),
             body: "boom".to_string(),
         }];
-        let transcript = render_repl_transcript(&paths, &config, "missing_session", &panels, None);
+        let transcript =
+            render_repl_transcript(&paths, &config, "missing_session", 80, &panels, None);
         assert!(transcript.contains("Error"));
         assert!(transcript.contains("boom"));
     }
@@ -5807,11 +5847,34 @@ mod tests {
             &paths,
             &config,
             "missing_session",
+            80,
             &panels,
             Some(&transient),
         );
         assert!(transcript.contains("persistent"));
         assert!(transcript.contains("temporary"));
+    }
+
+    #[test]
+    fn repl_transcript_renders_horizontal_rule_to_requested_width() {
+        let config = test_config();
+        let turns = vec![vec![SessionMessage {
+            role: "assistant".to_string(),
+            content: "---".to_string(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            created_at: now_rfc3339(),
+        }]];
+
+        let rendered = render_session_turns_with_width(&config, &turns, None, Some(24));
+        let plain = rendered
+            .replace(DIM, "")
+            .replace(CYAN, "")
+            .replace(RESET, "")
+            .replace("Assistant\n", "");
+        assert!(plain.contains(&"─".repeat(24)));
     }
 
     #[test]
@@ -5844,7 +5907,8 @@ mod tests {
 
         let mut state = ReplState::default();
         sync_repl_todo_panel(&paths, &config, session_id, &mut state);
-        let transcript = render_repl_transcript(&paths, &config, session_id, &state.panels, None);
+        let transcript =
+            render_repl_transcript(&paths, &config, session_id, 80, &state.panels, None);
 
         assert!(transcript.contains("• Updated Todo"));
         assert!(transcript.contains("Implement UI"));

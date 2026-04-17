@@ -130,6 +130,14 @@ fn strip_thinking(input: &str) -> (String, String) {
 /// Render markdown text to ANSI-formatted terminal output (non-streaming).
 /// Strips thinking blocks and saves them.
 pub fn render_markdown(input: &str, _collapse_thinking: bool) -> String {
+    render_markdown_with_width(input, _collapse_thinking, terminal_render_width())
+}
+
+pub(crate) fn render_markdown_with_width(
+    input: &str,
+    _collapse_thinking: bool,
+    width: usize,
+) -> String {
     let (content, thinking) = strip_thinking(input);
     if !thinking.is_empty() {
         save_thinking(&thinking);
@@ -140,7 +148,7 @@ pub fn render_markdown(input: &str, _collapse_thinking: bool) -> String {
         sections.push(render_thinking_content(&thinking));
     }
     if !content.is_empty() {
-        sections.push(render_markdown_inner(&content));
+        sections.push(render_markdown_inner_with_width(&content, width));
     }
     sections.join("\n\n")
 }
