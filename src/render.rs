@@ -984,8 +984,8 @@ fn is_wide_char(c: char) -> bool {
     )
 }
 
-#[derive(Default)]
 struct LineRenderer {
+    width: usize,
     in_code_block: bool,
     code_block_lang: String,
     table_buffer: Vec<String>,
@@ -993,6 +993,16 @@ struct LineRenderer {
 }
 
 impl LineRenderer {
+    fn new(width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            in_code_block: false,
+            code_block_lang: String::new(),
+            table_buffer: Vec::new(),
+            in_table: false,
+        }
+    }
+
     fn process_line(&mut self, line: &str) -> String {
         if line.trim_start().starts_with("```") {
             if self.in_code_block {
@@ -1045,7 +1055,7 @@ impl LineRenderer {
 
     fn render_single_line(&self, line: &str) -> String {
         if is_horizontal_rule(line) {
-            return format!("{DIM}{}{RESET}\n", "─".repeat(48));
+            return render_horizontal_rule(self.width);
         }
         format!("{}\n", render_single_markdown_line(line))
     }
@@ -1104,10 +1114,14 @@ pub struct StreamRenderer {
 
 impl StreamRenderer {
     pub fn new(collapse_thinking: bool) -> Self {
+        Self::new_with_width(collapse_thinking, terminal_render_width())
+    }
+
+    pub fn new_with_width(collapse_thinking: bool, width: usize) -> Self {
         Self {
             buffer: String::new(),
-            normal_renderer: LineRenderer::default(),
-            thinking_renderer: LineRenderer::default(),
+            normal_renderer: LineRenderer::new(width),
+            thinking_renderer: LineRenderer::new(width),
             in_thinking: false,
             thinking_content: String::new(),
             thinking_lines_shown: 0,
@@ -1163,7 +1177,7 @@ impl StreamRenderer {
 
                     self.in_thinking = false;
                     self.thinking_lines_shown = 0;
-                    self.thinking_renderer = LineRenderer::default();
+                    self.thinking_renderer = LineRenderer::new(self.normal_renderer.width);
                     self.note_phase(StreamPhase::Answering);
                     // Skip newline right after </think>
                     if self.tag_buffer.starts_with('\n') {
@@ -1222,7 +1236,7 @@ impl StreamRenderer {
                     self.in_thinking = true;
                     self.thinking_content.clear();
                     self.thinking_lines_shown = 0;
-                    self.thinking_renderer = LineRenderer::default();
+                    self.thinking_renderer = LineRenderer::new(self.normal_renderer.width);
                     self.note_phase(StreamPhase::Thinking);
                     // Skip newline right after <think>
                     if self.tag_buffer.starts_with('\n') {
@@ -1297,7 +1311,7 @@ impl StreamRenderer {
             save_thinking(self.thinking_content.trim());
             self.in_thinking = false;
             self.thinking_lines_shown = 0;
-            self.thinking_renderer = LineRenderer::default();
+            self.thinking_renderer = LineRenderer::new(self.normal_renderer.width);
             self.note_phase(StreamPhase::Answering);
         }
 
@@ -1760,6 +1774,14 @@ mod tests {
         assert_eq!(phases, vec![StreamPhase::Thinking, StreamPhase::Answering]);
         assert!(rendered.contains("plan"));
         assert!(!rendered.contains("Thinking"));
+    }
+
+    #[test]
+    fn stream_renderer_renders_full_width_horizontal_rule() {
+        let mut renderer = StreamRenderer::new_with_width(false, 12);
+        let rendered = renderer.push("---\n");
+        let plain = rendered.replace(DIM, "").replace(RESET, "");
+        assert_eq!(plain.trim_end_matches('\n'), "─".repeat(12));
     }
 
     #[test]
