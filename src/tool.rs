@@ -834,6 +834,7 @@ pub fn parse_tool_call(raw: &Value) -> AppResult<ToolCall> {
 }
 
 /// Execute a tool call with optional user confirmation.
+#[cfg(test)]
 pub fn execute_tool(
     call: &ToolCall,
     auto_confirm: bool,

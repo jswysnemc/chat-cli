@@ -213,7 +213,7 @@ fn terminal_render_width() -> usize {
 }
 
 fn render_horizontal_rule(width: usize) -> String {
-    let rule_width = width.saturating_sub(1).max(3);
+    let rule_width = width.max(3);
     format!("{DIM}{}{RESET}\n", "─".repeat(rule_width))
 }
 
@@ -1635,6 +1635,13 @@ mod tests {
         assert!(rendered.contains("未完成任务"));
         assert!(!rendered.contains("[x]"));
         assert!(!rendered.contains("[ ]"));
+    }
+
+    #[test]
+    fn render_markdown_renders_full_width_horizontal_rule() {
+        let rendered = render_markdown_inner_with_width("---", 12);
+        let plain = rendered.replace(DIM, "").replace(RESET, "");
+        assert_eq!(plain, "─".repeat(12));
     }
 
     #[test]

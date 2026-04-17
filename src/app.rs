@@ -28,10 +28,12 @@ use crate::session::{
     set_current_session, short_id,
 };
 use crate::tool::{
-    continue_bash_session, execute_tool, execute_tool_with_context, initial_tool_definitions,
+    continue_bash_session, execute_tool_with_context, initial_tool_definitions,
     list_bash_sessions, lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation,
     tool_call_side_effects, tool_definitions_for_names, tool_search_matches,
 };
+#[cfg(test)]
+use crate::tool::execute_tool;
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
 use crossterm::event::{
@@ -1145,6 +1147,7 @@ fn stop_stream_status(status: &mut Option<StreamStatus>) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn execute_tool_as_message(
     raw_call: &Value,
     auto_confirm: bool,
