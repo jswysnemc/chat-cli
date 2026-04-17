@@ -1377,6 +1377,13 @@ fn summarize_tool_call_activity(raw_call: &Value) -> String {
             ),
             "skills_list" => "skills_list".to_string(),
             "SkillsList" => "SkillsList".to_string(),
+            "todo" | "todo_write" | "TodoWrite" => {
+                let count = call.arguments["todos"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                format!("TodoWrite: {count} item(s)")
+            }
             other => other.to_string(),
         },
         Err(_) => "unknown_tool".to_string(),
@@ -1389,6 +1396,147 @@ fn summarize_tool_call_names(raw_calls: &[Value]) -> String {
         .map(summarize_tool_call_activity)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TodoUiStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoUiStatus {
+    fn marker(&self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[~]",
+            Self::Completed => "[x]",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TodoUiItem {
+    content: String,
+    status: TodoUiStatus,
+    #[serde(default, alias = "activeForm")]
+    active_form: Option<String>,
+}
+
+fn is_todo_tool_name(name: &str) -> bool {
+    matches!(name, "todo" | "todo_write" | "TodoWrite")
+}
+
+fn todo_items_from_raw_call(raw_call: &Value) -> Option<Vec<TodoUiItem>> {
+    let call = parse_tool_call(raw_call).ok()?;
+    if !is_todo_tool_name(&call.name) {
+        return None;
+    }
+    serde_json::from_value(call.arguments.get("todos")?.clone()).ok()
+}
+
+fn latest_todo_items_from_events(events: &[SessionEvent]) -> Option<Vec<TodoUiItem>> {
+    for event in events.iter().rev() {
+        let SessionEvent::Message(message) = event else {
+            continue;
+        };
+        for raw_call in message.tool_calls.iter().rev() {
+            if let Some(todos) = todo_items_from_raw_call(raw_call) {
+                return Some(todos);
+            }
+        }
+    }
+    None
+}
+
+fn build_repl_todo_panel(todos: &[TodoUiItem]) -> ReplRuntimePanel {
+    let pending = todos
+        .iter()
+        .filter(|item| matches!(item.status, TodoUiStatus::Pending))
+        .count();
+    let in_progress = todos
+        .iter()
+        .filter(|item| matches!(item.status, TodoUiStatus::InProgress))
+        .count();
+    let completed = todos
+        .iter()
+        .filter(|item| matches!(item.status, TodoUiStatus::Completed))
+        .count();
+    let mut lines = vec![format!(
+        "{pending} pending, {in_progress} in progress, {completed} completed"
+    )];
+    lines.push(String::new());
+    lines.extend(todos.iter().map(|todo| {
+        let mut line = format!("{} {}", todo.status.marker(), todo.content.trim());
+        if let Some(active_form) = todo.active_form.as_deref()
+            && !active_form.trim().is_empty()
+        {
+            line.push_str(&format!(" ({})", active_form.trim()));
+        }
+        line
+    }));
+    ReplRuntimePanel {
+        kind: ReplRuntimePanelKind::Status,
+        title: "Todo".to_string(),
+        body: lines.join("\n"),
+    }
+}
+
+fn sync_repl_todo_panel(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    state: &mut ReplState,
+) {
+    let todos = read_events(paths, config, session_id)
+        .ok()
+        .and_then(|events| latest_todo_items_from_events(&events))
+        .filter(|items| !items.is_empty());
+
+    state.panels.retain(|panel| panel.title != "Todo");
+    if state
+        .transient_panel
+        .as_ref()
+        .is_some_and(|panel| panel.title == "Todo")
+    {
+        state.transient_panel = None;
+    }
+    if let Some(todos) = todos {
+        push_repl_panel(state, build_repl_todo_panel(&todos));
+    }
+}
+
+fn should_print_tool_result_ui(
+    format: OutputFormat,
+    show_static_status_bar: bool,
+    message: &ChatMessage,
+) -> bool {
+    show_static_status_bar
+        && format == OutputFormat::Text
+        && message.role == "tool"
+        && message.name.as_deref().is_some_and(is_todo_tool_name)
+        && !message.content.trim().is_empty()
+}
+
+fn print_tool_result_ui(
+    stdout: &mut io::Stdout,
+    config: &AppConfig,
+    message: &ChatMessage,
+) -> AppResult<()> {
+    let rendered = render_markdown(
+        &message.content,
+        config.defaults.collapse_thinking.unwrap_or(false),
+    );
+    if rendered.trim().is_empty() {
+        return Ok(());
+    }
+    writeln!(stdout, "{}", render_runtime_panel("Todo", &rendered, CYAN))
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write Todo UI: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush Todo UI: {err}")))?;
+    Ok(())
 }
 
 fn normalize_tool_path(path: &str) -> String {
@@ -2206,6 +2354,7 @@ async fn handle_repl(
         if ensure_repl_session_id(paths, config, &mut session_id, session_temp)? {
             session_temp = is_temp_session(&session_id) || args.temp;
         }
+        sync_repl_todo_panel(paths, config, &session_id, &mut repl_state);
         let input = read_repl_input(
             &stdin,
             &mut stdout,
@@ -4471,6 +4620,13 @@ async fn execute_ask_with_tools(
                     config,
                     &prepared.request.messages,
                 );
+                if should_print_tool_result_ui(
+                    prepared.format.clone(),
+                    show_static_status_bar,
+                    &tool_message,
+                ) {
+                    print_tool_result_ui(&mut stdout, config, &tool_message)?;
+                }
                 prepared.request.messages.push(tool_message);
             }
         }
@@ -5646,6 +5802,46 @@ mod tests {
         );
         assert!(transcript.contains("persistent"));
         assert!(transcript.contains("temporary"));
+    }
+
+    #[test]
+    fn sync_repl_todo_panel_loads_latest_todos_from_session_history() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        let session_id = "sess_todo_panel";
+        append_events(
+            &paths,
+            &config,
+            session_id,
+            &[SessionEvent::Message(SessionMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                images: Vec::new(),
+                tool_calls: vec![json!({
+                    "id": "call_todo",
+                    "type": "function",
+                    "function": {
+                        "name": "TodoWrite",
+                        "arguments": "{\"todos\":[{\"content\":\"Implement UI\",\"status\":\"in_progress\",\"active_form\":\"Implementing UI\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}"
+                    }
+                })],
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            })],
+        )
+        .unwrap();
+
+        let mut state = ReplState::default();
+        sync_repl_todo_panel(&paths, &config, session_id, &mut state);
+        let transcript = render_repl_transcript(&paths, &config, session_id, &state.panels, None);
+
+        assert!(transcript.contains("Todo"));
+        assert!(transcript.contains("Implement UI"));
+        assert!(transcript.contains("Run tests"));
+        assert!(transcript.contains("1 pending, 1 in progress, 0 completed"));
+
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

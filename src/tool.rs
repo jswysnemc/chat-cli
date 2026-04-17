@@ -112,24 +112,6 @@ enum TodoStatus {
     Completed,
 }
 
-impl TodoStatus {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-        }
-    }
-
-    fn marker(&self) -> &'static str {
-        match self {
-            Self::Pending => "[ ]",
-            Self::InProgress => "[~]",
-            Self::Completed => "[x]",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TodoItem {
@@ -1218,14 +1200,15 @@ fn render_todo_update(old_todos: &[TodoItem], new_todos: &[TodoItem]) -> String 
     };
     let (pending, in_progress, completed) = todo_status_counts(new_todos);
     let mut lines = vec![
-        action.to_string(),
-        format!("counts: {pending} pending, {in_progress} in_progress, {completed} completed"),
-        "current:".to_string(),
+        format!("## {}", title_case(action)),
+        format!("{pending} pending, {in_progress} in progress, {completed} completed."),
+        String::new(),
+        "### Current".to_string(),
     ];
     lines.extend(render_todo_list(new_todos));
     if !old_todos.is_empty() {
         lines.push(String::new());
-        lines.push("previous:".to_string());
+        lines.push("### Previous".to_string());
         lines.extend(render_todo_list(old_todos));
     }
     lines.join("\n")
@@ -1252,20 +1235,42 @@ fn render_todo_list(todos: &[TodoItem]) -> Vec<String> {
     todos
         .iter()
         .map(|todo| {
-            let mut line = format!(
-                "- {} {} ({})",
-                todo.status.marker(),
-                todo.content.trim(),
-                todo.status.label()
-            );
+            let checkbox = match todo.status {
+                TodoStatus::Completed => "[x]",
+                TodoStatus::Pending | TodoStatus::InProgress => "[ ]",
+            };
+            let mut line = format!("- {checkbox} {}", todo.content.trim());
+            let mut suffixes = Vec::new();
+            if todo.status == TodoStatus::InProgress {
+                suffixes.push("in progress".to_string());
+            } else if todo.status == TodoStatus::Pending {
+                suffixes.push("pending".to_string());
+            }
             if let Some(active_form) = todo.active_form.as_deref()
                 && !active_form.trim().is_empty()
             {
-                line.push_str(&format!(" | active_form: {}", active_form.trim()));
+                suffixes.push(active_form.trim().to_string());
+            }
+            if !suffixes.is_empty() {
+                line.push_str(&format!(" _({})_", suffixes.join(" · ")));
             }
             line
         })
         .collect()
+}
+
+fn title_case(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn write_file_contents(path: &str, content: &str) -> AppResult<()> {
@@ -3108,11 +3113,11 @@ mod tests {
         };
 
         let result = execute_tool_with_context(&call, true, &config, &transcript).unwrap();
-        assert!(result.content.contains("current:"));
-        assert!(result.content.contains("previous:"));
+        assert!(result.content.contains("### Current"));
+        assert!(result.content.contains("### Previous"));
         assert!(result.content.contains("Inspect codebase"));
         assert!(result.content.contains("Run tests"));
-        assert!(result.content.contains("active_form: Running tests"));
+        assert!(result.content.contains("Running tests"));
     }
 
     #[test]
