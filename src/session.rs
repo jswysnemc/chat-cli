@@ -86,7 +86,6 @@ pub struct SessionSummary {
     pub session_id: String,
     pub is_current: bool,
     pub is_temp: bool,
-    pub created_at: Option<u64>,
     pub updated_at: Option<u64>,
     pub first_prompt: Option<String>,
     pub user_messages: usize,
@@ -422,7 +421,6 @@ fn build_session_summary(
     events: &[SessionEvent],
     is_current: bool,
 ) -> SessionSummary {
-    let mut created_at = None;
     let mut updated_at = None;
     let mut first_prompt = None;
     let mut user_messages = 0;
@@ -431,8 +429,7 @@ fn build_session_summary(
     for event in events {
         match event {
             SessionEvent::Meta(meta) => {
-                created_at = parse_timestamp(&meta.created_at);
-                updated_at = created_at;
+                updated_at = parse_timestamp(&meta.created_at);
             }
             SessionEvent::Message(message) => {
                 let ts = parse_timestamp(&message.created_at);
@@ -467,7 +464,6 @@ fn build_session_summary(
         session_id: session_id.to_string(),
         is_current,
         is_temp: is_temp_session(session_id),
-        created_at,
         updated_at,
         first_prompt,
         user_messages,

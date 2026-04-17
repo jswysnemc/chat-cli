@@ -442,20 +442,7 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
         SessionCommand::List => {
             let current_session = load_state(paths)?.current_session;
             for summary in list_session_summaries(paths, config, current_session.as_deref())? {
-                let marker = if summary.is_current { "* " } else { "  " };
-                let temp_tag = if summary.is_temp { " [temp]" } else { "" };
-                println!(
-                    "{}{}{} created_at={} updated_at={} user_messages={} assistant_messages={} first_prompt={}",
-                    marker,
-                    short_id(&summary.session_id),
-                    temp_tag,
-                    summary.created_at.unwrap_or(0),
-                    summary.updated_at.unwrap_or(0),
-                    summary.user_messages,
-                    summary.assistant_messages,
-                    serde_json::to_string(summary.first_prompt.as_deref().unwrap_or(""))
-                        .unwrap_or_default(),
-                );
+                println!("{}", format_session_list_entry(&summary));
             }
             Ok(())
         }
@@ -607,6 +594,20 @@ fn handle_session(paths: &AppPaths, config: &AppConfig, command: SessionCommand)
             Ok(())
         }
     }
+}
+
+fn format_session_list_entry(summary: &crate::session::SessionSummary) -> String {
+    let marker = if summary.is_current { "* " } else { "  " };
+    let temp_tag = if summary.is_temp { " [temp]" } else { "" };
+    let prompt = serde_json::to_string(summary.first_prompt.as_deref().unwrap_or(""))
+        .unwrap_or_else(|_| "\"\"".to_string());
+    let updated = summary.updated_at.unwrap_or(0);
+    format!(
+        "{marker}{}{temp_tag} {prompt} {DIM}· {}u/{}a · updated={updated}{RESET}",
+        short_id(&summary.session_id),
+        summary.user_messages,
+        summary.assistant_messages,
+    )
 }
 
 fn resolve_render_session_id(
@@ -6216,6 +6217,26 @@ mod tests {
             patches: ModelPatchConfig::default(),
         };
         assert_eq!(format_model_list_entry(&model), "minimax/MiniMax-M2.7");
+    }
+
+    #[test]
+    fn format_session_list_entry_prioritizes_prompt_and_compacts_metadata() {
+        let summary = crate::session::SessionSummary {
+            session_id: "tmp_01KPCJPG".to_string(),
+            is_current: true,
+            is_temp: true,
+            updated_at: Some(1776391290),
+            first_prompt: Some("测试一下todo工具".to_string()),
+            user_messages: 2,
+            assistant_messages: 4,
+        };
+
+        let rendered = format_session_list_entry(&summary);
+        assert!(rendered.starts_with("* tmp_01KPCJPG [temp] \"测试一下todo工具\""));
+        assert!(rendered.contains("2u/4a"));
+        assert!(rendered.contains("updated=1776391290"));
+        assert!(!rendered.contains("created_at="));
+        assert!(!rendered.contains("first_prompt="));
     }
 
     #[test]
