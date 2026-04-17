@@ -28,9 +28,9 @@ use crate::session::{
     set_current_session, short_id,
 };
 use crate::tool::{
-    continue_bash_session, execute_tool, initial_tool_definitions, list_bash_sessions,
-    lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation, tool_call_side_effects,
-    tool_definitions_for_names, tool_search_matches,
+    continue_bash_session, execute_tool, execute_tool_with_context, initial_tool_definitions,
+    list_bash_sessions, lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation,
+    tool_call_side_effects, tool_definitions_for_names, tool_search_matches,
 };
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
@@ -1175,7 +1175,24 @@ fn execute_tool_as_message_with_context(
                     name: Some(call.name),
                 };
             }
-            execute_tool_as_message(raw_call, auto_confirm, config)
+            match execute_tool_with_context(&call, auto_confirm, config, transcript) {
+                Ok(result) => ChatMessage {
+                    role: "tool".to_string(),
+                    content: result.content,
+                    images: result.images,
+                    tool_calls: None,
+                    tool_call_id: Some(result.tool_call_id),
+                    name: Some(call.name),
+                },
+                Err(err) => ChatMessage {
+                    role: "tool".to_string(),
+                    content: format!("tool execution error: {}", err.message),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_call_id: Some(call.id),
+                    name: Some(call.name),
+                },
+            }
         }
         Err(err) => ChatMessage {
             role: "tool".to_string(),

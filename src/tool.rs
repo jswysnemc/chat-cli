@@ -1,6 +1,8 @@
 use crate::config::{AppConfig, expand_tilde};
 use crate::error::{AppError, AppResult, EXIT_ARGS};
 use crate::media::MessageImage;
+use crate::provider::ChatMessage;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -99,6 +101,42 @@ pub struct ToolSpec {
 struct ToolRuntimeContext<'a> {
     auto_confirm: bool,
     config: &'a AppConfig,
+    transcript: &'a [ChatMessage],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TodoStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn marker(&self) -> &'static str {
+        match self {
+            Self::Pending => "[ ]",
+            Self::InProgress => "[~]",
+            Self::Completed => "[x]",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TodoItem {
+    content: String,
+    status: TodoStatus,
+    #[serde(default, alias = "activeForm")]
+    active_form: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -150,7 +188,7 @@ enum BashSessionUpdate {
 
 static BASH_SESSIONS: OnceLock<Mutex<BTreeMap<String, InteractiveBashSession>>> = OnceLock::new();
 
-const BUILTIN_TOOL_HANDLERS: [ToolHandler; 10] = [
+const BUILTIN_TOOL_HANDLERS: [ToolHandler; 11] = [
     ToolHandler {
         spec: ToolSpec {
             name: "ToolSearch",
@@ -290,6 +328,20 @@ const BUILTIN_TOOL_HANDLERS: [ToolHandler; 10] = [
             definition: define_status_tool,
         },
         execute: execute_status_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "TodoWrite",
+            aliases: &["todo", "todo_write"],
+            description: "Update the session todo checklist by submitting the full current list.",
+            search_hint: "manage the session task checklist",
+            side_effects: ToolSideEffects::Mutating,
+            parallelism: ToolParallelism::SequentialOnly,
+            requires_confirmation: false,
+            defer_loading: true,
+            definition: define_todo_write_tool,
+        },
+        execute: execute_todo_write_tool,
     },
 ];
 
@@ -552,12 +604,65 @@ fn define_status_tool() -> Value {
     })
 }
 
+fn define_todo_write_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "TodoWrite",
+            "description": "Update the todo list for the current session. Always send the full current list, not a partial patch. Use statuses pending, in_progress, and completed. Keep at most one task in_progress at a time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The full replacement todo list for the current session.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Imperative task description, for example 'Run tests' or 'Implement todo tool'."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Current task status."
+                                },
+                                "active_form": {
+                                    "type": "string",
+                                    "description": "Optional present-continuous form, for example 'Running tests'."
+                                }
+                            },
+                            "required": ["content", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["todos"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 fn execute_status_tool(
     _call: &ToolCall,
     _context: &ToolRuntimeContext<'_>,
 ) -> AppResult<(String, Vec<MessageImage>)> {
     print_tool_header("Status", "");
     let content = crate::context::collect_context_status();
+    Ok((content, Vec::new()))
+}
+
+fn execute_todo_write_tool(
+    call: &ToolCall,
+    context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
+    print_tool_header("TodoWrite", "");
+    let todos = parse_todo_items_argument(&call.arguments)?;
+    validate_todo_items(&todos)?;
+    let old_todos = latest_todo_items_from_transcript(context.transcript, &call.id);
+    let content = render_todo_update(&old_todos, &todos);
     Ok((content, Vec::new()))
 }
 
@@ -752,9 +857,19 @@ pub fn execute_tool(
     auto_confirm: bool,
     config: &AppConfig,
 ) -> AppResult<ToolResult> {
+    execute_tool_with_context(call, auto_confirm, config, &[])
+}
+
+pub fn execute_tool_with_context(
+    call: &ToolCall,
+    auto_confirm: bool,
+    config: &AppConfig,
+    transcript: &[ChatMessage],
+) -> AppResult<ToolResult> {
     let context = ToolRuntimeContext {
         auto_confirm,
         config,
+        transcript,
     };
     let (content, images) = match find_tool_handler(&call.name) {
         Some(handler) => (handler.execute)(call, &context)?,
@@ -1021,6 +1136,136 @@ fn try_read_image_file(path: &Path) -> Option<MessageImage> {
     let bytes = std::fs::read(path).ok()?;
     let media_type = crate::media::detect_image_media_type(path, &bytes)?;
     Some(MessageImage::from_bytes(&bytes, media_type))
+}
+
+fn parse_todo_items_argument(arguments: &Value) -> AppResult<Vec<TodoItem>> {
+    let todos = arguments
+        .get("todos")
+        .cloned()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, "TodoWrite: missing 'todos' argument"))?;
+    serde_json::from_value(todos).map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("TodoWrite: invalid todos payload: {err}"),
+        )
+    })
+}
+
+fn validate_todo_items(todos: &[TodoItem]) -> AppResult<()> {
+    let in_progress_count = todos
+        .iter()
+        .filter(|item| item.status == TodoStatus::InProgress)
+        .count();
+    if in_progress_count > 1 {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "TodoWrite: at most one todo may be in_progress",
+        ));
+    }
+    for item in todos {
+        if item.content.trim().is_empty() {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                "TodoWrite: todo content cannot be empty",
+            ));
+        }
+        if item
+            .active_form
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(AppError::new(
+                EXIT_ARGS,
+                "TodoWrite: active_form cannot be empty when provided",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn latest_todo_items_from_transcript(
+    transcript: &[ChatMessage],
+    current_call_id: &str,
+) -> Vec<TodoItem> {
+    for message in transcript.iter().rev() {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for raw_call in tool_calls.iter().rev() {
+            let Ok(call) = parse_tool_call(raw_call) else {
+                continue;
+            };
+            if call.id == current_call_id || !is_todo_tool_name(&call.name) {
+                continue;
+            }
+            if let Ok(todos) = parse_todo_items_argument(&call.arguments) {
+                return todos;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn is_todo_tool_name(name: &str) -> bool {
+    matches!(name, "TodoWrite" | "todo" | "todo_write")
+}
+
+fn render_todo_update(old_todos: &[TodoItem], new_todos: &[TodoItem]) -> String {
+    let action = if old_todos == new_todos {
+        "todo list unchanged"
+    } else {
+        "todo list updated"
+    };
+    let (pending, in_progress, completed) = todo_status_counts(new_todos);
+    let mut lines = vec![
+        action.to_string(),
+        format!("counts: {pending} pending, {in_progress} in_progress, {completed} completed"),
+        "current:".to_string(),
+    ];
+    lines.extend(render_todo_list(new_todos));
+    if !old_todos.is_empty() {
+        lines.push(String::new());
+        lines.push("previous:".to_string());
+        lines.extend(render_todo_list(old_todos));
+    }
+    lines.join("\n")
+}
+
+fn todo_status_counts(todos: &[TodoItem]) -> (usize, usize, usize) {
+    let mut pending = 0usize;
+    let mut in_progress = 0usize;
+    let mut completed = 0usize;
+    for todo in todos {
+        match todo.status {
+            TodoStatus::Pending => pending += 1,
+            TodoStatus::InProgress => in_progress += 1,
+            TodoStatus::Completed => completed += 1,
+        }
+    }
+    (pending, in_progress, completed)
+}
+
+fn render_todo_list(todos: &[TodoItem]) -> Vec<String> {
+    if todos.is_empty() {
+        return vec!["- (empty)".to_string()];
+    }
+    todos
+        .iter()
+        .map(|todo| {
+            let mut line = format!(
+                "- {} {} ({})",
+                todo.status.marker(),
+                todo.content.trim(),
+                todo.status.label()
+            );
+            if let Some(active_form) = todo.active_form.as_deref()
+                && !active_form.trim().is_empty()
+            {
+                line.push_str(&format!(" | active_form: {}", active_form.trim()));
+            }
+            line
+        })
+        .collect()
 }
 
 fn write_file_contents(path: &str, content: &str) -> AppResult<()> {
@@ -2790,7 +3035,8 @@ mod tests {
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Status"));
-        assert_eq!(defs.len(), 9);
+        assert!(names.contains(&"TodoWrite"));
+        assert_eq!(defs.len(), 10);
     }
 
     #[test]
@@ -2806,6 +3052,67 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(write_names.contains(&"Edit"));
         assert!(!write_names.contains(&"Write"));
+
+        let todo_matches = tool_search_matches("todo", 3);
+        let todo_names = todo_matches
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(todo_names.contains(&"TodoWrite"));
+    }
+
+    #[test]
+    fn todo_write_rejects_multiple_in_progress_items() {
+        let call = ToolCall {
+            id: "call_todo".to_string(),
+            name: "TodoWrite".to_string(),
+            arguments: json!({
+                "todos": [
+                    {"content": "First", "status": "in_progress"},
+                    {"content": "Second", "status": "in_progress"}
+                ]
+            }),
+        };
+
+        let err = execute_tool(&call, true, &AppConfig::default()).unwrap_err();
+        assert!(err.message.contains("at most one todo may be in_progress"));
+    }
+
+    #[test]
+    fn todo_write_uses_previous_todos_from_transcript() {
+        let config = AppConfig::default();
+        let transcript = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            images: Vec::new(),
+            tool_calls: Some(vec![json!({
+                "id": "call_old",
+                "type": "function",
+                "function": {
+                    "name": "TodoWrite",
+                    "arguments": "{\"todos\":[{\"content\":\"Inspect codebase\",\"status\":\"completed\"},{\"content\":\"Implement tool\",\"status\":\"in_progress\"}]}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        }];
+        let call = ToolCall {
+            id: "call_new".to_string(),
+            name: "TodoWrite".to_string(),
+            arguments: json!({
+                "todos": [
+                    {"content": "Implement tool", "status": "completed"},
+                    {"content": "Run tests", "status": "in_progress", "active_form": "Running tests"}
+                ]
+            }),
+        };
+
+        let result = execute_tool_with_context(&call, true, &config, &transcript).unwrap();
+        assert!(result.content.contains("current:"));
+        assert!(result.content.contains("previous:"));
+        assert!(result.content.contains("Inspect codebase"));
+        assert!(result.content.contains("Run tests"));
+        assert!(result.content.contains("active_form: Running tests"));
     }
 
     #[test]
