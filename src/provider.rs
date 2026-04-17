@@ -1,5 +1,7 @@
 use crate::config::{ModelConfig, ProviderConfig};
-use crate::error::{AppError, AppResult, EXIT_AUTH, EXIT_NETWORK, EXIT_PROVIDER, EXIT_RATE_LIMIT};
+use crate::error::{
+    AppError, AppResult, EXIT_AUTH, EXIT_MODEL, EXIT_NETWORK, EXIT_PROVIDER, EXIT_RATE_LIMIT,
+};
 use crate::media::MessageImage;
 use crate::session::Usage;
 use futures_util::StreamExt;
@@ -60,6 +62,7 @@ pub struct ChatStreamChunk {
 }
 
 pub async fn send_chat(request: ChatRequest) -> AppResult<ChatResponse> {
+    validate_request_media_support(&request)?;
     match request.provider.kind.as_str() {
         "openai_compatible" => send_openai_compatible(request).await,
         "anthropic" => send_anthropic(request).await,
@@ -75,6 +78,7 @@ pub async fn stream_chat<F>(request: ChatRequest, on_chunk: F) -> AppResult<Chat
 where
     F: FnMut(ChatStreamChunk) -> AppResult<()>,
 {
+    validate_request_media_support(&request)?;
     match request.provider.kind.as_str() {
         "openai_compatible" => stream_openai_compatible(request, on_chunk).await,
         "anthropic" => stream_anthropic(request, on_chunk).await,
@@ -82,6 +86,37 @@ where
         other => Err(AppError::new(
             EXIT_PROVIDER,
             format!("provider kind `{other}` is not implemented yet"),
+        )),
+    }
+}
+
+fn validate_request_media_support(request: &ChatRequest) -> AppResult<()> {
+    if !request
+        .messages
+        .iter()
+        .any(|message| !message.images.is_empty())
+    {
+        return Ok(());
+    }
+    if !request
+        .model
+        .capabilities
+        .iter()
+        .any(|capability| capability == "vision")
+    {
+        return Err(AppError::new(
+            EXIT_MODEL,
+            format!(
+                "model `{}` does not support image input; add capability `vision` or select a vision-capable model",
+                request.model_id
+            ),
+        ));
+    }
+    match request.provider.kind.as_str() {
+        "openai_compatible" | "anthropic" => Ok(()),
+        other => Err(AppError::new(
+            EXIT_PROVIDER,
+            format!("provider kind `{other}` does not support image input yet"),
         )),
     }
 }
@@ -684,49 +719,7 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
     );
     body.insert(
         "messages".to_string(),
-        Value::Array(
-            messages
-                .iter()
-                .map(|msg| {
-                    let mut m = Map::new();
-                    m.insert("role".to_string(), json!(msg.role));
-                    if msg.role == "tool" {
-                        if msg.images.is_empty() {
-                            m.insert("content".to_string(), json!(msg.content));
-                        } else {
-                            m.insert(
-                                "content".to_string(),
-                                build_openai_message_content_value(msg),
-                            );
-                        }
-                        if let Some(id) = &msg.tool_call_id {
-                            m.insert("tool_call_id".to_string(), json!(id));
-                        }
-                    } else if msg.role == "assistant" {
-                        if let Some(tc) = &msg.tool_calls {
-                            m.insert("tool_calls".to_string(), Value::Array(tc.clone()));
-                            // content can be null when assistant has tool_calls
-                            if msg.content.is_empty() {
-                                m.insert("content".to_string(), Value::Null);
-                            } else {
-                                m.insert("content".to_string(), json!(msg.content));
-                            }
-                        } else {
-                            m.insert(
-                                "content".to_string(),
-                                build_openai_message_content_value(msg),
-                            );
-                        }
-                    } else {
-                        m.insert(
-                            "content".to_string(),
-                            build_openai_message_content_value(msg),
-                        );
-                    }
-                    Value::Object(m)
-                })
-                .collect(),
-        ),
+        Value::Array(build_openai_messages(&messages)),
     );
     body.insert("stream".to_string(), Value::Bool(stream));
     if stream {
@@ -751,6 +744,52 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
         body.insert(key.clone(), value.clone());
     }
     Value::Object(body)
+}
+
+fn build_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut built = Vec::new();
+    for message in messages {
+        let mut m = Map::new();
+        m.insert("role".to_string(), json!(message.role));
+        if message.role == "tool" {
+            m.insert("content".to_string(), json!(message.content));
+            if let Some(id) = &message.tool_call_id {
+                m.insert("tool_call_id".to_string(), json!(id));
+            }
+            built.push(Value::Object(m));
+            if !message.images.is_empty() {
+                built.push(json!({
+                    "role": "user",
+                    "content": build_openai_tool_image_followup_content(message),
+                }));
+            }
+            continue;
+        }
+        if message.role == "assistant" {
+            if let Some(tc) = &message.tool_calls {
+                m.insert("tool_calls".to_string(), Value::Array(tc.clone()));
+                // content can be null when assistant has tool_calls
+                if message.content.is_empty() {
+                    m.insert("content".to_string(), Value::Null);
+                } else {
+                    m.insert("content".to_string(), json!(message.content));
+                }
+            } else {
+                m.insert(
+                    "content".to_string(),
+                    build_openai_message_content_value(message),
+                );
+            }
+            built.push(Value::Object(m));
+            continue;
+        }
+        m.insert(
+            "content".to_string(),
+            build_openai_message_content_value(message),
+        );
+        built.push(Value::Object(m));
+    }
+    built
 }
 
 fn resolved_openai_reasoning_effort(request: &ChatRequest) -> Option<String> {
@@ -786,6 +825,23 @@ fn build_openai_message_content_value(message: &ChatMessage) -> Value {
             "text": message.content,
         }));
     }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image.data_url(),
+            }
+        }));
+    }
+    Value::Array(parts)
+}
+
+fn build_openai_tool_image_followup_content(message: &ChatMessage) -> Value {
+    let mut parts = Vec::new();
+    parts.push(json!({
+        "type": "text",
+        "text": tool_image_followup_text(message),
+    }));
     for image in &message.images {
         parts.push(json!({
             "type": "image_url",
@@ -876,6 +932,12 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
                 "role": message.role,
                 "content": build_anthropic_message_content_value(message),
             }));
+            if message.role == "tool" && !message.images.is_empty() {
+                result.push(json!({
+                    "role": "user",
+                    "content": build_anthropic_tool_image_followup_content(message),
+                }));
+            }
         }
     }
     let system = if system_parts.is_empty() {
@@ -886,7 +948,45 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
     (system, result)
 }
 
+fn build_anthropic_tool_image_followup_content(message: &ChatMessage) -> Value {
+    let mut parts = Vec::new();
+    parts.push(json!({
+        "type": "text",
+        "text": tool_image_followup_text(message),
+    }));
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data,
+            }
+        }));
+    }
+    Value::Array(parts)
+}
+
+fn tool_image_followup_text(message: &ChatMessage) -> String {
+    let tool_name = message.name.as_deref().unwrap_or("tool");
+    let count = message.images.len();
+    let suffix = if count == 1 { "" } else { "s" };
+    if message.content.trim().is_empty() {
+        format!(
+            "Tool `{tool_name}` returned {count} image attachment{suffix}. Treat the attached image output as tool context and continue answering the original user request."
+        )
+    } else {
+        format!(
+            "Tool `{tool_name}` returned {count} image attachment{suffix}. Treat the attached image output as tool context and continue answering the original user request.\n\nTool text output:\n{}",
+            message.content
+        )
+    }
+}
+
 fn build_anthropic_message_content_value(message: &ChatMessage) -> Value {
+    if message.role == "tool" {
+        return json!(message.content);
+    }
     if message.images.is_empty() {
         return json!(message.content);
     }
@@ -1780,6 +1880,188 @@ mod tests {
             content[1]["image_url"]["url"].as_str(),
             Some("data:image/png;base64,YWJj")
         );
+    }
+
+    #[test]
+    fn build_openai_body_moves_tool_images_into_followup_user_message() {
+        let request = ChatRequest {
+            provider_id: "cpap".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "team-gpt-5-4".to_string(),
+            model: ModelConfig {
+                provider: "cpap".to_string(),
+                remote_name: "team/gpt-5.4".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "vision".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    images: Vec::new(),
+                    tool_calls: Some(vec![json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": "{\"path\":\"/tmp/test.png\"}"
+                        }
+                    })]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: "image file: /tmp/test.png".to_string(),
+                    images: vec![MessageImage {
+                        media_type: "image/png".to_string(),
+                        data: "YWJj".to_string(),
+                    }],
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    name: Some("Read".to_string()),
+                },
+            ],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"].as_str(), Some("tool"));
+        assert_eq!(
+            messages[1]["content"].as_str(),
+            Some("image file: /tmp/test.png")
+        );
+        assert_eq!(messages[1]["tool_call_id"].as_str(), Some("call_1"));
+        assert_eq!(messages[2]["role"].as_str(), Some("user"));
+        let content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Tool `Read` returned 1 image attachment")
+        );
+        assert_eq!(content[1]["type"].as_str(), Some("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"].as_str(),
+            Some("data:image/png;base64,YWJj")
+        );
+    }
+
+    #[test]
+    fn build_anthropic_body_moves_tool_images_into_followup_user_message() {
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-vision".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude-vision".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "vision".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: "image file: /tmp/test.png".to_string(),
+                images: vec![MessageImage {
+                    media_type: "image/png".to_string(),
+                    data: "YWJj".to_string(),
+                }],
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                name: Some("Read".to_string()),
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"].as_str(), Some("tool"));
+        assert_eq!(
+            messages[0]["content"].as_str(),
+            Some("image file: /tmp/test.png")
+        );
+        assert_eq!(messages[1]["role"].as_str(), Some("user"));
+        let content = messages[1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
+        assert_eq!(content[1]["type"].as_str(), Some("image"));
+        assert_eq!(
+            content[1]["source"]["media_type"].as_str(),
+            Some("image/png")
+        );
+        assert_eq!(content[1]["source"]["data"].as_str(), Some("YWJj"));
+    }
+
+    #[test]
+    fn validate_request_media_support_rejects_non_vision_model() {
+        let request = ChatRequest {
+            provider_id: "cpap".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "text-only".to_string(),
+            model: ModelConfig {
+                provider: "cpap".to_string(),
+                remote_name: "text-only".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "tool".to_string(),
+                content: "image file".to_string(),
+                images: vec![MessageImage {
+                    media_type: "image/png".to_string(),
+                    data: "YWJj".to_string(),
+                }],
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                name: Some("Read".to_string()),
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let err = validate_request_media_support(&request).unwrap_err();
+        assert!(err.message.contains("does not support image input"));
     }
 
     #[test]

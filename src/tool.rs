@@ -3015,6 +3015,28 @@ mod tests {
         assert!(!output.contains("interactive bash session is still running"));
     }
 
+    #[test]
+    fn read_tool_returns_image_payload_for_png_files() {
+        let temp_root = make_temp_dir("read-image");
+        let image_path = temp_root.join("test.png");
+        fs::write(&image_path, b"\x89PNG\r\n\x1a\nfake-png").unwrap();
+
+        let call = ToolCall {
+            id: "call_read".to_string(),
+            name: "Read".to_string(),
+            arguments: json!({
+                "path": image_path.display().to_string()
+            }),
+        };
+
+        let result = execute_tool(&call, true, &AppConfig::default()).unwrap();
+        assert!(result.content.contains("image file:"));
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].media_type, "image/png");
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
     fn make_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
