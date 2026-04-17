@@ -8,6 +8,7 @@ use crate::config::{
     load_secrets, parse_headers, read_system_prompt, render_config_value, save_config,
     save_secrets, set_config_value, validate_config,
 };
+use crate::context::{ContextStatusMode, prepend_context_status};
 use crate::error::{
     AppError, AppResult, EXIT_ARGS, EXIT_AUTH, EXIT_CONFIG, EXIT_MODEL, EXIT_PROVIDER,
 };
@@ -792,6 +793,7 @@ fn build_repl_status_panel(
         format!("model: {model_id}"),
         format!("stream: {}", if state.stream { "on" } else { "off" }),
         format!("tools: {}", if state.tools { "on" } else { "off" }),
+        format!("context_status: {}", state.context_status.as_str()),
     ];
     sections.push(String::new());
     sections.push("quick actions:".to_string());
@@ -1121,7 +1123,7 @@ fn execute_tool_as_message(
             Ok(result) => ChatMessage {
                 role: "tool".to_string(),
                 content: result.content,
-                images: Vec::new(),
+                images: result.images,
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id),
                 name: Some(call.name),
@@ -2020,6 +2022,7 @@ fn ensure_repl_session_id(
 struct ReplState {
     stream: bool,
     tools: bool,
+    context_status: ContextStatusMode,
     provider_override: Option<String>,
     model_override: Option<String>,
     panels: Vec<ReplRuntimePanel>,
@@ -2171,6 +2174,10 @@ async fn handle_repl(
     let mut repl_state = ReplState {
         stream: !args.no_stream || args.stream,
         tools: args.tools || config.defaults.tools.unwrap_or(false),
+        context_status: crate::context::resolve_context_status_mode(
+            args.context_status,
+            config.defaults.context_status,
+        ),
         provider_override: None,
         model_override: None,
         panels: Vec::new(),
@@ -2243,6 +2250,7 @@ async fn handle_repl(
                     params: Vec::new(),
                     timeout: None,
                     raw_provider_response: false,
+                    context_status: Some(repl_state.context_status),
                 };
                 let use_tools = ask_args.tools;
                 let turn_cli = repl_runtime_cli(cli, config, &repl_state);
@@ -4205,11 +4213,12 @@ struct BuiltInput {
 #[derive(Clone)]
 struct PreparedAsk {
     format: OutputFormat,
-    prompt: String,
+    persisted_user_content: String,
     user_images: Vec<MessageImage>,
     session_id: String,
     session_preamble: Vec<ChatMessage>,
     request: ChatRequest,
+    context_status_mode: ContextStatusMode,
 }
 
 async fn execute_ask(
@@ -4227,7 +4236,7 @@ async fn execute_ask(
         config,
         args,
         &prepared.session_preamble,
-        &prepared.prompt,
+        &prepared.persisted_user_content,
         &prepared.user_images,
         &prepared.session_id,
         &response,
@@ -4461,25 +4470,33 @@ async fn execute_ask_with_tools(
     let response = match response_result {
         Ok(response) => response,
         Err(err) => {
+            let persisted_turn_messages = persisted_turn_messages_for_session(
+                &prepared,
+                &prepared.request.messages[turn_start_index..],
+            );
             persist_partial_tool_turn(
                 paths,
                 config,
                 args,
                 &prepared.session_id,
                 &prepared.session_preamble,
-                &prepared.request.messages[turn_start_index..],
+                &persisted_turn_messages,
             )?;
             return Err(err);
         }
     };
 
+    let persisted_turn_messages = persisted_turn_messages_for_session(
+        &prepared,
+        &prepared.request.messages[turn_start_index..],
+    );
     persist_tool_session(
         paths,
         config,
         args,
         &prepared.session_preamble,
         &prepared.session_id,
-        &prepared.request.messages[turn_start_index..],
+        &persisted_turn_messages,
         &response,
     )?;
 
@@ -4517,7 +4534,6 @@ async fn execute_ask_stream(
 ) -> AppResult<()> {
     let prepared = prepare_ask(cli, paths, config, secrets, args, output_override)?;
     let format = prepared.format.clone();
-    let prompt = prepared.prompt.clone();
     let session_id = prepared.session_id.clone();
     let mut stdout = io::stdout();
 
@@ -4630,7 +4646,7 @@ async fn execute_ask_stream(
         config,
         args,
         &prepared.session_preamble,
-        &prompt,
+        &prepared.persisted_user_content,
         &prepared.user_images,
         &session_id,
         &response,
@@ -4744,7 +4760,8 @@ fn prepare_ask(
             }
         }
     }
-    if messages.is_empty() {
+    let is_new_session = messages.is_empty();
+    if is_new_session {
         // Build system prompt from CLI args and config file
         let cli_system = read_system_prompt(&args.system)?;
         let file_system = config
@@ -4782,9 +4799,37 @@ fn prepare_ask(
             messages.push(system_message);
         }
     }
+    let context_status_mode = crate::context::resolve_context_status_mode(
+        args.context_status,
+        config.defaults.context_status,
+    );
+    if is_new_session && context_status_mode == ContextStatusMode::SystemOnce {
+        let status_message = ChatMessage {
+            role: "system".to_string(),
+            content: crate::context::collect_context_status(),
+            images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        session_preamble.push(status_message.clone());
+        messages.push(status_message);
+    }
+    let user_content = match context_status_mode {
+        ContextStatusMode::Always | ContextStatusMode::Latest => {
+            prepend_context_status(&input.prompt)
+        }
+        ContextStatusMode::Off | ContextStatusMode::SystemOnce => input.prompt.clone(),
+    };
+    let persisted_user_content = match context_status_mode {
+        ContextStatusMode::Always => user_content.clone(),
+        ContextStatusMode::Off | ContextStatusMode::Latest | ContextStatusMode::SystemOnce => {
+            input.prompt.clone()
+        }
+    };
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: input.prompt.clone(),
+        content: user_content,
         images: input.images.clone(),
         tool_calls: None,
         tool_call_id: None,
@@ -4817,10 +4862,11 @@ fn prepare_ask(
 
     Ok(PreparedAsk {
         format,
-        prompt: input.prompt,
+        persisted_user_content,
         user_images: input.images,
         session_id,
         session_preamble,
+        context_status_mode,
         request: ChatRequest {
             provider_id,
             provider: provider.clone(),
@@ -4835,6 +4881,20 @@ fn prepare_ask(
             tools: Vec::new(),
         },
     })
+}
+
+fn persisted_turn_messages_for_session(
+    prepared: &PreparedAsk,
+    turn_messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let mut persisted = turn_messages.to_vec();
+    if prepared.context_status_mode == ContextStatusMode::Latest
+        && let Some(first_message) = persisted.first_mut()
+        && first_message.role == "user"
+    {
+        first_message.content = prepared.persisted_user_content.clone();
+    }
+    persisted
 }
 
 fn persist_session(
@@ -5202,6 +5262,7 @@ mod tests {
             params: Vec::new(),
             timeout: None,
             raw_provider_response: false,
+            context_status: Some(ContextStatusMode::Off),
         }
     }
 
@@ -5516,6 +5577,7 @@ mod tests {
         let state = ReplState {
             stream: true,
             tools: false,
+            context_status: ContextStatusMode::Off,
             provider_override: Some("deepseek".to_string()),
             model_override: Some("deepseek-reasoner-search".to_string()),
             panels: Vec::new(),
@@ -5526,6 +5588,7 @@ mod tests {
         assert!(panel.body.contains("provider: deepseek"));
         assert!(panel.body.contains("model: deepseek-reasoner-search"));
         assert!(panel.body.contains("tools: off"));
+        assert!(panel.body.contains("context_status: off"));
         assert!(panel.body.contains("/model"));
     }
 
@@ -6267,7 +6330,7 @@ mod tests {
             &config,
             &first_args,
             &first.session_preamble,
-            &first.prompt,
+            &first.persisted_user_content,
             &first.user_images,
             &first.session_id,
             &response,
@@ -6296,6 +6359,244 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(second_roles, vec!["system", "user", "assistant", "user"]);
         assert_eq!(second.request.messages[0].content, "回答时保持简洁");
+        assert!(second.session_preamble.is_empty());
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn context_status_always_persists_injected_user_message() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+
+        let mut args = ask_args("看看这个仓库");
+        args.new_session = true;
+        args.context_status = Some(ContextStatusMode::Always);
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &args, None).unwrap();
+        assert!(
+            prepared.request.messages[0]
+                .content
+                .starts_with("# Current Status")
+        );
+        assert!(
+            prepared
+                .persisted_user_content
+                .starts_with("# Current Status")
+        );
+
+        let response = ChatResponse {
+            provider_id: "cpap".to_string(),
+            model_id: "team-gpt-5-4".to_string(),
+            content: "这是一个 Rust 项目。".to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+        persist_session(
+            &paths,
+            &config,
+            &args,
+            &prepared.session_preamble,
+            &prepared.persisted_user_content,
+            &prepared.user_images,
+            &prepared.session_id,
+            &response,
+        )
+        .unwrap();
+
+        let stored_events = read_events(&paths, &config, &prepared.session_id).unwrap();
+        let stored_messages = stored_events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Message(message) => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(stored_messages[0].content.starts_with("# Current Status"));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn context_status_latest_is_filtered_from_persisted_tool_history() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+
+        let mut args = ask_args("读取 Cargo.toml");
+        args.new_session = true;
+        args.tools = true;
+        args.context_status = Some(ContextStatusMode::Latest);
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &args, None).unwrap();
+        assert!(
+            prepared.request.messages[0]
+                .content
+                .starts_with("# Current Status")
+        );
+
+        let mut turn_messages = prepared.request.messages.clone();
+        turn_messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            images: Vec::new(),
+            tool_calls: Some(vec![json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"Cargo.toml\"}"
+                }
+            })]),
+            tool_call_id: None,
+            name: None,
+        });
+        turn_messages.push(ChatMessage {
+            role: "tool".to_string(),
+            content: "[package]\nname = \"chat-cli\"".to_string(),
+            images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            name: Some("read".to_string()),
+        });
+
+        let persisted_turn_messages =
+            persisted_turn_messages_for_session(&prepared, &turn_messages);
+        assert_eq!(persisted_turn_messages[0].content, "读取 Cargo.toml");
+
+        let response = ChatResponse {
+            provider_id: "cpap".to_string(),
+            model_id: "team-gpt-5-4".to_string(),
+            content: "这是 Cargo 配置文件。".to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+        persist_tool_session(
+            &paths,
+            &config,
+            &args,
+            &prepared.session_preamble,
+            &prepared.session_id,
+            &persisted_turn_messages,
+            &response,
+        )
+        .unwrap();
+
+        let stored_events = read_events(&paths, &config, &prepared.session_id).unwrap();
+        let stored_messages = stored_events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Message(message) => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stored_messages[0].content, "读取 Cargo.toml");
+
+        let mut second_args = ask_args("继续总结");
+        second_args.session = Some(prepared.session_id.clone());
+        let second = prepare_ask(&cli, &paths, &config, &secrets, &second_args, None).unwrap();
+        assert_eq!(second.request.messages[0].content, "读取 Cargo.toml");
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn context_status_system_once_is_injected_after_system_prompt_only_on_first_turn() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+
+        let mut first_args = ask_args("第一条消息");
+        first_args.new_session = true;
+        first_args.system = Some("回答时保持简洁".to_string());
+        first_args.context_status = Some(ContextStatusMode::SystemOnce);
+
+        let first = prepare_ask(&cli, &paths, &config, &secrets, &first_args, None).unwrap();
+        let first_roles = first
+            .request
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(first_roles, vec!["system", "system", "user"]);
+        assert_eq!(first.request.messages[0].content, "回答时保持简洁");
+        assert!(
+            first.request.messages[1]
+                .content
+                .starts_with("# Current Status")
+        );
+        assert_eq!(first.persisted_user_content, "第一条消息");
+
+        let response = ChatResponse {
+            provider_id: "cpap".to_string(),
+            model_id: "team-gpt-5-4".to_string(),
+            content: "第一条回复".to_string(),
+            finish_reason: "stop".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+        persist_session(
+            &paths,
+            &config,
+            &first_args,
+            &first.session_preamble,
+            &first.persisted_user_content,
+            &first.user_images,
+            &first.session_id,
+            &response,
+        )
+        .unwrap();
+
+        let mut second_args = ask_args("第二条消息");
+        second_args.session = Some(first.session_id.clone());
+        second_args.context_status = Some(ContextStatusMode::SystemOnce);
+        let second = prepare_ask(&cli, &paths, &config, &secrets, &second_args, None).unwrap();
+        let second_roles = second
+            .request
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            second_roles,
+            vec!["system", "system", "user", "assistant", "user"]
+        );
+        assert!(
+            second.request.messages[1]
+                .content
+                .starts_with("# Current Status")
+        );
+        assert_eq!(second.request.messages[4].content, "第二条消息");
         assert!(second.session_preamble.is_empty());
 
         let _ = fs::remove_dir_all(base_dir);

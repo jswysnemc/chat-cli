@@ -173,7 +173,7 @@ fn try_read_pbpaste_clipboard_text() -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn detect_image_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+pub fn detect_image_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some("image/png");
     }

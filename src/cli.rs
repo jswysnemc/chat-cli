@@ -1,3 +1,4 @@
+use crate::context::ContextStatusMode;
 use crate::media::MessageImage;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,9 @@ pub struct AskArgs {
 
     #[arg(long)]
     pub raw_provider_response: bool,
+
+    #[arg(long, value_enum)]
+    pub context_status: Option<ContextStatusMode>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -157,6 +161,9 @@ pub struct ReplArgs {
 
     #[arg(long)]
     pub no_stream: bool,
+
+    #[arg(long, value_enum)]
+    pub context_status: Option<ContextStatusMode>,
 }
 
 #[derive(Subcommand, Debug, Clone)]

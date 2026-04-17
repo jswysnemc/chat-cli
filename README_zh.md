@@ -60,6 +60,9 @@ chat ask --new-session      # 创建新会话
 chat ask --output json      # JSON 输出模式
 chat ask --stream           # 流式输出
 chat ask --tools            # 启用工具调用
+chat ask --context-status always "分析这个仓库"
+chat ask --context-status latest "只在这一轮注入状态"
+chat ask --context-status system-once --system "回答简洁" "开始新会话"
 ```
 
 ### `chat repl`
@@ -71,6 +74,7 @@ chat repl
 chat repl --session <id>     # 继续会话
 chat repl --system <prompt>  # 系统提示词
 chat repl --multiline        # 启用多行输入
+chat repl --context-status system-once
 ```
 
 ### `chat session`
@@ -97,6 +101,8 @@ chat config init              # 初始化配置目录
 chat config path              # 打印配置/数据/缓存路径
 chat config show              # 显示完整配置
 chat config get defaults.model
+chat config get defaults.context_status
+chat config set defaults.context_status system-once
 chat config set audit.enabled true
 chat config validate          # 校验引用关系和默认项
 
@@ -140,6 +146,7 @@ tools = true                                    # 默认启用工具调用
 system_prompt_file = "~/.config/chat-cli/system.md" # 外部 system prompt 文件
 system_prompt_mode = "append"                   # append | override
 collapse_thinking = false                       # 是否折叠 <think> 输出
+context_status = "off"                          # off | always | latest | system-once
 
 [session]
 store_format = "jsonl"                          # 会话落盘格式
@@ -194,6 +201,13 @@ stream = true                                   # 此 profile 是否流式输出
 # [providers.deepseek]
 # api_key = "<redacted>"                        # 真正的密钥不要写进 config.toml
 ```
+
+`defaults.context_status` 和 `--context-status` 共有 4 种模式：
+
+- `off`：不注入状态
+- `always`：每轮用户消息前都注入状态，并保留到会话历史里
+- `latest`：只对当前这轮用户消息注入，回复完成后落盘原始用户消息，不保留注入状态
+- `system-once`：只在会话开始时作为一条 system message 注入一次，位置在初始 system prompt 之后，后续不再刷新
 
 ### `secrets.toml` 脱敏示例
 

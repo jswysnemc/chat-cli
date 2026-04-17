@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod config;
+mod context;
 mod error;
 mod media;
 mod output;

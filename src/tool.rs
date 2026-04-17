@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, expand_tilde};
 use crate::error::{AppError, AppResult, EXIT_ARGS};
+use crate::media::MessageImage;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,6 +59,7 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
+    pub images: Vec<MessageImage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +104,7 @@ struct ToolRuntimeContext<'a> {
 #[derive(Clone, Copy)]
 struct ToolHandler {
     spec: ToolSpec,
-    execute: fn(&ToolCall, &ToolRuntimeContext<'_>) -> AppResult<String>,
+    execute: fn(&ToolCall, &ToolRuntimeContext<'_>) -> AppResult<(String, Vec<MessageImage>)>,
 }
 
 /// Confirmation result from the user.
@@ -148,7 +150,7 @@ enum BashSessionUpdate {
 
 static BASH_SESSIONS: OnceLock<Mutex<BTreeMap<String, InteractiveBashSession>>> = OnceLock::new();
 
-const BUILTIN_TOOL_HANDLERS: [ToolHandler; 9] = [
+const BUILTIN_TOOL_HANDLERS: [ToolHandler; 10] = [
     ToolHandler {
         spec: ToolSpec {
             name: "ToolSearch",
@@ -274,6 +276,20 @@ const BUILTIN_TOOL_HANDLERS: [ToolHandler; 9] = [
             definition: define_skill_read_tool,
         },
         execute: execute_skill_read_tool,
+    },
+    ToolHandler {
+        spec: ToolSpec {
+            name: "Status",
+            aliases: &["status"],
+            description: "Get current environment status information including time, user, working directory, file tree, git info, and dev tool versions.",
+            search_hint: "get current environment status",
+            side_effects: ToolSideEffects::ReadOnly,
+            parallelism: ToolParallelism::ParallelSafe,
+            requires_confirmation: false,
+            defer_loading: true,
+            definition: define_status_tool,
+        },
+        execute: execute_status_tool,
     },
 ];
 
@@ -522,6 +538,29 @@ fn define_skill_read_tool() -> Value {
     })
 }
 
+fn define_status_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "Status",
+            "description": "Get current environment status information. Returns: current time, current user, working directory (with empty check), file tree (recursive up to 2 levels, ignoring common build/cache dirs), git repo status (branch, commit), OS info, and versions of common dev tools (python, node, rust, go, java).",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn execute_status_tool(
+    _call: &ToolCall,
+    _context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
+    print_tool_header("Status", "");
+    let content = crate::context::collect_context_status();
+    Ok((content, Vec::new()))
+}
+
 fn builtin_tool_handlers() -> &'static [ToolHandler] {
     &BUILTIN_TOOL_HANDLERS
 }
@@ -717,27 +756,28 @@ pub fn execute_tool(
         auto_confirm,
         config,
     };
-    let content = match find_tool_handler(&call.name) {
+    let (content, images) = match find_tool_handler(&call.name) {
         Some(handler) => (handler.execute)(call, &context)?,
-        None => format!("error: unknown tool '{}'", call.name),
+        None => (format!("error: unknown tool '{}'", call.name), Vec::new()),
     };
     Ok(ToolResult {
         tool_call_id: call.id.clone(),
         content,
+        images,
     })
 }
 
 fn execute_tool_search_tool(
     call: &ToolCall,
     _context: &ToolRuntimeContext<'_>,
-) -> AppResult<String> {
+) -> AppResult<(String, Vec<MessageImage>)> {
     let query = call.arguments["query"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "ToolSearch: missing 'query' argument"))?;
     let max_results = call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
     let matches = tool_search_matches(query, max_results);
     if matches.is_empty() {
-        return Ok("no matching tools found".to_string());
+        return Ok(("no matching tools found".to_string(), Vec::new()));
     }
     let results = matches
         .into_iter()
@@ -757,7 +797,7 @@ fn execute_tool_search_tool(
             })
         })
         .collect::<Vec<_>>();
-    serde_json::to_string_pretty(&json!({
+    let content = serde_json::to_string_pretty(&json!({
         "loaded_tools": results.iter().map(|item| item["name"].clone()).collect::<Vec<_>>(),
         "results": results,
     }))
@@ -766,10 +806,14 @@ fn execute_tool_search_tool(
             EXIT_ARGS,
             format!("failed to render ToolSearch results: {err}"),
         )
-    })
+    })?;
+    Ok((content, Vec::new()))
 }
 
-fn execute_read_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_read_tool(
+    call: &ToolCall,
+    _context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     let path = call.arguments["file_path"]
         .as_str()
         .or_else(|| call.arguments["path"].as_str())
@@ -780,10 +824,14 @@ fn execute_read_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppR
         .map(|value| value as usize);
     let limit = call.arguments["limit"].as_u64().map(|value| value as usize);
     print_tool_header("Read", &normalized);
-    tool_read(&normalized, offset, limit)
+    let (content, images) = tool_read(&normalized, offset, limit)?;
+    Ok((content, images))
 }
 
-fn execute_edit_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_edit_tool(
+    call: &ToolCall,
+    context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     let path = call.arguments["file_path"]
         .as_str()
         .or_else(|| call.arguments["path"].as_str())
@@ -815,24 +863,29 @@ fn execute_edit_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
         mode,
     );
     print_tool_preview(&render_diff_preview(&normalized, &diff));
-    match confirm_tool_action(action, Some(new_string), context.auto_confirm)? {
-        ConfirmResult::Yes => tool_edit(&normalized, old_string, new_string, replace_all),
-        ConfirmResult::No(None) => Ok("user declined the edit operation".to_string()),
-        ConfirmResult::No(Some(feedback)) => Ok(format!(
-            "user declined the edit operation. user feedback: {feedback}"
-        )),
-        ConfirmResult::Edit(replacement) => {
-            tool_edit(&normalized, old_string, &replacement, replace_all)
+    let content = match confirm_tool_action(action, Some(new_string), context.auto_confirm)? {
+        ConfirmResult::Yes => tool_edit(&normalized, old_string, new_string, replace_all)?,
+        ConfirmResult::No(None) => "user declined the edit operation".to_string(),
+        ConfirmResult::No(Some(feedback)) => {
+            format!("user declined the edit operation. user feedback: {feedback}")
         }
-    }
+        ConfirmResult::Edit(replacement) => {
+            tool_edit(&normalized, old_string, &replacement, replace_all)?
+        }
+    };
+    Ok((content, Vec::new()))
 }
 
-fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_bash_tool(
+    call: &ToolCall,
+    context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     if let Some(session_id) = call.arguments["session_id"].as_str() {
         print_tool_header("Bash", &format!("session {session_id}"));
         let input = call.arguments["input"].as_str();
         let close = call.arguments["close"].as_bool().unwrap_or(false);
-        return continue_bash_session(session_id, input, close);
+        let content = continue_bash_session(session_id, input, close)?;
+        return Ok((content, Vec::new()));
     }
 
     let command = call.arguments["command"]
@@ -840,17 +893,21 @@ fn execute_bash_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppRe
         .ok_or_else(|| AppError::new(EXIT_ARGS, "Bash: missing 'command' argument"))?;
     print_tool_header("Bash", &truncate_preview(command, 120));
     let auto_confirm = context.auto_confirm || is_read_only_bash_command(command);
-    match confirm_tool_action("run", Some(command), auto_confirm)? {
-        ConfirmResult::Yes => tool_bash(command),
-        ConfirmResult::No(None) => Ok("user declined the bash execution".to_string()),
-        ConfirmResult::No(Some(feedback)) => Ok(format!(
-            "user declined the bash execution. user feedback: {feedback}"
-        )),
-        ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd),
-    }
+    let content = match confirm_tool_action("run", Some(command), auto_confirm)? {
+        ConfirmResult::Yes => tool_bash(command)?,
+        ConfirmResult::No(None) => "user declined the bash execution".to_string(),
+        ConfirmResult::No(Some(feedback)) => {
+            format!("user declined the bash execution. user feedback: {feedback}")
+        }
+        ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd)?,
+    };
+    Ok((content, Vec::new()))
 }
 
-fn execute_grep_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_grep_tool(
+    call: &ToolCall,
+    _context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     let pattern = call.arguments["pattern"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "Grep: missing 'pattern' argument"))?;
@@ -863,47 +920,71 @@ fn execute_grep_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppR
         .as_str()
         .unwrap_or("files_with_matches");
     print_tool_header("Grep", &format!("/{pattern}/ in {normalized}"));
-    tool_grep(pattern, &normalized, include, output_mode)
+    let content = tool_grep(pattern, &normalized, include, output_mode)?;
+    Ok((content, Vec::new()))
 }
 
-fn execute_glob_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_glob_tool(
+    call: &ToolCall,
+    _context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     let pattern = call.arguments["pattern"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "Glob: missing 'pattern' argument"))?;
     let path = normalize_tool_path(call.arguments["path"].as_str().unwrap_or("."));
     print_tool_header("Glob", &format!("{pattern} in {path}"));
-    tool_glob(pattern, &path)
+    let content = tool_glob(pattern, &path)?;
+    Ok((content, Vec::new()))
 }
 
-fn execute_fetch_tool(call: &ToolCall, _context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_fetch_tool(
+    call: &ToolCall,
+    _context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     let url = call.arguments["url"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "WebFetch: missing 'url' argument"))?;
     print_tool_header("WebFetch", url);
-    tool_fetch(url)
+    let content = tool_fetch(url)?;
+    Ok((content, Vec::new()))
 }
 
 fn execute_skills_list_tool(
     call: &ToolCall,
     context: &ToolRuntimeContext<'_>,
-) -> AppResult<String> {
+) -> AppResult<(String, Vec<MessageImage>)> {
     let query = call.arguments["query"].as_str();
     print_tool_header("SkillsList", query.unwrap_or("all skills"));
-    tool_skills_list(query, context.config)
+    let content = tool_skills_list(query, context.config)?;
+    Ok((content, Vec::new()))
 }
 
-fn execute_skill_read_tool(call: &ToolCall, context: &ToolRuntimeContext<'_>) -> AppResult<String> {
+fn execute_skill_read_tool(
+    call: &ToolCall,
+    context: &ToolRuntimeContext<'_>,
+) -> AppResult<(String, Vec<MessageImage>)> {
     let name = call.arguments["name"]
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "skill_read tool: missing 'name' argument"))?;
     let scope = call.arguments["scope"].as_str();
     print_tool_header("SkillRead", name);
-    tool_skill_read(name, scope, context.config)
+    let content = tool_skill_read(name, scope, context.config)?;
+    Ok((content, Vec::new()))
 }
 
 // ─── Tool Implementations ───
 
-fn tool_read(path: &str, offset: Option<usize>, limit: Option<usize>) -> AppResult<String> {
+fn tool_read(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> AppResult<(String, Vec<MessageImage>)> {
+    let file_path = Path::new(path);
+    if file_path.exists() {
+        if let Some(image) = try_read_image_file(file_path) {
+            return Ok((format!("image file: {}", file_path.display()), vec![image]));
+        }
+    }
     let text = std::fs::read_to_string(path)
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read `{path}`: {err}")))?;
     let lines = text.lines().collect::<Vec<_>>();
@@ -926,7 +1007,13 @@ fn tool_read(path: &str, offset: Option<usize>, limit: Option<usize>) -> AppResu
             effective_limit
         ));
     }
-    Ok(output)
+    Ok((output, Vec::new()))
+}
+
+fn try_read_image_file(path: &Path) -> Option<MessageImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let media_type = crate::media::detect_image_media_type(path, &bytes)?;
+    Some(MessageImage::from_bytes(&bytes, media_type))
 }
 
 fn write_file_contents(path: &str, content: &str) -> AppResult<()> {
@@ -2695,7 +2782,8 @@ mod tests {
         assert!(names.contains(&"Bash"));
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Edit"));
-        assert_eq!(defs.len(), 8);
+        assert!(names.contains(&"Status"));
+        assert_eq!(defs.len(), 9);
     }
 
     #[test]

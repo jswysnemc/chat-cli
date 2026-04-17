@@ -1,5 +1,7 @@
 use crate::cli::OutputFormat;
+use crate::context::ContextStatusMode;
 use crate::error::{AppError, AppResult, EXIT_CONFIG, ResultCodeExt};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -114,6 +116,7 @@ pub struct DefaultsConfig {
     pub system_prompt_file: Option<String>,
     pub system_prompt_mode: Option<String>,
     pub collapse_thinking: Option<bool>,
+    pub context_status: Option<ContextStatusMode>,
 }
 
 impl Default for DefaultsConfig {
@@ -130,6 +133,7 @@ impl Default for DefaultsConfig {
             system_prompt_file: None,
             system_prompt_mode: Some("append".to_string()),
             collapse_thinking: Some(false),
+            context_status: Some(ContextStatusMode::Off),
         }
     }
 }
@@ -424,6 +428,12 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .collapse_thinking
             .unwrap_or(false)
             .to_string()),
+        "defaults.context_status" => Ok(config
+            .defaults
+            .context_status
+            .unwrap_or_default()
+            .as_str()
+            .to_string()),
         "session.store_format" => Ok(config
             .session
             .store_format
@@ -484,6 +494,9 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         },
         "defaults.collapse_thinking" => {
             config.defaults.collapse_thinking = Some(parse_bool(value)?);
+        }
+        "defaults.context_status" => {
+            config.defaults.context_status = Some(parse_context_status_mode(value)?);
         }
         "session.store_format" => config.session.store_format = Some(value.to_string()),
         "session.dir" => config.session.dir = Some(value.to_string()),
@@ -640,6 +653,22 @@ fn parse_u32(value: &str, key: &str) -> AppResult<u32> {
     Ok(parsed)
 }
 
+fn parse_context_status_mode(value: &str) -> AppResult<ContextStatusMode> {
+    ContextStatusMode::from_str(value, true).map_err(|_| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!(
+                "context_status must be one of: {}",
+                ContextStatusMode::value_variants()
+                    .iter()
+                    .map(|mode| mode.to_possible_value().unwrap().get_name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    })
+}
+
 fn parse_string_array(value: &str, key: &str) -> AppResult<Vec<String>> {
     serde_json::from_str::<Vec<String>>(value).map_err(|err| {
         AppError::new(
@@ -679,6 +708,20 @@ mod tests {
         set_config_value(&mut config, "tools.progressive_loading", "false").unwrap();
         assert_eq!(config.tools.max_rounds, Some(12));
         assert_eq!(config.tools.progressive_loading, Some(false));
+    }
+
+    #[test]
+    fn set_config_value_parses_context_status_mode() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "defaults.context_status", "latest").unwrap();
+        assert_eq!(
+            config.defaults.context_status,
+            Some(ContextStatusMode::Latest)
+        );
+        assert_eq!(
+            render_config_value(&config, "defaults.context_status").unwrap(),
+            "latest"
+        );
     }
 
     #[test]

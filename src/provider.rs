@@ -691,7 +691,14 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
                     let mut m = Map::new();
                     m.insert("role".to_string(), json!(msg.role));
                     if msg.role == "tool" {
-                        m.insert("content".to_string(), json!(msg.content));
+                        if msg.images.is_empty() {
+                            m.insert("content".to_string(), json!(msg.content));
+                        } else {
+                            m.insert(
+                                "content".to_string(),
+                                build_openai_message_content_value(msg),
+                            );
+                        }
                         if let Some(id) = &msg.tool_call_id {
                             m.insert("tool_call_id".to_string(), json!(id));
                         }

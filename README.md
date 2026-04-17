@@ -56,6 +56,9 @@ chat ask --new-session           # create new session
 chat ask --output json           # JSON output mode
 chat ask --stream                # streaming output
 chat ask --tools                 # enable tool calling
+chat ask --context-status always "Inspect this repo"
+chat ask --context-status latest "Only inject status for this turn"
+chat ask --context-status system-once --system "Be concise" "Start a new session"
 chat ask -i screenshot.png "Describe this UI"
 chat ask -I "What's in the clipboard image?"
 ```
@@ -69,6 +72,7 @@ chat repl
 chat repl --session <id>         # continue session
 chat repl --system <prompt>      # system prompt
 chat repl --multiline            # enable multiline input
+chat repl --context-status system-once
 ```
 
 ### `chat session`
@@ -95,6 +99,8 @@ chat config init                 # initialize config directory
 chat config path                 # print config/data/cache paths
 chat config show                 # show full config
 chat config get defaults.model   # read one config value
+chat config get defaults.context_status
+chat config set defaults.context_status system-once
 chat config set audit.enabled true
 chat config validate             # validate references and defaults
 
@@ -138,6 +144,7 @@ tools = true                                    # enable tool calling by default
 system_prompt_file = "~/.config/chat-cli/system.md" # external system prompt file
 system_prompt_mode = "append"                   # append | override
 collapse_thinking = false                       # collapse <think> blocks in rendered output
+context_status = "off"                          # off | always | latest | system-once
 
 [session]
 store_format = "jsonl"                          # on-disk session format
@@ -192,6 +199,13 @@ stream = true                                   # stream responses for this prof
 # [providers.deepseek]
 # api_key = "<redacted>"                        # keep real secrets out of config.toml
 ```
+
+`defaults.context_status` and `--context-status` accept 4 modes:
+
+- `off`: do not inject status
+- `always`: inject status before every user turn and keep it in session history
+- `latest`: inject status only for the current user turn, then persist the raw user message without the injected status
+- `system-once`: inject status once as a system message right after the initial system prompt for a session, then never refresh it again
 
 ### Sanitized `secrets.toml` Example
 
