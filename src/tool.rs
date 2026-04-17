@@ -401,11 +401,11 @@ fn define_bash_tool() -> Value {
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Continue an existing interactive bash session instead of starting a new command."
+                        "description": "Continue an existing interactive bash session instead of starting a new command. Only include this when resuming a real session_id returned by Bash; omit it for new commands and never send empty or placeholder values."
                     },
                     "input": {
                         "type": "string",
-                        "description": "Optional text to send to an existing interactive bash session. A trailing newline is added automatically."
+                        "description": "Optional text to send to an existing interactive bash session. A trailing newline is added automatically. Omit this field when you only want to poll for more output."
                     },
                     "close": {
                         "type": "boolean",
@@ -880,7 +880,7 @@ fn execute_bash_tool(
     call: &ToolCall,
     context: &ToolRuntimeContext<'_>,
 ) -> AppResult<(String, Vec<MessageImage>)> {
-    if let Some(session_id) = call.arguments["session_id"].as_str() {
+    if let Some(session_id) = tool_argument_non_empty_str(&call.arguments, "session_id") {
         print_tool_header("Bash", &format!("session {session_id}"));
         let input = call.arguments["input"].as_str();
         let close = call.arguments["close"].as_bool().unwrap_or(false);
@@ -902,6 +902,13 @@ fn execute_bash_tool(
         ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd)?,
     };
     Ok((content, Vec::new()))
+}
+
+fn tool_argument_non_empty_str<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn execute_grep_tool(
@@ -2942,6 +2949,59 @@ mod tests {
                 .iter()
                 .any(|session| session.session_id == session_id)
         );
+    }
+
+    #[test]
+    fn bash_tool_ignores_empty_session_id_when_starting_new_command() {
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "Bash".to_string(),
+            arguments: json!({
+                "command": "printf 'ok\\n'",
+                "session_id": "",
+                "input": "",
+                "close": false
+            }),
+        };
+
+        let result = execute_tool(&call, true, &AppConfig::default()).unwrap();
+        assert!(result.content.contains("ok"));
+        assert!(!result.content.contains("unknown interactive session"));
+    }
+
+    #[test]
+    fn bash_tool_ignores_whitespace_session_id_when_starting_new_command() {
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "Bash".to_string(),
+            arguments: json!({
+                "command": "printf 'trimmed\\n'",
+                "session_id": "   ",
+                "input": "",
+                "close": false
+            }),
+        };
+
+        let result = execute_tool(&call, true, &AppConfig::default()).unwrap();
+        assert!(result.content.contains("trimmed"));
+        assert!(!result.content.contains("unknown interactive session"));
+    }
+
+    #[test]
+    fn bash_tool_still_rejects_unknown_non_empty_session_id() {
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "Bash".to_string(),
+            arguments: json!({
+                "command": "printf 'unused\\n'",
+                "session_id": "0",
+                "input": "",
+                "close": false
+            }),
+        };
+
+        let err = execute_tool(&call, true, &AppConfig::default()).unwrap_err();
+        assert!(err.message.contains("unknown interactive session `0`"));
     }
 
     #[test]
