@@ -1193,44 +1193,19 @@ fn is_todo_tool_name(name: &str) -> bool {
 }
 
 fn render_todo_update(old_todos: &[TodoItem], new_todos: &[TodoItem]) -> String {
-    let action = if old_todos == new_todos {
-        "todo list unchanged"
+    let title = if old_todos == new_todos {
+        "Todo"
     } else {
-        "todo list updated"
+        "Updated Todo"
     };
-    let (pending, in_progress, completed) = todo_status_counts(new_todos);
-    let mut lines = vec![
-        format!("## {}", title_case(action)),
-        format!("{pending} pending, {in_progress} in progress, {completed} completed."),
-        String::new(),
-        "### Current".to_string(),
-    ];
-    lines.extend(render_todo_list(new_todos));
-    if !old_todos.is_empty() {
-        lines.push(String::new());
-        lines.push("### Previous".to_string());
-        lines.extend(render_todo_list(old_todos));
-    }
+    let mut lines = vec![title.to_string()];
+    lines.extend(render_compact_todo_lines(new_todos));
     lines.join("\n")
 }
 
-fn todo_status_counts(todos: &[TodoItem]) -> (usize, usize, usize) {
-    let mut pending = 0usize;
-    let mut in_progress = 0usize;
-    let mut completed = 0usize;
-    for todo in todos {
-        match todo.status {
-            TodoStatus::Pending => pending += 1,
-            TodoStatus::InProgress => in_progress += 1,
-            TodoStatus::Completed => completed += 1,
-        }
-    }
-    (pending, in_progress, completed)
-}
-
-fn render_todo_list(todos: &[TodoItem]) -> Vec<String> {
+fn render_compact_todo_lines(todos: &[TodoItem]) -> Vec<String> {
     if todos.is_empty() {
-        return vec!["- (empty)".to_string()];
+        return vec!["- [ ] (empty)".to_string()];
     }
     todos
         .iter()
@@ -1240,37 +1215,23 @@ fn render_todo_list(todos: &[TodoItem]) -> Vec<String> {
                 TodoStatus::Pending | TodoStatus::InProgress => "[ ]",
             };
             let mut line = format!("- {checkbox} {}", todo.content.trim());
-            let mut suffixes = Vec::new();
             if todo.status == TodoStatus::InProgress {
-                suffixes.push("in progress".to_string());
-            } else if todo.status == TodoStatus::Pending {
-                suffixes.push("pending".to_string());
-            }
-            if let Some(active_form) = todo.active_form.as_deref()
+                let active = todo
+                    .active_form
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::trim)
+                    .unwrap_or("in progress");
+                line.push_str(&format!(" _({active})_"));
+            } else if todo.status == TodoStatus::Pending
+                && let Some(active_form) = todo.active_form.as_deref()
                 && !active_form.trim().is_empty()
             {
-                suffixes.push(active_form.trim().to_string());
-            }
-            if !suffixes.is_empty() {
-                line.push_str(&format!(" _({})_", suffixes.join(" · ")));
+                line.push_str(&format!(" _({})_", active_form.trim()));
             }
             line
         })
         .collect()
-}
-
-fn title_case(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn write_file_contents(path: &str, content: &str) -> AppResult<()> {
@@ -3113,9 +3074,9 @@ mod tests {
         };
 
         let result = execute_tool_with_context(&call, true, &config, &transcript).unwrap();
-        assert!(result.content.contains("### Current"));
-        assert!(result.content.contains("### Previous"));
-        assert!(result.content.contains("Inspect codebase"));
+        assert!(result.content.contains("Updated Todo"));
+        assert!(!result.content.contains("### Previous"));
+        assert!(!result.content.contains("Inspect codebase"));
         assert!(result.content.contains("Run tests"));
         assert!(result.content.contains("Running tests"));
     }

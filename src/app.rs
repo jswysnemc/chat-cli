@@ -737,6 +737,7 @@ fn render_repl_runtime_panel(panel: &ReplRuntimePanel) -> String {
         ReplRuntimePanelKind::User => render_user_message_block(&panel.title, &panel.body),
         ReplRuntimePanelKind::Status => render_runtime_panel(&panel.title, &panel.body, CYAN),
         ReplRuntimePanelKind::Error => render_runtime_panel(&panel.title, &panel.body, RED),
+        ReplRuntimePanelKind::Todo => render_compact_runtime_panel(&panel.title, &panel.body, CYAN),
     }
 }
 
@@ -760,6 +761,44 @@ fn render_runtime_panel(title: &str, body: &str, accent: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{accent}{title}{RESET}\n{rendered}")
+}
+
+fn render_compact_runtime_panel(title: &str, body: &str, accent: &str) -> String {
+    let mut lines = vec![format!("{accent}• {title}{RESET}")];
+    let body_lines = if body.trim().is_empty() {
+        vec!["(empty)".to_string()]
+    } else {
+        body.lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    };
+    for (index, line) in body_lines.iter().enumerate() {
+        let prefix = if index == 0 { "└ " } else { "  " };
+        lines.push(format!("{accent}{prefix}{RESET}{line}"));
+    }
+    lines.join("\n")
+}
+
+fn render_repl_todo_lines(todos: &[TodoUiItem]) -> Vec<String> {
+    if todos.is_empty() {
+        return vec!["- [ ] (empty)".to_string()];
+    }
+    todos
+        .iter()
+        .map(|todo| {
+            let checkbox = match todo.status {
+                TodoUiStatus::Completed => "[x]",
+                TodoUiStatus::Pending | TodoUiStatus::InProgress => "[ ]",
+            };
+            let mut line = format!("- {checkbox} {}", todo.content.trim());
+            if let Some(active_form) = todo.active_form.as_deref()
+                && !active_form.trim().is_empty()
+            {
+                line.push_str(&format!(" _({})_", active_form.trim()));
+            }
+            line
+        })
+        .collect()
 }
 
 fn push_repl_panel(state: &mut ReplState, panel: ReplRuntimePanel) {
@@ -1406,16 +1445,6 @@ enum TodoUiStatus {
     Completed,
 }
 
-impl TodoUiStatus {
-    fn marker(&self) -> &'static str {
-        match self {
-            Self::Pending => "[ ]",
-            Self::InProgress => "[~]",
-            Self::Completed => "[x]",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct TodoUiItem {
     content: String,
@@ -1451,35 +1480,10 @@ fn latest_todo_items_from_events(events: &[SessionEvent]) -> Option<Vec<TodoUiIt
 }
 
 fn build_repl_todo_panel(todos: &[TodoUiItem]) -> ReplRuntimePanel {
-    let pending = todos
-        .iter()
-        .filter(|item| matches!(item.status, TodoUiStatus::Pending))
-        .count();
-    let in_progress = todos
-        .iter()
-        .filter(|item| matches!(item.status, TodoUiStatus::InProgress))
-        .count();
-    let completed = todos
-        .iter()
-        .filter(|item| matches!(item.status, TodoUiStatus::Completed))
-        .count();
-    let mut lines = vec![format!(
-        "{pending} pending, {in_progress} in progress, {completed} completed"
-    )];
-    lines.push(String::new());
-    lines.extend(todos.iter().map(|todo| {
-        let mut line = format!("{} {}", todo.status.marker(), todo.content.trim());
-        if let Some(active_form) = todo.active_form.as_deref()
-            && !active_form.trim().is_empty()
-        {
-            line.push_str(&format!(" ({})", active_form.trim()));
-        }
-        line
-    }));
     ReplRuntimePanel {
-        kind: ReplRuntimePanelKind::Status,
-        title: "Todo".to_string(),
-        body: lines.join("\n"),
+        kind: ReplRuntimePanelKind::Todo,
+        title: "Updated Todo".to_string(),
+        body: render_repl_todo_lines(todos).join("\n"),
     }
 }
 
@@ -1531,7 +1535,7 @@ fn print_tool_result_ui(
     if rendered.trim().is_empty() {
         return Ok(());
     }
-    writeln!(stdout, "{}", render_runtime_panel("Todo", &rendered, CYAN))
+    writeln!(stdout, "{rendered}")
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write Todo UI: {err}")))?;
     stdout
         .flush()
@@ -2551,6 +2555,7 @@ enum ReplRuntimePanelKind {
     Status,
     Error,
     User,
+    Todo,
 }
 
 #[derive(Debug, Clone)]
@@ -5836,10 +5841,10 @@ mod tests {
         sync_repl_todo_panel(&paths, &config, session_id, &mut state);
         let transcript = render_repl_transcript(&paths, &config, session_id, &state.panels, None);
 
-        assert!(transcript.contains("Todo"));
+        assert!(transcript.contains("• Updated Todo"));
         assert!(transcript.contains("Implement UI"));
         assert!(transcript.contains("Run tests"));
-        assert!(transcript.contains("1 pending, 1 in progress, 0 completed"));
+        assert!(!transcript.contains("1 pending, 1 in progress, 0 completed"));
 
         let _ = fs::remove_dir_all(base_dir);
     }
