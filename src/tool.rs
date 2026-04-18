@@ -700,7 +700,7 @@ pub fn continue_bash_session(
 }
 
 fn progressive_loading_enabled(config: &AppConfig) -> bool {
-    config.tools.progressive_loading.unwrap_or(true)
+    config.tools.progressive_loading.unwrap_or(false)
 }
 
 fn full_tool_definitions() -> Vec<Value> {

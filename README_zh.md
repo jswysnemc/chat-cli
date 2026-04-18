@@ -31,7 +31,7 @@ chat repl
 chat ask "解释这个报错"
 
 # 管道输入
-git diff | chat ask --stdin -P review
+git diff | chat ask --stdin "审查这个 diff"
 
 # 指定图片
 chat ask -i screenshot.png "描述这个界面"
@@ -44,6 +44,52 @@ chat session list
 
 # 配置 provider
 chat config provider set openai --kind openai_compatible --base-url https://api.openai.com/v1
+```
+
+## Shell 快捷命令示例
+
+如果你平时主要在 shell 里使用，可以在 `~/.zshrc` 或 `~/.bashrc` 里加入这些快捷命令：
+
+```bash
+alias ca='chat ask --stream'
+alias cn='chat ask --stream --new-session'
+alias ct='chat ask --stream --new-session --temp'
+```
+
+含义：
+
+- `ca`：流式单次提问或继续当前会话
+- `cn`：流式提问，并强制新建会话
+- `ct`：流式提问，并创建临时会话
+
+模型切换如果要配合 `fzf` 交互选择，建议写成函数，不要写成 alias：
+
+```bash
+ccm() {
+  chat config model use "$(chat --no-color config model list | fzf)"
+}
+```
+
+原因：
+
+- `alias` 不适合包裹这类带命令替换和交互选择的逻辑，可维护性较差
+- `chat config model list` 输出的是 `provider/remote_name`，正好可以直接传给 `chat config model use <target>`
+- 加上 `--no-color` 可以避免 ANSI 颜色干扰 `fzf`
+
+如果还想配合 `fzf` 快速切换会话，也可以加一个函数：
+
+```bash
+ccs() {
+  chat session switch "$(chat --no-color session list | fzf | awk '{print ($1=="*" ? $2 : $1)}')"
+}
+```
+
+修改完 shell 配置后，重新加载即可：
+
+```bash
+source ~/.zshrc
+# 或
+source ~/.bashrc
 ```
 
 ## 命令
@@ -129,6 +175,168 @@ chat config auth remove deepseek
 - 密钥：`~/.config/chat-cli/secrets.toml`
 - 会话：`~/.local/share/chat-cli/sessions/`
 
+先执行一次 `chat config init`。初始化生成的默认配置会把 `defaults.tools = true` 打开，也就是默认开启 tool calling；同时把 `tools.progressive_loading = false` 设为默认关闭。
+
+## API 接入说明
+
+完整接入分成 4 部分：
+
+1. 创建 provider
+2. 在该 provider 下创建一个或多个 model
+3. 配置鉴权
+4. 选择默认模型
+
+### 最小接入流程
+
+OpenAI 兼容接口示例：
+
+```bash
+chat config init
+
+chat config provider set openai \
+  --kind openai_compatible \
+  --base-url https://api.openai.com/v1
+
+chat config model set gpt-4.1 \
+  --provider openai \
+  --remote-name gpt-4.1 \
+  --capability chat
+
+chat config auth set openai --env OPENAI_API_KEY
+export OPENAI_API_KEY="<你的密钥>"
+
+chat config model use gpt-4.1
+chat config provider test openai
+chat ask "hello"
+```
+
+Anthropic 示例：
+
+```bash
+chat config provider set anthropic \
+  --kind anthropic
+
+chat config model set claude-sonnet-4-7 \
+  --provider anthropic \
+  --remote-name claude-sonnet-4-7 \
+  --capability chat \
+  --capability reasoning
+
+chat config auth set anthropic --env ANTHROPIC_API_KEY
+export ANTHROPIC_API_KEY="<你的密钥>"
+
+chat config model use claude-sonnet-4-7
+chat config provider test anthropic
+```
+
+本地 Ollama 示例：
+
+```bash
+chat config provider set ollama --kind ollama
+
+chat config model set qwen2.5 \
+  --provider ollama \
+  --remote-name qwen2.5 \
+  --capability chat
+
+chat config model use qwen2.5
+chat config provider test ollama
+```
+
+### 各配置项的含义
+
+#### Provider
+
+provider 用来定义如何连接上游 API。
+
+- `kind`：`openai_compatible`、`anthropic` 或 `ollama`
+- `base_url`：`openai_compatible` 必填；`anthropic` 和 `ollama` 可选
+- `api_key_env`：可选，从哪个环境变量读取 API key
+- `headers`：附加静态请求头，格式是 `KEY=VALUE`
+- `org`、`project`：OpenAI 兼容接口的附加头，会映射成 `OpenAI-Organization` 和 `OpenAI-Project`
+- `default_model`：provider 级的默认 model id
+- `timeout`：总请求超时秒数；`0` 表示不限制
+
+`base_url` 的行为：
+
+- `openai_compatible`：必须显式配置 `base_url`
+- `anthropic`：默认是 `https://api.anthropic.com/v1`
+- `ollama`：默认是 `http://localhost:11434/api`
+
+#### Model
+
+model 是本地别名和运行时元数据。
+
+- `id`：CLI 内部使用的本地 model id
+- `provider`：它归属的 provider id
+- `remote_name`：真正发给上游 API 的模型名
+- `capabilities`：功能声明，例如 `chat`、`reasoning`、`vision`
+- `reasoning_effort`：可选，兼容模型的推理强度提示
+- `patch_system_to_user`：可选，给部分 OpenAI 兼容后端使用的兼容 patch
+
+运行时的模型选择优先级：
+
+1. `--model`
+2. `defaults.model`
+3. `provider.default_model`
+
+如果选中的 model 不属于当前 provider，请求会直接报错。
+
+#### 鉴权
+
+API key 支持两种配置方式。
+
+使用环境变量：
+
+```bash
+chat config auth set openai --env OPENAI_API_KEY
+export OPENAI_API_KEY="<你的密钥>"
+```
+
+写入 `secrets.toml`：
+
+```bash
+chat config auth set openai --value "<你的密钥>"
+```
+
+解析优先级：
+
+1. `provider.api_key_env`
+2. `secrets.toml`
+
+注意：
+
+- 两边都存在时，环境变量优先
+- `ollama` 可以不配置 API key
+- `openai_compatible` 和 `anthropic` 一般都需要 API key
+- 不要把真实密钥写进 `config.toml`
+
+### 接入完成后常用命令
+
+```bash
+chat config show
+chat config validate
+chat config provider list
+chat config model list
+chat config auth status
+chat repl
+chat ask "解释这个报错"
+```
+
+### 需要注意的点
+
+- `provider set` 只创建上游接口入口，不会自动创建 model
+- `model set --remote-name` 必须和上游真实模型名一致
+- 如果要发送图片，model 必须包含 `vision` capability，否则会直接拒绝请求
+- `chat config provider test <id>` 只校验连通性和基础鉴权，不代表该 provider 下所有 model 都一定可用
+- 有些 OpenAI 兼容网关提供 `/models`，有些只支持 `/chat/completions`；当前健康检查在 `/models` 返回 404 时会自动回退
+- `defaults.tools = true` 表示 `ask` 和 `repl` 默认启用 tool calling；如果当前模型或网关对 tools 支持不好，可以执行 `chat config set defaults.tools false`
+- `tools.progressive_loading = false` 现在是默认值。测试结果表明，关闭渐进式加载时整体体验更好。开启后可能会节省一些 token，因为一开始只暴露 `ToolSearch`，但能力较弱的模型可能不知道当前有哪些工具，也不知道下一步该做什么
+- 如果更看重节省 token，而不是工具可发现性，可以执行 `chat config set tools.progressive_loading true`
+- `timeout = 0` 表示不限制总请求时长，长推理请求可能会等待很久
+- `chat config model use <target>` 支持本地 model id，例如 `gpt-4.1`，也支持 `provider/model` 形式，例如 `openai/gpt-4.1`
+- `chat config auth status` 会显示是否配置了环境变量名、该环境变量当前是否存在、以及文件密钥是否存在
+
 API 密钥应放在 `secrets.toml` 或环境变量里。下面的示例按照当前本地配置整理，但私有域名和用户专属路径已经做了脱敏或归一化处理。
 
 ### 当前配置脱敏版
@@ -154,7 +362,7 @@ store_format = "jsonl"                          # 会话落盘格式
 
 [tools]
 max_rounds = 20                                 # 单轮 ask/repl 最多允许多少轮工具调用
-progressive_loading = true                     # true: 先暴露 ToolSearch；false: 直接暴露全部工具 schema
+progressive_loading = false                    # false: 默认直接暴露全部工具 schema；true: 先暴露 ToolSearch 以节省部分 token
 
 [audit]
 enabled = true                                  # 启用危险工具审核子 agent
@@ -187,15 +395,6 @@ capabilities = ["chat", "reasoning"]           # 例如 chat reasoning vision im
 # reasoning_effort = "medium"                   # 可选，推理强度
 # [models.deepseek-reasoner-search.patches]
 # system_to_user = true                         # 可选，兼容性 patch
-
-[profiles.review]
-provider = "deepseek"                           # profile 级 provider 覆盖
-model = "deepseek-reasoner-search"              # profile 级 model 覆盖
-system = "You are a careful reviewer."          # 可选，内联 system prompt
-temperature = 0.2                               # 可选，运行时覆盖
-max_output_tokens = 8192                        # 可选，运行时覆盖
-output = "text"                                 # line | text | json | ndjson
-stream = true                                   # 此 profile 是否流式输出
 
 # secrets.toml
 # [providers.deepseek]

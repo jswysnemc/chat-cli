@@ -33,13 +33,59 @@ chat repl
 chat ask "Explain this error"
 
 # Use with pipe input
-git diff | chat ask --stdin -P review
+git diff | chat ask --stdin "Review this diff"
 
 # List sessions
 chat session list
 
 # Configure a provider
 chat config provider set openai --kind openai_compatible --base-url https://api.openai.com/v1
+```
+
+## Shell shortcuts
+
+If you use the tool mostly from a shell, you can add these shortcuts to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+alias ca='chat ask --stream'
+alias cn='chat ask --stream --new-session'
+alias ct='chat ask --stream --new-session --temp'
+```
+
+Meaning:
+
+- `ca`: streaming ask against the current session flow
+- `cn`: streaming ask with a forced new session
+- `ct`: streaming ask with a new temporary session
+
+For model switching with `fzf`, use a shell function rather than an alias:
+
+```bash
+ccm() {
+  chat config model use "$(chat --no-color config model list | fzf)"
+}
+```
+
+Why:
+
+- this kind of interactive command substitution is better expressed as a function
+- `chat config model list` prints `provider/remote_name`, which can be passed directly to `chat config model use <target>`
+- `--no-color` avoids ANSI color codes interfering with `fzf`
+
+If you also want fast session switching through `fzf`, add this function too:
+
+```bash
+ccs() {
+  chat session switch "$(chat --no-color session list | fzf | awk '{print ($1=="*" ? $2 : $1)}')"
+}
+```
+
+Reload your shell config after editing:
+
+```bash
+source ~/.zshrc
+# or
+source ~/.bashrc
 ```
 
 ## Commands
@@ -127,6 +173,168 @@ Default config locations (XDG compliant):
 - Secrets: `~/.config/chat-cli/secrets.toml`
 - Sessions: `~/.local/share/chat-cli/sessions/`
 
+Run `chat config init` first. The generated default config enables tool calling by default with `defaults.tools = true`, and disables progressive tool loading by default with `tools.progressive_loading = false`.
+
+## API Setup Guide
+
+The full setup consists of 4 parts:
+
+1. create a provider entry
+2. create one or more local model entries under that provider
+3. configure authentication
+4. select the default model
+
+### Minimal setup flow
+
+OpenAI-compatible example:
+
+```bash
+chat config init
+
+chat config provider set openai \
+  --kind openai_compatible \
+  --base-url https://api.openai.com/v1
+
+chat config model set gpt-4.1 \
+  --provider openai \
+  --remote-name gpt-4.1 \
+  --capability chat
+
+chat config auth set openai --env OPENAI_API_KEY
+export OPENAI_API_KEY="<your-key>"
+
+chat config model use gpt-4.1
+chat config provider test openai
+chat ask "hello"
+```
+
+Anthropic example:
+
+```bash
+chat config provider set anthropic \
+  --kind anthropic
+
+chat config model set claude-sonnet-4-7 \
+  --provider anthropic \
+  --remote-name claude-sonnet-4-7 \
+  --capability chat \
+  --capability reasoning
+
+chat config auth set anthropic --env ANTHROPIC_API_KEY
+export ANTHROPIC_API_KEY="<your-key>"
+
+chat config model use claude-sonnet-4-7
+chat config provider test anthropic
+```
+
+Local Ollama example:
+
+```bash
+chat config provider set ollama --kind ollama
+
+chat config model set qwen2.5 \
+  --provider ollama \
+  --remote-name qwen2.5 \
+  --capability chat
+
+chat config model use qwen2.5
+chat config provider test ollama
+```
+
+### What each config item means
+
+#### Provider
+
+A provider defines how to reach the upstream API.
+
+- `kind`: `openai_compatible`, `anthropic`, or `ollama`
+- `base_url`: required for `openai_compatible`; optional for `anthropic` and `ollama`
+- `api_key_env`: optional environment variable name for reading the API key
+- `headers`: extra static headers in `KEY=VALUE` form
+- `org`, `project`: OpenAI-compatible headers mapped to `OpenAI-Organization` and `OpenAI-Project`
+- `default_model`: provider-level fallback model id
+- `timeout`: total request timeout in seconds; `0` means disabled
+
+Base URL behavior:
+
+- `openai_compatible`: `base_url` is required
+- `anthropic`: defaults to `https://api.anthropic.com/v1`
+- `ollama`: defaults to `http://localhost:11434/api`
+
+#### Model
+
+A model entry is a local alias plus runtime metadata.
+
+- `id`: local model id used by this CLI
+- `provider`: the provider id it belongs to
+- `remote_name`: the exact upstream model name sent to the API
+- `capabilities`: feature declarations such as `chat`, `reasoning`, `vision`
+- `reasoning_effort`: optional reasoning hint for compatible models
+- `patch_system_to_user`: compatibility patch for some OpenAI-compatible backends
+
+Selection priority at runtime:
+
+1. `--model`
+2. `defaults.model`
+3. `provider.default_model`
+
+If the selected model belongs to another provider, the request is rejected.
+
+#### Authentication
+
+There are 2 supported ways to provide API keys:
+
+Use an environment variable:
+
+```bash
+chat config auth set openai --env OPENAI_API_KEY
+export OPENAI_API_KEY="<your-key>"
+```
+
+Store the key in `secrets.toml`:
+
+```bash
+chat config auth set openai --value "<your-key>"
+```
+
+Resolution order:
+
+1. `provider.api_key_env`
+2. `secrets.toml`
+
+Notes:
+
+- If both exist, the environment variable wins
+- `ollama` can work without an API key
+- `openai_compatible` and `anthropic` usually require an API key
+- Do not put the real key into `config.toml`
+
+### Common commands after setup
+
+```bash
+chat config show
+chat config validate
+chat config provider list
+chat config model list
+chat config auth status
+chat repl
+chat ask "Explain this error"
+```
+
+### Important notes
+
+- `provider set` only creates the upstream endpoint entry; it does not create models automatically
+- `model set --remote-name` must match the upstream model name exactly
+- To send images, the model must include capability `vision`; otherwise image requests are rejected
+- `chat config provider test <id>` only checks connectivity and basic authentication; it does not prove every model under that provider is valid
+- Some OpenAI-compatible gateways expose `/models`, some only allow `/chat/completions`; the health check already falls back when `/models` returns 404
+- `defaults.tools = true` means tool calling is enabled by default for `ask` and `repl`; if the current model/provider does not support tools well, turn it off with `chat config set defaults.tools false`
+- `tools.progressive_loading = false` is now the default. Testing showed that the overall experience is better when progressive loading is disabled. Turning it on may save some tokens because only `ToolSearch` is exposed first, but weaker models may fail to infer what tools are available or what they should do next
+- If you want token savings more than tool discoverability, enable it with `chat config set tools.progressive_loading true`
+- `timeout = 0` means there is no total request timeout; long reasoning requests may therefore wait for a long time
+- `chat config model use <target>` accepts either a local model id like `gpt-4.1` or a `provider/model` target like `openai/gpt-4.1`
+- `chat config auth status` shows whether an env var name is configured, whether that env var is currently present, and whether a file-based secret exists
+
 API keys should stay in `secrets.toml` or environment variables. The example below mirrors the current local setup, but private hosts and user-specific paths are intentionally redacted or normalized.
 
 ### Sanitized Current Config
@@ -152,7 +360,7 @@ store_format = "jsonl"                          # on-disk session format
 
 [tools]
 max_rounds = 20                                 # max tool-calling rounds per turn
-progressive_loading = true                     # true: expose ToolSearch first; false: expose all tool schemas upfront
+progressive_loading = false                    # false: expose all tool schemas upfront; true: expose ToolSearch first to save some tokens
 
 [audit]
 enabled = true                                  # enable the dangerous-tool audit subagent
@@ -185,15 +393,6 @@ capabilities = ["chat", "reasoning"]           # e.g. chat reasoning vision imag
 # reasoning_effort = "medium"                   # optional reasoning level
 # [models.deepseek-reasoner-search.patches]
 # system_to_user = true                         # optional compatibility patch
-
-[profiles.review]
-provider = "deepseek"                           # profile-level provider override
-model = "deepseek-reasoner-search"              # profile-level model override
-system = "You are a careful reviewer."          # optional inline system prompt
-temperature = 0.2                               # optional runtime override
-max_output_tokens = 8192                        # optional runtime override
-output = "text"                                 # line | text | json | ndjson
-stream = true                                   # stream responses for this profile
 
 # secrets.toml
 # [providers.deepseek]

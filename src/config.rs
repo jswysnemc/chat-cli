@@ -84,8 +84,6 @@ pub struct AppConfig {
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelConfig>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub profiles: BTreeMap<String, ProfileConfig>,
 }
 
 impl Default for AppConfig {
@@ -98,7 +96,6 @@ impl Default for AppConfig {
             skills: SkillsConfig::default(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
-            profiles: BTreeMap::new(),
         }
     }
 }
@@ -129,7 +126,7 @@ impl Default for DefaultsConfig {
             auto_create_session: Some(true),
             auto_save_session: Some(true),
             session_id_kind: Some("ulid".to_string()),
-            tools: None,
+            tools: Some(true),
             system_prompt_file: None,
             system_prompt_mode: Some("append".to_string()),
             collapse_thinking: Some(false),
@@ -163,7 +160,7 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             max_rounds: Some(20),
-            progressive_loading: Some(true),
+            progressive_loading: Some(false),
         }
     }
 }
@@ -240,17 +237,6 @@ pub struct ModelConfig {
     pub reasoning_effort: Option<String>,
     #[serde(default, skip_serializing_if = "ModelPatchConfig::is_empty")]
     pub patches: ModelPatchConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProfileConfig {
-    pub provider: String,
-    pub model: String,
-    pub system: Option<String>,
-    pub temperature: Option<f64>,
-    pub max_output_tokens: Option<u32>,
-    pub output: Option<OutputFormat>,
-    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -412,7 +398,7 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .auto_save_session
             .unwrap_or(true)
             .to_string()),
-        "defaults.tools" => Ok(config.defaults.tools.unwrap_or(false).to_string()),
+        "defaults.tools" => Ok(config.defaults.tools.unwrap_or(true).to_string()),
         "defaults.system_prompt_file" => Ok(config
             .defaults
             .system_prompt_file
@@ -441,9 +427,11 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .unwrap_or_else(|| "jsonl".to_string())),
         "session.dir" => Ok(config.session.dir.clone().unwrap_or_default()),
         "tools.max_rounds" => Ok(config.tools.max_rounds.unwrap_or(20).to_string()),
-        "tools.progressive_loading" => {
-            Ok(config.tools.progressive_loading.unwrap_or(true).to_string())
-        }
+        "tools.progressive_loading" => Ok(config
+            .tools
+            .progressive_loading
+            .unwrap_or(false)
+            .to_string()),
         "audit.enabled" => Ok(config.audit.enabled.unwrap_or(false).to_string()),
         "audit.model" => Ok(config.audit.model.clone().unwrap_or_default()),
         "audit.default_prompt_file" => {
@@ -690,8 +678,17 @@ mod tests {
             config.skills.paths,
             vec![".claude/skills", "~/.claude/skills"]
         );
+        assert_eq!(config.defaults.tools, Some(true));
+        assert_eq!(
+            render_config_value(&config, "defaults.tools").unwrap(),
+            "true"
+        );
         assert_eq!(config.tools.max_rounds, Some(20));
-        assert_eq!(config.tools.progressive_loading, Some(true));
+        assert_eq!(config.tools.progressive_loading, Some(false));
+        assert_eq!(
+            render_config_value(&config, "tools.progressive_loading").unwrap(),
+            "false"
+        );
     }
 
     #[test]
@@ -792,6 +789,24 @@ mod tests {
         assert!(default_text.contains("\"results\""));
         assert!(bash_text.contains("Bash"));
         assert!(edit_text.contains("文件编辑"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn init_config_files_enable_tools_by_default() {
+        let base = std::env::temp_dir().join(format!("chat-cli-init-test-{}", ulid::Ulid::new()));
+        let paths =
+            AppPaths::from_overrides(Some(base.join("config")), Some(base.join("data"))).unwrap();
+
+        init_config_files(&paths).unwrap();
+        let config = load_config(&paths).unwrap();
+        let config_text = fs::read_to_string(&paths.config_file).unwrap();
+
+        assert_eq!(config.defaults.tools, Some(true));
+        assert_eq!(config.tools.progressive_loading, Some(false));
+        assert!(config_text.contains("tools = true"));
+        assert!(config_text.contains("progressive_loading = false"));
 
         let _ = fs::remove_dir_all(base);
     }

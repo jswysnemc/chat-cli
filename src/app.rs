@@ -1094,7 +1094,7 @@ async fn handle_ask(
     secrets: &SecretsConfig,
     args: AskArgs,
 ) -> AppResult<()> {
-    let use_tools = args.tools || config.defaults.tools.unwrap_or(false);
+    let use_tools = args.tools || config.defaults.tools.unwrap_or(true);
     if use_tools {
         let output_fmt = if args.stream {
             Some(OutputFormat::Text)
@@ -2379,7 +2379,7 @@ async fn handle_repl(
     let mut first_turn = true;
     let mut repl_state = ReplState {
         stream: !args.no_stream || args.stream,
-        tools: args.tools || config.defaults.tools.unwrap_or(false),
+        tools: args.tools || config.defaults.tools.unwrap_or(true),
         context_status: crate::context::resolve_context_status_mode(
             args.context_status,
             config.defaults.context_status,
@@ -4648,7 +4648,7 @@ async fn execute_ask_with_tools(
             };
 
             for raw_call in &response.tool_calls {
-                if config.tools.progressive_loading.unwrap_or(true) {
+                if config.tools.progressive_loading.unwrap_or(false) {
                     for tool_name in discovered_tool_names_from_search(raw_call) {
                         loaded_tool_names.insert(tool_name);
                     }
