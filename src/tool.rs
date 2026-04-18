@@ -115,10 +115,9 @@ enum TodoStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TodoItem {
-    content: String,
+    title: String,
+    details: String,
     status: TodoStatus,
-    #[serde(default, alias = "activeForm")]
-    active_form: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -601,21 +600,21 @@ fn define_todo_write_tool() -> Value {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "content": {
+                                "title": {
                                     "type": "string",
-                                    "description": "Imperative task description, for example 'Run tests' or 'Implement todo tool'."
+                                    "description": "Short todo title shown in the rendered checklist."
+                                },
+                                "details": {
+                                    "type": "string",
+                                    "description": "Longer explanatory content describing what the plan is trying to accomplish."
                                 },
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
                                     "description": "Current task status."
-                                },
-                                "active_form": {
-                                    "type": "string",
-                                    "description": "Optional present-continuous form, for example 'Running tests'."
                                 }
                             },
-                            "required": ["content", "status"],
+                            "required": ["title", "details", "status"],
                             "additionalProperties": false
                         }
                     }
@@ -1146,20 +1145,16 @@ fn validate_todo_items(todos: &[TodoItem]) -> AppResult<()> {
         ));
     }
     for item in todos {
-        if item.content.trim().is_empty() {
+        if item.title.trim().is_empty() {
             return Err(AppError::new(
                 EXIT_ARGS,
-                "TodoWrite: todo content cannot be empty",
+                "TodoWrite: todo title cannot be empty",
             ));
         }
-        if item
-            .active_form
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
+        if item.details.trim().is_empty() {
             return Err(AppError::new(
                 EXIT_ARGS,
-                "TodoWrite: active_form cannot be empty when provided",
+                "TodoWrite: todo details cannot be empty",
             ));
         }
     }
@@ -1195,9 +1190,9 @@ fn is_todo_tool_name(name: &str) -> bool {
 
 fn render_todo_update(old_todos: &[TodoItem], new_todos: &[TodoItem]) -> String {
     let title = if old_todos == new_todos {
-        "Todo"
+        "Plan"
     } else {
-        "Updated Todo"
+        "Updated Plan"
     };
     let mut lines = vec![title.to_string()];
     lines.extend(render_compact_todo_lines(new_todos));
@@ -1206,33 +1201,23 @@ fn render_todo_update(old_todos: &[TodoItem], new_todos: &[TodoItem]) -> String 
 
 fn render_compact_todo_lines(todos: &[TodoItem]) -> Vec<String> {
     if todos.is_empty() {
-        return vec!["- [ ] (empty)".to_string()];
+        return vec!["└ (empty)".to_string()];
     }
-    todos
+    let details = todos
         .iter()
-        .map(|todo| {
-            let checkbox = match todo.status {
-                TodoStatus::Completed => "[x]",
-                TodoStatus::Pending | TodoStatus::InProgress => "[ ]",
-            };
-            let mut line = format!("- {checkbox} {}", todo.content.trim());
-            if todo.status == TodoStatus::InProgress {
-                let active = todo
-                    .active_form
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .map(str::trim)
-                    .unwrap_or("in progress");
-                line.push_str(&format!(" _({active})_"));
-            } else if todo.status == TodoStatus::Pending
-                && let Some(active_form) = todo.active_form.as_deref()
-                && !active_form.trim().is_empty()
-            {
-                line.push_str(&format!(" _({})_", active_form.trim()));
-            }
-            line
-        })
-        .collect()
+        .find(|todo| matches!(todo.status, TodoStatus::InProgress))
+        .map(|todo| todo.details.trim())
+        .or_else(|| todos.first().map(|todo| todo.details.trim()))
+        .unwrap_or("");
+    let mut lines = vec![format!("└ {details}")];
+    lines.extend(todos.iter().map(|todo| {
+        let marker = match todo.status {
+            TodoStatus::Completed => "✔",
+            TodoStatus::Pending | TodoStatus::InProgress => "□",
+        };
+        format!("  {marker} {}", todo.title.trim())
+    }));
+    lines
 }
 
 fn write_file_contents(path: &str, content: &str) -> AppResult<()> {
@@ -3035,8 +3020,8 @@ mod tests {
             name: "TodoWrite".to_string(),
             arguments: json!({
                 "todos": [
-                    {"content": "First", "status": "in_progress"},
-                    {"content": "Second", "status": "in_progress"}
+                    {"title": "First", "details": "First details", "status": "in_progress"},
+                    {"title": "Second", "details": "Second details", "status": "in_progress"}
                 ]
             }),
         };
@@ -3057,7 +3042,7 @@ mod tests {
                 "type": "function",
                 "function": {
                     "name": "TodoWrite",
-                    "arguments": "{\"todos\":[{\"content\":\"Inspect codebase\",\"status\":\"completed\"},{\"content\":\"Implement tool\",\"status\":\"in_progress\"}]}"
+                    "arguments": "{\"todos\":[{\"title\":\"Inspect codebase\",\"details\":\"Inspect the current repository structure.\",\"status\":\"completed\"},{\"title\":\"Implement tool\",\"details\":\"Implement the todo tool changes.\",\"status\":\"in_progress\"}]}"
                 }
             })]),
             tool_call_id: None,
@@ -3068,18 +3053,22 @@ mod tests {
             name: "TodoWrite".to_string(),
             arguments: json!({
                 "todos": [
-                    {"content": "Implement tool", "status": "completed"},
-                    {"content": "Run tests", "status": "in_progress", "active_form": "Running tests"}
+                    {"title": "Implement tool", "details": "Implement the todo tool changes.", "status": "completed"},
+                    {"title": "Run tests", "details": "Run the test suite after the tool changes.", "status": "in_progress"}
                 ]
             }),
         };
 
         let result = execute_tool_with_context(&call, true, &config, &transcript).unwrap();
-        assert!(result.content.contains("Updated Todo"));
-        assert!(!result.content.contains("### Previous"));
+        assert!(result.content.contains("Updated Plan"));
         assert!(!result.content.contains("Inspect codebase"));
-        assert!(result.content.contains("Run tests"));
-        assert!(result.content.contains("Running tests"));
+        assert!(
+            result
+                .content
+                .contains("Run the test suite after the tool changes.")
+        );
+        assert!(result.content.contains("✔ Implement tool"));
+        assert!(result.content.contains("□ Run tests"));
     }
 
     #[test]

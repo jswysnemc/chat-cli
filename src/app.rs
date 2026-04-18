@@ -37,8 +37,9 @@ use crate::tool::{
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::queue;
@@ -86,7 +87,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
 
     match cli.command {
         Commands::Ask(args) => handle_ask(&root, &paths, &config, &secrets, args).await,
-        Commands::Repl(args) => handle_repl(&root, &paths, &config, &secrets, args).await,
+        Commands::Repl(args) => handle_repl(&root, &paths, &mut config, &secrets, args).await,
         Commands::Session { command } => handle_session(&paths, &config, command),
         Commands::Config { command } => {
             handle_config(&paths, &mut config, &mut secrets, command).await
@@ -801,24 +802,23 @@ fn render_compact_runtime_panel(title: &str, body: &str, accent: &str) -> String
 
 fn render_repl_todo_lines(todos: &[TodoUiItem]) -> Vec<String> {
     if todos.is_empty() {
-        return vec!["- [ ] (empty)".to_string()];
+        return vec!["└ (empty)".to_string()];
     }
-    todos
+    let details = todos
         .iter()
-        .map(|todo| {
-            let checkbox = match todo.status {
-                TodoUiStatus::Completed => "[x]",
-                TodoUiStatus::Pending | TodoUiStatus::InProgress => "[ ]",
-            };
-            let mut line = format!("- {checkbox} {}", todo.content.trim());
-            if let Some(active_form) = todo.active_form.as_deref()
-                && !active_form.trim().is_empty()
-            {
-                line.push_str(&format!(" _({})_", active_form.trim()));
-            }
-            line
-        })
-        .collect()
+        .find(|todo| matches!(todo.status, TodoUiStatus::InProgress))
+        .map(|todo| todo.details.trim())
+        .or_else(|| todos.first().map(|todo| todo.details.trim()))
+        .unwrap_or("");
+    let mut lines = vec![details.to_string()];
+    lines.extend(todos.iter().map(|todo| {
+        let marker = match todo.status {
+            TodoUiStatus::Completed => "✔",
+            TodoUiStatus::Pending | TodoUiStatus::InProgress => "□",
+        };
+        format!("{marker} {}", todo.title.trim())
+    }));
+    lines
 }
 
 fn push_repl_panel(state: &mut ReplState, panel: ReplRuntimePanel) {
@@ -856,11 +856,12 @@ fn build_repl_status_panel(
     ];
     sections.push(String::new());
     sections.push("quick actions:".to_string());
-    sections.push("/provider  choose provider".to_string());
-    sections.push("/model     choose model".to_string());
-    sections.push("/stream    toggle streaming".to_string());
-    sections.push("/tools     toggle tool calling".to_string());
-    sections.push("/new       create a new session".to_string());
+    sections.push("/model       choose model".to_string());
+    sections.push("/sessions    switch session".to_string());
+    sections.push("/audit       toggle audit checks".to_string());
+    sections.push("/tool-search toggle progressive loading".to_string());
+    sections.push("/clear       clear current session history".to_string());
+    sections.push("/new         create a new session".to_string());
     ReplRuntimePanel {
         kind: ReplRuntimePanelKind::Status,
         title: "Status".to_string(),
@@ -1484,10 +1485,9 @@ enum TodoUiStatus {
 
 #[derive(Debug, Clone, Deserialize)]
 struct TodoUiItem {
-    content: String,
+    title: String,
+    details: String,
     status: TodoUiStatus,
-    #[serde(default, alias = "activeForm")]
-    active_form: Option<String>,
 }
 
 fn is_todo_tool_name(name: &str) -> bool {
@@ -1519,7 +1519,7 @@ fn latest_todo_items_from_events(events: &[SessionEvent]) -> Option<Vec<TodoUiIt
 fn build_repl_todo_panel(todos: &[TodoUiItem]) -> ReplRuntimePanel {
     ReplRuntimePanel {
         kind: ReplRuntimePanelKind::Todo,
-        title: "Updated Todo".to_string(),
+        title: "Updated Plan".to_string(),
         body: render_repl_todo_lines(todos).join("\n"),
     }
 }
@@ -1535,11 +1535,13 @@ fn sync_repl_todo_panel(
         .and_then(|events| latest_todo_items_from_events(&events))
         .filter(|items| !items.is_empty());
 
-    state.panels.retain(|panel| panel.title != "Todo");
+    state
+        .panels
+        .retain(|panel| panel.kind != ReplRuntimePanelKind::Todo);
     if state
         .transient_panel
         .as_ref()
-        .is_some_and(|panel| panel.title == "Todo")
+        .is_some_and(|panel| panel.kind == ReplRuntimePanelKind::Todo)
     {
         state.transient_panel = None;
     }
@@ -2268,95 +2270,81 @@ enum ReplDirective {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplSlashCommand {
-    Commands,
     Model,
-    Provider,
-    Stream,
-    Tools,
+    Session,
+    Audit,
+    ToolSearch,
     Status,
     New,
     Clear,
     Bash,
     Quit,
     Exit,
-    HelpAlias,
 }
 
 impl ReplSlashCommand {
     fn command(self) -> &'static str {
         match self {
-            ReplSlashCommand::Commands => "commands",
             ReplSlashCommand::Model => "model",
-            ReplSlashCommand::Provider => "provider",
-            ReplSlashCommand::Stream => "stream",
-            ReplSlashCommand::Tools => "tools",
+            ReplSlashCommand::Session => "sessions",
+            ReplSlashCommand::Audit => "audit",
+            ReplSlashCommand::ToolSearch => "tool-search",
             ReplSlashCommand::Status => "status",
             ReplSlashCommand::New => "new",
             ReplSlashCommand::Clear => "clear",
             ReplSlashCommand::Bash => "bash",
             ReplSlashCommand::Quit => "quit",
             ReplSlashCommand::Exit => "exit",
-            ReplSlashCommand::HelpAlias => "help",
         }
     }
 
     fn usage(self) -> &'static str {
         match self {
-            ReplSlashCommand::Commands => "/commands",
             ReplSlashCommand::Model => "/model [list [provider]|reset|<id>|<provider>/<model>]",
-            ReplSlashCommand::Provider => "/provider [list|reset|<id>]",
-            ReplSlashCommand::Stream => "/stream [on|off|toggle]",
-            ReplSlashCommand::Tools => "/tools [on|off|toggle]",
+            ReplSlashCommand::Session => "/sessions [list|current|switch <id>]",
+            ReplSlashCommand::Audit => "/audit [on|off|status]",
+            ReplSlashCommand::ToolSearch => "/tool-search [on|off|status]",
             ReplSlashCommand::Status => "/status",
             ReplSlashCommand::New => "/new [temp]",
             ReplSlashCommand::Clear => "/clear",
             ReplSlashCommand::Bash => "/bash ...",
             ReplSlashCommand::Quit => "/quit",
             ReplSlashCommand::Exit => "/exit",
-            ReplSlashCommand::HelpAlias => "/help",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            ReplSlashCommand::Commands => "show available REPL commands",
             ReplSlashCommand::Model => "choose the model for new turns",
-            ReplSlashCommand::Provider => "choose the provider for new turns",
-            ReplSlashCommand::Stream => "toggle streaming output",
-            ReplSlashCommand::Tools => "toggle tool calling for new turns",
+            ReplSlashCommand::Session => "list or switch chat sessions",
+            ReplSlashCommand::Audit => "toggle audit checks for dangerous tools",
+            ReplSlashCommand::ToolSearch => "toggle progressive tool loading",
             ReplSlashCommand::Status => "show current REPL session and runtime config",
             ReplSlashCommand::New => "start a new chat session",
-            ReplSlashCommand::Clear => "clear the terminal output",
+            ReplSlashCommand::Clear => "clear the current session history",
             ReplSlashCommand::Bash => "inspect or continue interactive bash sessions",
             ReplSlashCommand::Quit | ReplSlashCommand::Exit => "exit the REPL",
-            ReplSlashCommand::HelpAlias => "alias of /commands",
         }
-    }
-
-    fn visible(self) -> bool {
-        !matches!(self, ReplSlashCommand::HelpAlias)
     }
 }
 
 const REPL_SLASH_COMMANDS: &[ReplSlashCommand] = &[
-    ReplSlashCommand::Commands,
     ReplSlashCommand::Model,
-    ReplSlashCommand::Provider,
-    ReplSlashCommand::Stream,
-    ReplSlashCommand::Tools,
+    ReplSlashCommand::Session,
+    ReplSlashCommand::Audit,
+    ReplSlashCommand::ToolSearch,
     ReplSlashCommand::Status,
     ReplSlashCommand::New,
     ReplSlashCommand::Clear,
     ReplSlashCommand::Bash,
     ReplSlashCommand::Quit,
     ReplSlashCommand::Exit,
-    ReplSlashCommand::HelpAlias,
 ];
 
 async fn handle_repl(
     cli: &Cli,
     paths: &AppPaths,
-    config: &AppConfig,
+    config: &mut AppConfig,
     secrets: &SecretsConfig,
     args: ReplArgs,
 ) -> AppResult<()> {
@@ -2644,9 +2632,9 @@ enum ReplPopupAction {
 enum ReplSlashMode {
     Commands,
     Model,
-    Provider,
-    Stream,
-    Tools,
+    Session,
+    Audit,
+    ToolSearch,
     Bash,
 }
 
@@ -2655,9 +2643,9 @@ impl ReplSlashMode {
         match self {
             Self::Commands => None,
             Self::Model => Some("model"),
-            Self::Provider => Some("provider"),
-            Self::Stream => Some("stream"),
-            Self::Tools => Some("tools"),
+            Self::Session => Some("sessions"),
+            Self::Audit => Some("audit"),
+            Self::ToolSearch => Some("tool-search"),
             Self::Bash => Some("bash"),
         }
     }
@@ -2668,12 +2656,12 @@ impl ReplSlashMode {
 
     fn placeholder(self) -> &'static str {
         match self {
-            Self::Commands => "筛选斜杠命令，Enter 确认",
-            Self::Model => "筛选模型，Enter 确认",
-            Self::Provider => "筛选 provider，Enter 确认",
-            Self::Stream => "筛选 stream 选项，Enter 确认",
-            Self::Tools => "筛选 tools 选项，Enter 确认",
-            Self::Bash => "筛选 bash 子命令，Enter 确认",
+            Self::Commands => "Filter slash commands. Press Enter to apply.",
+            Self::Model => "Filter models. Press Enter to apply.",
+            Self::Session => "Filter sessions. Press Enter to switch.",
+            Self::Audit => "Choose an audit setting. Press Enter to apply.",
+            Self::ToolSearch => "Choose a tool search setting. Press Enter to apply.",
+            Self::Bash => "Choose a bash subcommand. Press Enter to apply.",
         }
     }
 }
@@ -2700,7 +2688,7 @@ impl ReplTerminalGuard {
             .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to enable raw mode: {err}")))?;
         let supports_keyboard_enhancement =
             matches!(terminal::supports_keyboard_enhancement(), Ok(true));
-        execute!(stdout, EnableBracketedPaste).map_err(|err| {
+        execute!(stdout, EnableBracketedPaste, EnableMouseCapture).map_err(|err| {
             AppError::new(
                 EXIT_ARGS,
                 format!("failed to initialize REPL terminal mode: {err}"),
@@ -2733,7 +2721,12 @@ impl Drop for ReplTerminalGuard {
         if self.supports_keyboard_enhancement {
             let _ = queue!(stdout, PopKeyboardEnhancementFlags);
         }
-        let _ = execute!(stdout, DisableBracketedPaste, cursor::Show);
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            cursor::Show
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -2756,7 +2749,7 @@ fn read_repl_tui_input(
     };
 
     loop {
-        let popup_model = repl_popup_model(&draft, cli, config, state);
+        let popup_model = repl_popup_model(&draft, cli, paths, config, state);
         sync_repl_popup_selection(&mut draft, popup_model.as_ref());
         render_repl_editor(stdout, &view, &draft, popup_model.as_ref())?;
         let event = event::read().map_err(|err| {
@@ -2768,6 +2761,21 @@ fn read_repl_tui_input(
                 clear_repl_transient_panel(state);
                 draft.esc_pending = false;
                 handle_pasted_text(&mut draft, text);
+            }
+            Event::Mouse(mouse) => {
+                clear_repl_transient_panel(state);
+                draft.esc_pending = false;
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        draft.transcript_scroll =
+                            transcript_scroll_page_up(&view.transcript, &draft, 3)?;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        draft.transcript_scroll =
+                            transcript_scroll_page_down(&view.transcript, &draft, 3)?;
+                    }
+                    _ => {}
+                }
             }
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 clear_repl_transient_panel(state);
@@ -2837,11 +2845,18 @@ fn read_repl_tui_input(
                                 images: Vec::new(),
                             });
                         }
+                        if draft.slash_mode.is_some() {
+                            draft.status = Some("No matching slash command.".to_string());
+                            continue;
+                        }
                         if draft.buffer.trim().is_empty()
                             && draft.images.is_empty()
                             && draft.collapsed_pastes.is_empty()
                         {
-                            draft.status = Some("输入为空，按 Ctrl+V 可附加剪贴板图片".to_string());
+                            draft.status = Some(
+                                "Input is empty. Press Ctrl+V to attach a clipboard image."
+                                    .to_string(),
+                            );
                             continue;
                         }
                         clear_repl_surface(stdout)?;
@@ -2928,12 +2943,14 @@ fn read_repl_tui_input(
                             draft.popup_signature = None;
                         } else if draft.collapsed_pastes.pop().is_some() {
                             draft.status = Some(format!(
-                                "已移除一段粘贴文本，剩余 {} 段",
+                                "Removed one pasted text block. {} remaining.",
                                 draft.collapsed_pastes.len()
                             ));
                         } else if draft.images.pop().is_some() {
-                            draft.status =
-                                Some(format!("已移除一张图片，剩余 {} 张", draft.images.len()));
+                            draft.status = Some(format!(
+                                "Removed one image. {} remaining.",
+                                draft.images.len()
+                            ));
                         }
                     }
                     KeyCode::Delete => {
@@ -2968,13 +2985,15 @@ fn read_repl_tui_input(
                     KeyCode::Esc => {
                         if draft.esc_pending {
                             clear_repl_text_input(&mut draft);
-                            draft.status = Some("已清空输入".to_string());
+                            draft.status = Some("Input cleared.".to_string());
                         } else {
                             draft.esc_pending = true;
                             if draft.slash_mode.is_some() {
-                                draft.status = Some("再次按 Esc 退出斜杠模式".to_string());
+                                draft.status =
+                                    Some("Press Esc again to leave slash mode.".to_string());
                             } else {
-                                draft.status = Some("再次按 Esc 清空输入".to_string());
+                                draft.status =
+                                    Some("Press Esc again to clear the input.".to_string());
                             }
                         }
                     }
@@ -3133,7 +3152,7 @@ fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> Rep
         let placeholder = draft
             .slash_mode
             .map(ReplSlashMode::placeholder)
-            .unwrap_or("输入消息，按 /commands 查看命令");
+            .unwrap_or("Type a message. Press /commands for help.");
         lines.push(format!("{prompt_prefix}{DIM}{placeholder}{RESET}"));
         (fixed_lines, prefix_width)
     } else {
@@ -3227,9 +3246,10 @@ fn popup_window_start(selected: usize, total_items: usize, visible_count: usize)
 
 fn repl_popup_model(
     draft: &ReplEditorDraft,
-    cli: &Cli,
+    _cli: &Cli,
+    paths: &AppPaths,
     config: &AppConfig,
-    state: &ReplState,
+    _state: &ReplState,
 ) -> Option<ReplPopupModel> {
     if let Some(mode) = draft.slash_mode {
         let query = draft.buffer.trim();
@@ -3243,14 +3263,14 @@ fn repl_popup_model(
                         ReplSlashCommand::Model => {
                             ReplPopupAction::EnterSlashMode(ReplSlashMode::Model)
                         }
-                        ReplSlashCommand::Provider => {
-                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Provider)
+                        ReplSlashCommand::Session => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Session)
                         }
-                        ReplSlashCommand::Stream => {
-                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Stream)
+                        ReplSlashCommand::Audit => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Audit)
                         }
-                        ReplSlashCommand::Tools => {
-                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Tools)
+                        ReplSlashCommand::ToolSearch => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::ToolSearch)
                         }
                         ReplSlashCommand::Bash => {
                             ReplPopupAction::EnterSlashMode(ReplSlashMode::Bash)
@@ -3259,10 +3279,16 @@ fn repl_popup_model(
                     },
                 })
                 .collect::<Vec<_>>(),
-            ReplSlashMode::Provider => build_repl_provider_popup_items(cli, config, state, query),
             ReplSlashMode::Model => build_repl_model_popup_items(config, query),
-            ReplSlashMode::Stream => build_repl_toggle_popup_items("stream", state.stream, query),
-            ReplSlashMode::Tools => build_repl_toggle_popup_items("tools", state.tools, query),
+            ReplSlashMode::Session => build_repl_session_popup_items(paths, config, query),
+            ReplSlashMode::Audit => {
+                build_repl_toggle_popup_items("audit", config.audit.enabled.unwrap_or(false), query)
+            }
+            ReplSlashMode::ToolSearch => build_repl_toggle_popup_items(
+                "tool-search",
+                config.tools.progressive_loading.unwrap_or(false),
+                query,
+            ),
             ReplSlashMode::Bash => build_repl_bash_popup_items(query),
         };
         if items.is_empty() {
@@ -3283,11 +3309,13 @@ fn repl_popup_model(
             detail: command.description().to_string(),
             action: match command {
                 ReplSlashCommand::Model => ReplPopupAction::EnterSlashMode(ReplSlashMode::Model),
-                ReplSlashCommand::Provider => {
-                    ReplPopupAction::EnterSlashMode(ReplSlashMode::Provider)
+                ReplSlashCommand::Session => {
+                    ReplPopupAction::EnterSlashMode(ReplSlashMode::Session)
                 }
-                ReplSlashCommand::Stream => ReplPopupAction::EnterSlashMode(ReplSlashMode::Stream),
-                ReplSlashCommand::Tools => ReplPopupAction::EnterSlashMode(ReplSlashMode::Tools),
+                ReplSlashCommand::Audit => ReplPopupAction::EnterSlashMode(ReplSlashMode::Audit),
+                ReplSlashCommand::ToolSearch => {
+                    ReplPopupAction::EnterSlashMode(ReplSlashMode::ToolSearch)
+                }
                 ReplSlashCommand::Bash => ReplPopupAction::EnterSlashMode(ReplSlashMode::Bash),
                 _ => ReplPopupAction::SubmitPrompt(format!("/{}", command.command())),
             },
@@ -3300,6 +3328,51 @@ fn repl_popup_model(
         signature: first_line.to_string(),
         items,
     })
+}
+
+fn build_repl_session_popup_items(
+    paths: &AppPaths,
+    config: &AppConfig,
+    query: &str,
+) -> Vec<ReplPopupItem> {
+    let current = load_state(paths)
+        .ok()
+        .and_then(|state| state.current_session);
+    let mut items = vec![ReplPopupItem {
+        label: "list".to_string(),
+        detail: "show saved sessions".to_string(),
+        action: ReplPopupAction::SubmitPrompt("/sessions list".to_string()),
+    }];
+    if let Some(current_session) = current.as_deref() {
+        items.push(ReplPopupItem {
+            label: "current".to_string(),
+            detail: format!("active {}", short_id(current_session)),
+            action: ReplPopupAction::SubmitPrompt("/sessions current".to_string()),
+        });
+    }
+    let summaries = list_session_summaries(paths, config, current.as_deref()).unwrap_or_default();
+    for summary in summaries {
+        let short = short_id(&summary.session_id);
+        if !matches_popup_query(&short, query)
+            && !summary
+                .first_prompt
+                .as_deref()
+                .is_some_and(|prompt| matches_popup_query(prompt, query))
+        {
+            continue;
+        }
+        let detail = summary
+            .first_prompt
+            .as_deref()
+            .map(|prompt| truncate_plain_to_width(prompt, 36))
+            .unwrap_or_else(|| "(empty)".to_string());
+        items.push(ReplPopupItem {
+            label: short.clone(),
+            detail,
+            action: ReplPopupAction::SubmitPrompt(format!("/sessions switch {short}")),
+        });
+    }
+    items
 }
 
 fn build_repl_bash_popup_items(query: &str) -> Vec<ReplPopupItem> {
@@ -3315,38 +3388,6 @@ fn build_repl_bash_popup_items(query: &str) -> Vec<ReplPopupItem> {
         action: ReplPopupAction::SubmitPrompt(format!("/bash {label}")),
     })
     .collect()
-}
-
-fn build_repl_provider_popup_items(
-    cli: &Cli,
-    config: &AppConfig,
-    state: &ReplState,
-    query: &str,
-) -> Vec<ReplPopupItem> {
-    let current = repl_effective_provider_id(cli, config, state);
-    let mut items = vec![ReplPopupItem {
-        label: "reset".to_string(),
-        detail: "use CLI/config default provider".to_string(),
-        action: ReplPopupAction::SubmitPrompt("/provider reset".to_string()),
-    }];
-    let mut providers = config.providers.iter().collect::<Vec<_>>();
-    providers.sort_by(|left, right| left.0.cmp(right.0));
-    for (provider_id, provider) in providers {
-        if !matches_popup_query(provider_id, query) {
-            continue;
-        }
-        let detail = if current.as_deref() == Some(provider_id.as_str()) {
-            format!("current · {}", provider.kind)
-        } else {
-            provider.kind.clone()
-        };
-        items.push(ReplPopupItem {
-            label: provider_id.clone(),
-            detail,
-            action: ReplPopupAction::SubmitPrompt(format!("/provider {provider_id}")),
-        });
-    }
-    items
 }
 
 fn build_repl_model_popup_items(config: &AppConfig, query: &str) -> Vec<ReplPopupItem> {
@@ -3376,15 +3417,16 @@ fn build_repl_model_popup_items(config: &AppConfig, query: &str) -> Vec<ReplPopu
 }
 
 fn build_repl_toggle_popup_items(name: &str, current: bool, query: &str) -> Vec<ReplPopupItem> {
-    ["on", "off", "toggle"]
+    ["status", "on", "off"]
         .into_iter()
         .filter(|value| matches_popup_query(value, query))
         .map(|value| ReplPopupItem {
             label: value.to_string(),
-            detail: if (value == "on" && current) || (value == "off" && !current) {
-                "current".to_string()
-            } else {
-                "set runtime option".to_string()
+            detail: match value {
+                "status" => format!("current {}", if current { "on" } else { "off" }),
+                "on" if current => "current".to_string(),
+                "off" if !current => "current".to_string(),
+                _ => "update config".to_string(),
             },
             action: ReplPopupAction::SubmitPrompt(format!("/{name} {value}")),
         })
@@ -3837,7 +3879,18 @@ fn manual_repl_slash_prompt(draft: &ReplEditorDraft) -> Option<String> {
     let mode = draft.slash_mode?;
     let query = draft.buffer.trim();
     match mode {
-        ReplSlashMode::Commands => (!query.is_empty()).then(|| format!("/{query}")),
+        ReplSlashMode::Commands => {
+            if query.is_empty() {
+                None
+            } else {
+                Some(format!("/{query}"))
+            }
+        }
+        ReplSlashMode::Audit | ReplSlashMode::ToolSearch | ReplSlashMode::Bash
+            if query.is_empty() =>
+        {
+            None
+        }
         _ => mode.command().map(|command| {
             if query.is_empty() {
                 format!("/{command}")
@@ -3952,7 +4005,7 @@ fn display_width_char(ch: char) -> usize {
 fn handle_repl_directive(
     input: ReplInput,
     state: &mut ReplState,
-    stdout: &mut io::Stdout,
+    _stdout: &mut io::Stdout,
     cli: &Cli,
     paths: &AppPaths,
     config: &AppConfig,
@@ -3970,33 +4023,27 @@ fn handle_repl_directive(
 
     if let Some((command, rest)) = parse_repl_slash_command(trimmed) {
         match command {
-            ReplSlashCommand::Commands | ReplSlashCommand::HelpAlias => {
-                print_repl_commands();
-                return Ok(ReplDirective::Continue);
-            }
             ReplSlashCommand::Exit | ReplSlashCommand::Quit => {
                 return Ok(ReplDirective::Exit);
             }
             ReplSlashCommand::Clear => {
-                execute!(stdout, Clear(ClearType::All), MoveTo(0, 0)).map_err(|err| {
-                    AppError::new(EXIT_ARGS, format!("failed to clear terminal: {err}"))
-                })?;
-                return Ok(ReplDirective::Continue);
-            }
-            ReplSlashCommand::Stream => {
-                handle_repl_stream_command(state, rest);
-                return Ok(ReplDirective::Continue);
-            }
-            ReplSlashCommand::Tools => {
-                handle_repl_tools_command(state, rest);
-                return Ok(ReplDirective::Continue);
-            }
-            ReplSlashCommand::Provider => {
-                handle_repl_provider_command(cli, config, state, rest)?;
+                handle_repl_clear_command(paths, config, session_id, first_turn, temp)?;
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::Model => {
                 handle_repl_model_command(cli, config, state, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Session => {
+                handle_repl_session_command(paths, config, session_id, first_turn, temp, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Audit => {
+                handle_repl_audit_command(paths, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::ToolSearch => {
+                handle_repl_tool_search_command(paths, rest)?;
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::Bash => {
@@ -4064,12 +4111,11 @@ fn parse_repl_slash_command(input: &str) -> Option<(ReplSlashCommand, &str)> {
         None => (stripped, ""),
     };
     let command = match name {
-        "" | "commands" => ReplSlashCommand::Commands,
-        "help" => ReplSlashCommand::HelpAlias,
+        "" | "commands" => return None,
         "model" => ReplSlashCommand::Model,
-        "provider" => ReplSlashCommand::Provider,
-        "stream" => ReplSlashCommand::Stream,
-        "tools" => ReplSlashCommand::Tools,
+        "sessions" | "session" => ReplSlashCommand::Session,
+        "audit" => ReplSlashCommand::Audit,
+        "tool-search" | "toolsearch" => ReplSlashCommand::ToolSearch,
         "status" => ReplSlashCommand::Status,
         "new" => ReplSlashCommand::New,
         "clear" => ReplSlashCommand::Clear,
@@ -4082,11 +4128,7 @@ fn parse_repl_slash_command(input: &str) -> Option<(ReplSlashCommand, &str)> {
 }
 
 fn visible_repl_slash_commands() -> Vec<ReplSlashCommand> {
-    REPL_SLASH_COMMANDS
-        .iter()
-        .copied()
-        .filter(|command| command.visible())
-        .collect()
+    REPL_SLASH_COMMANDS.to_vec()
 }
 
 fn filtered_repl_slash_commands(query: &str) -> Vec<ReplSlashCommand> {
@@ -4103,93 +4145,124 @@ fn filtered_repl_slash_commands(query: &str) -> Vec<ReplSlashCommand> {
         .collect()
 }
 
-fn print_repl_commands() {
-    for command in visible_repl_slash_commands() {
-        println!("{:<24} {}", command.usage(), command.description());
-    }
-}
-
-fn handle_repl_stream_command(state: &mut ReplState, mode: &str) {
-    match mode {
-        "" => println!("stream: {}", if state.stream { "on" } else { "off" }),
-        "on" => {
-            state.stream = true;
-            println!("stream enabled");
-        }
-        "off" => {
-            state.stream = false;
-            println!("stream disabled");
-        }
-        "toggle" => {
-            state.stream = !state.stream;
-            println!("stream: {}", if state.stream { "on" } else { "off" });
-        }
-        _ => println!("usage: {}", ReplSlashCommand::Stream.usage()),
-    }
-}
-
-fn handle_repl_tools_command(state: &mut ReplState, mode: &str) {
-    match mode {
-        "" => println!("tools: {}", if state.tools { "on" } else { "off" }),
-        "on" => {
-            state.tools = true;
-            println!("tools enabled");
-        }
-        "off" => {
-            state.tools = false;
-            println!("tools disabled");
-        }
-        "toggle" => {
-            state.tools = !state.tools;
-            println!("tools: {}", if state.tools { "on" } else { "off" });
-        }
-        _ => println!("usage: {}", ReplSlashCommand::Tools.usage()),
-    }
-}
-
-fn handle_repl_provider_command(
-    cli: &Cli,
+fn handle_repl_clear_command(
+    paths: &AppPaths,
     config: &AppConfig,
-    state: &mut ReplState,
+    session_id: &mut String,
+    first_turn: &mut bool,
+    temp: bool,
+) -> AppResult<()> {
+    let current = session_id.clone();
+    let next = if temp {
+        generate_temp_session_id()
+    } else {
+        generate_session_id()
+    };
+    set_current_session(paths, config, Some(&next), temp)?;
+    delete_session(paths, config, &current)?;
+    *session_id = next.clone();
+    *first_turn = true;
+    println!(
+        "cleared session {}; new session {}",
+        short_id(&current),
+        short_id(&next)
+    );
+    Ok(())
+}
+
+fn handle_repl_session_command(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &mut String,
+    first_turn: &mut bool,
+    temp: bool,
     rest: &str,
 ) -> AppResult<()> {
     match rest {
         "" | "list" => {
-            print_repl_provider_choices(cli, config, state);
+            let current = load_state(paths)?.current_session;
+            for summary in list_session_summaries(paths, config, current.as_deref())? {
+                println!("{}", format_session_list_entry(&summary));
+            }
             Ok(())
         }
-        "reset" => {
-            state.provider_override = None;
-            state.model_override = None;
-            println!(
-                "provider reset to {}",
-                repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string())
-            );
+        "current" => {
+            println!("{}", short_id(session_id));
             Ok(())
         }
-        provider_id => {
-            if !config.providers.contains_key(provider_id) {
-                return Err(AppError::new(
-                    EXIT_PROVIDER,
-                    format!("provider `{provider_id}` does not exist"),
-                ));
-            }
-            state.provider_override = Some(provider_id.to_string());
-            if state.model_override.as_ref().is_some_and(|model_id| {
-                config
-                    .models
-                    .get(model_id)
-                    .is_some_and(|model| model.provider != provider_id)
-            }) {
-                state.model_override = None;
-            }
-            match repl_effective_model_id(cli, config, state) {
-                Some(model_id) => println!("provider set to {provider_id} model={model_id}"),
-                None => println!("provider set to {provider_id}; no model resolved, use /model"),
-            }
+        _ if rest.starts_with("switch ") => {
+            let id = rest["switch ".len()..].trim();
+            let resolved = resolve_session_id(paths, config, id)?;
+            let session_temp = is_temp_session(&resolved) || temp;
+            set_current_session(paths, config, Some(&resolved), session_temp)?;
+            *session_id = resolved.clone();
+            *first_turn = true;
+            println!("switched to {}", short_id(&resolved));
+            Ok(())
+        }
+        _ => {
+            println!("usage: {}", ReplSlashCommand::Session.usage());
             Ok(())
         }
     }
+}
+
+fn handle_repl_audit_command(paths: &AppPaths, rest: &str) -> AppResult<()> {
+    let mut config = load_config(paths)?;
+    apply_runtime_config_defaults(paths, &mut config);
+    match rest {
+        "" | "status" => {
+            println!(
+                "audit: {}",
+                if config.audit.enabled.unwrap_or(false) {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
+        "on" => {
+            config.audit.enabled = Some(true);
+            save_config(paths, &config)?;
+            println!("audit enabled");
+        }
+        "off" => {
+            config.audit.enabled = Some(false);
+            save_config(paths, &config)?;
+            println!("audit disabled");
+        }
+        _ => println!("usage: {}", ReplSlashCommand::Audit.usage()),
+    }
+    Ok(())
+}
+
+fn handle_repl_tool_search_command(paths: &AppPaths, rest: &str) -> AppResult<()> {
+    let mut config = load_config(paths)?;
+    apply_runtime_config_defaults(paths, &mut config);
+    match rest {
+        "" | "status" => {
+            println!(
+                "tool-search: {}",
+                if config.tools.progressive_loading.unwrap_or(false) {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+        }
+        "on" => {
+            config.tools.progressive_loading = Some(true);
+            save_config(paths, &config)?;
+            println!("tool-search enabled");
+        }
+        "off" => {
+            config.tools.progressive_loading = Some(false);
+            save_config(paths, &config)?;
+            println!("tool-search disabled");
+        }
+        _ => println!("usage: {}", ReplSlashCommand::ToolSearch.usage()),
+    }
+    Ok(())
 }
 
 fn handle_repl_model_command(
@@ -4227,24 +4300,6 @@ fn handle_repl_model_command(
             println!("model set to {model_id} provider={provider_id}");
             Ok(())
         }
-    }
-}
-
-fn print_repl_provider_choices(cli: &Cli, config: &AppConfig, state: &ReplState) {
-    let current = repl_effective_provider_id(cli, config, state);
-    println!(
-        "provider {}",
-        current.clone().unwrap_or_else(|| "-".to_string())
-    );
-    let mut providers = config.providers.keys().cloned().collect::<Vec<_>>();
-    providers.sort();
-    for provider_id in providers {
-        let marker = if current.as_deref() == Some(provider_id.as_str()) {
-            "*"
-        } else {
-            " "
-        };
-        println!("{marker} {provider_id}");
     }
 }
 
@@ -5497,85 +5552,56 @@ mod tests {
     }
 
     #[test]
-    fn repl_stream_command_toggles_runtime_state() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
-        let mut state = ReplState {
-            stream: true,
-            ..ReplState::default()
-        };
-        let mut stdout = io::stdout();
-        let directive = handle_repl_directive(
-            ReplInput {
-                prompt: "/stream off".to_string(),
-                images: Vec::new(),
-            },
-            &mut state,
-            &mut stdout,
-            &cli,
-            &paths,
-            &config,
-            &mut session_id,
-            &mut first_turn,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(directive, ReplDirective::Continue));
-        assert!(!state.stream);
+    fn repl_audit_command_updates_config() {
+        let (paths, base_dir) = test_paths();
+        handle_repl_audit_command(&paths, "on").unwrap();
+        let config = load_config(&paths).unwrap();
+        assert_eq!(config.audit.enabled, Some(true));
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
-    fn repl_tools_command_toggles_runtime_state() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
-        let mut state = ReplState {
-            tools: true,
-            ..ReplState::default()
-        };
-        let mut stdout = io::stdout();
-        let directive = handle_repl_directive(
-            ReplInput {
-                prompt: "/tools off".to_string(),
-                images: Vec::new(),
-            },
-            &mut state,
-            &mut stdout,
-            &cli,
-            &paths,
-            &config,
-            &mut session_id,
-            &mut first_turn,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(directive, ReplDirective::Continue));
-        assert!(!state.tools);
+    fn repl_tool_search_command_updates_config() {
+        let (paths, base_dir) = test_paths();
+        handle_repl_tool_search_command(&paths, "on").unwrap();
+        let config = load_config(&paths).unwrap();
+        assert_eq!(config.tools.progressive_loading, Some(true));
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
-    fn repl_provider_command_updates_runtime_target() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
-        let mut state = ReplState::default();
-        let mut stdout = io::stdout();
-        let directive = handle_repl_directive(
-            ReplInput {
-                prompt: "/provider deepseek".to_string(),
+    fn repl_session_command_switches_session() {
+        let (paths, base_dir) = test_paths();
+        let config = test_config();
+        append_events(
+            &paths,
+            &config,
+            "sess_alpha",
+            &[SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
                 images: Vec::new(),
-            },
-            &mut state,
-            &mut stdout,
-            &cli,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            })],
+        )
+        .unwrap();
+        let mut session_id = "sess_test_repl".to_string();
+        let mut first_turn = false;
+        handle_repl_session_command(
             &paths,
             &config,
             &mut session_id,
             &mut first_turn,
             false,
+            "switch alpha",
         )
         .unwrap();
-        assert!(matches!(directive, ReplDirective::Continue));
-        assert_eq!(state.provider_override.as_deref(), Some("deepseek"));
-        assert_eq!(
-            repl_effective_model_id(&cli, &config, &state).as_deref(),
-            Some("deepseek-reasoner-search")
-        );
+        assert_eq!(session_id, "sess_alpha");
+        assert!(first_turn);
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -5636,24 +5662,24 @@ mod tests {
     }
 
     #[test]
-    fn visible_repl_commands_exclude_help() {
+    fn visible_repl_commands_match_new_command_set() {
         let commands = visible_repl_slash_commands()
             .into_iter()
             .map(|command| command.command())
             .collect::<Vec<_>>();
-        assert!(commands.contains(&"commands"));
         assert!(commands.contains(&"model"));
-        assert!(commands.contains(&"provider"));
-        assert!(commands.contains(&"status"));
-        assert!(commands.contains(&"tools"));
-        assert!(!commands.contains(&"help"));
+        assert!(commands.contains(&"sessions"));
+        assert!(commands.contains(&"audit"));
+        assert!(commands.contains(&"tool-search"));
+        assert!(!commands.contains(&"provider"));
+        assert!(!commands.contains(&"tools"));
+        assert!(!commands.contains(&"stream"));
     }
 
     #[test]
-    fn parse_repl_slash_command_maps_help_to_alias() {
-        let (command, rest) = parse_repl_slash_command("/help").unwrap();
-        assert_eq!(command, ReplSlashCommand::HelpAlias);
-        assert_eq!(rest, "");
+    fn parse_repl_slash_command_rejects_commands_alias() {
+        assert!(parse_repl_slash_command("/commands").is_none());
+        assert!(parse_repl_slash_command("/help").is_none());
     }
 
     #[test]
@@ -5662,10 +5688,9 @@ mod tests {
             .into_iter()
             .map(|command| command.command())
             .collect::<Vec<_>>();
-        assert!(commands.contains(&"commands"));
         assert!(commands.contains(&"status"));
-        assert!(commands.contains(&"stream"));
-        assert!(!commands.contains(&"help"));
+        assert!(commands.contains(&"sessions"));
+        assert!(commands.contains(&"tool-search"));
     }
 
     #[test]
@@ -5675,7 +5700,6 @@ mod tests {
             .map(|command| command.command())
             .collect::<Vec<_>>();
         assert!(commands.contains(&"status"));
-        assert!(commands.contains(&"stream"));
         assert!(!commands.contains(&"clear"));
     }
 
@@ -5686,27 +5710,45 @@ mod tests {
             .map(|command| command.command())
             .collect::<Vec<_>>();
         assert!(commands.contains(&"model"));
-        assert!(!commands.contains(&"provider"));
+        assert!(!commands.contains(&"sessions"));
     }
 
     #[test]
-    fn repl_popup_model_shows_provider_choices_for_provider_input() {
+    fn repl_popup_model_shows_session_choices_for_session_input() {
         let cli = test_cli();
         let config = test_config();
         let state = ReplState::default();
+        let (paths, base_dir) = test_paths();
+        append_events(
+            &paths,
+            &config,
+            "sess_alpha",
+            &[SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            })],
+        )
+        .unwrap();
         let draft = ReplEditorDraft {
-            slash_mode: Some(ReplSlashMode::Provider),
+            slash_mode: Some(ReplSlashMode::Session),
             ..ReplEditorDraft::default()
         };
-        let popup = repl_popup_model(&draft, &cli, &config, &state).unwrap();
+        let popup = repl_popup_model(&draft, &cli, &paths, &config, &state).unwrap();
         let labels = popup
             .items
             .iter()
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>();
-        assert!(labels.contains(&"reset"));
-        assert!(labels.contains(&"cpap"));
-        assert!(labels.contains(&"deepseek"));
+        assert!(labels.contains(&"list"));
+        assert!(
+            labels.contains(&"current") || labels.iter().any(|label| label.starts_with("alpha"))
+        );
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -5714,11 +5756,12 @@ mod tests {
         let cli = test_cli();
         let config = test_config();
         let state = ReplState::default();
+        let (paths, _base_dir) = test_paths();
         let draft = ReplEditorDraft {
             buffer: "/mo".to_string(),
             ..ReplEditorDraft::default()
         };
-        let popup = repl_popup_model(&draft, &cli, &config, &state).unwrap();
+        let popup = repl_popup_model(&draft, &cli, &paths, &config, &state).unwrap();
         let action = accept_repl_popup_selection(&draft, Some(&popup)).unwrap();
         match action {
             ReplPopupAction::EnterSlashMode(mode) => assert_eq!(mode, ReplSlashMode::Model),
@@ -5727,25 +5770,46 @@ mod tests {
     }
 
     #[test]
-    fn repl_popup_accepts_provider_choice_as_submit_prompt() {
+    fn repl_popup_accepts_session_choice_as_submit_prompt() {
         let cli = test_cli();
         let config = test_config();
         let state = ReplState::default();
+        let (paths, base_dir) = test_paths();
+        append_events(
+            &paths,
+            &config,
+            "sess_alpha",
+            &[SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            })],
+        )
+        .unwrap();
         let mut draft = ReplEditorDraft {
-            slash_mode: Some(ReplSlashMode::Provider),
+            slash_mode: Some(ReplSlashMode::Session),
             ..ReplEditorDraft::default()
         };
-        let popup = repl_popup_model(&draft, &cli, &config, &state).unwrap();
+        let popup = repl_popup_model(&draft, &cli, &paths, &config, &state).unwrap();
         draft.popup_selected = popup
             .items
             .iter()
-            .position(|item| item.label == "deepseek")
+            .position(|item| {
+                item.label.starts_with("alpha") || item.label.starts_with("sess_alpha")
+            })
             .unwrap();
         let action = accept_repl_popup_selection(&draft, Some(&popup)).unwrap();
         match action {
-            ReplPopupAction::SubmitPrompt(prompt) => assert_eq!(prompt, "/provider deepseek"),
+            ReplPopupAction::SubmitPrompt(prompt) => {
+                assert!(prompt.starts_with("/sessions switch "))
+            }
             other => panic!("unexpected popup action: {other:?}"),
         }
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -5895,7 +5959,7 @@ mod tests {
                     "type": "function",
                     "function": {
                         "name": "TodoWrite",
-                        "arguments": "{\"todos\":[{\"content\":\"Implement UI\",\"status\":\"in_progress\",\"active_form\":\"Implementing UI\"},{\"content\":\"Run tests\",\"status\":\"pending\"}]}"
+                        "arguments": "{\"todos\":[{\"title\":\"Implement UI\",\"details\":\"Create the initial UI implementation for the REPL todo panel.\",\"status\":\"in_progress\"},{\"title\":\"Run tests\",\"details\":\"Run the full test suite after the UI update.\",\"status\":\"pending\"}]}"
                     }
                 })],
                 tool_call_id: None,
@@ -5907,13 +5971,24 @@ mod tests {
 
         let mut state = ReplState::default();
         sync_repl_todo_panel(&paths, &config, session_id, &mut state);
+        sync_repl_todo_panel(&paths, &config, session_id, &mut state);
         let transcript =
             render_repl_transcript(&paths, &config, session_id, 80, &state.panels, None);
 
-        assert!(transcript.contains("• Updated Todo"));
-        assert!(transcript.contains("Implement UI"));
-        assert!(transcript.contains("Run tests"));
-        assert!(!transcript.contains("1 pending, 1 in progress, 0 completed"));
+        assert_eq!(
+            state
+                .panels
+                .iter()
+                .filter(|panel| panel.kind == ReplRuntimePanelKind::Todo)
+                .count(),
+            1
+        );
+        assert!(transcript.contains("• Updated Plan"));
+        assert!(
+            transcript.contains("Create the initial UI implementation for the REPL todo panel.")
+        );
+        assert!(transcript.contains("□ Implement UI"));
+        assert!(transcript.contains("□ Run tests"));
 
         let _ = fs::remove_dir_all(base_dir);
     }
@@ -5945,14 +6020,14 @@ mod tests {
     #[test]
     fn repl_composer_view_does_not_render_status_inside_input_box() {
         let draft = ReplEditorDraft {
-            status: Some("已移除一张图片，剩余 0 张".to_string()),
+            status: Some("Removed one image. 0 remaining.".to_string()),
             slash_mode: Some(ReplSlashMode::Model),
             ..ReplEditorDraft::default()
         };
         let view = repl_composer_view(&draft, 80, 8);
         assert_eq!(view.lines.len(), 1);
-        assert!(view.lines[0].contains("筛选模型"));
-        assert!(!view.lines[0].contains("已移除一张图片"));
+        assert!(view.lines[0].contains("Filter models."));
+        assert!(!view.lines[0].contains("Removed one image."));
     }
 
     #[test]
@@ -5981,6 +6056,39 @@ mod tests {
     fn resolve_transcript_scroll_defaults_to_bottom() {
         assert_eq!(resolve_transcript_scroll(100, 10, usize::MAX), 90);
         assert_eq!(resolve_transcript_scroll(5, 10, usize::MAX), 0);
+    }
+
+    #[test]
+    fn manual_repl_slash_prompt_requires_query_for_command_mode() {
+        let draft = ReplEditorDraft {
+            slash_mode: Some(ReplSlashMode::Commands),
+            ..ReplEditorDraft::default()
+        };
+        assert!(manual_repl_slash_prompt(&draft).is_none());
+    }
+
+    #[test]
+    fn manual_repl_slash_prompt_requires_query_for_toggle_modes() {
+        let draft = ReplEditorDraft {
+            slash_mode: Some(ReplSlashMode::Audit),
+            ..ReplEditorDraft::default()
+        };
+        assert!(manual_repl_slash_prompt(&draft).is_none());
+    }
+
+    #[test]
+    fn repl_popup_model_shows_default_items_for_empty_session_query() {
+        let cli = test_cli();
+        let config = test_config();
+        let state = ReplState::default();
+        let (paths, base_dir) = test_paths();
+        let draft = ReplEditorDraft {
+            slash_mode: Some(ReplSlashMode::Session),
+            ..ReplEditorDraft::default()
+        };
+        let popup = repl_popup_model(&draft, &cli, &paths, &config, &state).unwrap();
+        assert!(!popup.items.is_empty());
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]
