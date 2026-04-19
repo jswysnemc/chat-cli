@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ANSI codes for tool UI
 const BOLD: &str = "\x1b[1m";
@@ -34,7 +35,6 @@ const SKILL_FILE_NAME: &str = "SKILL.md";
 const MAX_SKILL_READ_BYTES: usize = 64 * 1024;
 const MAX_READ_LINES: usize = 2000;
 const MAX_EDIT_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-const TOOL_NAME_WIDTH: usize = 12;
 const PREVIEW_MAX_CHARS: usize = 120;
 const DIFF_PREVIEW_MAX_LINES: usize = 8;
 const DIFF_CONTEXT_LINES: usize = 1;
@@ -2175,13 +2175,15 @@ fn glob_to_regex(pattern: &str) -> AppResult<regex::Regex> {
 // ─── UI Helpers ───
 
 fn print_tool_header(name: &str, detail: &str) {
-    let label = format_tool_label(name, None);
-    eprintln!("  {BOLD}{CYAN}{label}{RESET}{detail}");
+    for line in render_tool_header_lines(name, detail, None) {
+        eprintln!("{line}");
+    }
 }
 
 fn print_tool_header_detail(name: &str, detail: &str, mode: &str) {
-    let label = format_tool_label(name, Some(mode));
-    eprintln!("  {BOLD}{CYAN}{label}{RESET}{detail}");
+    for line in render_tool_header_lines(name, detail, Some(mode)) {
+        eprintln!("{line}");
+    }
 }
 
 fn print_tool_preview(rendered: &str) {
@@ -2789,7 +2791,134 @@ fn resolve_skill_entry<'a>(
 
 fn format_tool_label(name: &str, mode: Option<&str>) -> String {
     let label = mode.map_or_else(|| name.to_string(), |mode| format!("{name}:{mode}"));
-    format!("{label:<TOOL_NAME_WIDTH$}")
+    label
+}
+
+fn tool_header_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols.max(1) as usize)
+        .unwrap_or(80)
+        .max(20)
+}
+
+fn display_width_char(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn wrap_plain_tokens_to_width(text: &str, width: usize) -> Vec<String> {
+    if text.trim().is_empty() {
+        return vec![String::new()];
+    }
+    if width == 0 {
+        return vec![text.trim().to_string()];
+    }
+
+    let mut lines = Vec::new();
+    for source_line in text.lines() {
+        let words = source_line.split_whitespace().collect::<Vec<_>>();
+        if words.is_empty() {
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for word in words {
+            let word_width = display_width(word);
+            let rendered_word = if word_width > width {
+                let mut out = String::new();
+                let mut used = 0usize;
+                for ch in word.chars() {
+                    let ch_width = display_width_char(ch);
+                    if used + ch_width > width.saturating_sub(1).max(1) {
+                        break;
+                    }
+                    out.push(ch);
+                    used += ch_width;
+                }
+                format!("{out}…")
+            } else {
+                word.to_string()
+            };
+            let rendered_word_width = display_width(&rendered_word);
+
+            if current.is_empty() {
+                current = rendered_word;
+                current_width = rendered_word_width;
+                continue;
+            }
+
+            if current_width + 1 + rendered_word_width <= width {
+                current.push(' ');
+                current.push_str(&rendered_word);
+                current_width += 1 + rendered_word_width;
+            } else {
+                lines.push(current);
+                current = rendered_word;
+                current_width = rendered_word_width;
+            }
+        }
+
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn render_tool_header_lines(name: &str, detail: &str, mode: Option<&str>) -> Vec<String> {
+    let label = format_tool_label(name, mode);
+    let label_plain = format!("  {label}");
+    let label_width = display_width(&label_plain);
+    let width = tool_header_width();
+    let continuation_prefix = "    ";
+    let continuation_width = width
+        .saturating_sub(display_width(continuation_prefix))
+        .max(8);
+    let detail = detail.trim();
+
+    if detail.is_empty() {
+        return vec![format!("  {BOLD}{CYAN}{label}{RESET}")];
+    }
+
+    let detail_lines = detail.lines().collect::<Vec<_>>();
+    let first_line = detail_lines.first().copied().unwrap_or_default();
+    let inline_threshold = 24usize;
+    let inline_detail_max_width = 48usize;
+    let can_inline = detail_lines.len() == 1
+        && width.saturating_sub(label_width + 1) >= inline_threshold
+        && display_width(first_line) <= inline_detail_max_width;
+
+    let mut rendered = Vec::new();
+    if can_inline {
+        let first_prefix = format!("  {BOLD}{CYAN}{label}{RESET} ");
+        let first_width = width.saturating_sub(label_width + 1).max(8);
+        let wrapped = wrap_plain_tokens_to_width(first_line, first_width);
+        if let Some(first_segment) = wrapped.first() {
+            rendered.push(format!("{first_prefix}{first_segment}"));
+        } else {
+            rendered.push(first_prefix.trim_end().to_string());
+        }
+        for segment in wrapped.into_iter().skip(1) {
+            rendered.push(format!("{continuation_prefix}{segment}"));
+        }
+    } else {
+        rendered.push(format!("  {BOLD}{CYAN}{label}{RESET}"));
+        for line in detail_lines {
+            for segment in wrap_plain_tokens_to_width(line, continuation_width) {
+                rendered.push(format!("{continuation_prefix}{segment}"));
+            }
+        }
+    }
+    rendered
 }
 
 fn truncate_preview(value: &str, max_chars: usize) -> String {
@@ -3048,6 +3177,45 @@ mod tests {
         let write_alias = lookup_tool_spec("write").unwrap();
         assert_eq!(write_alias.name, "Edit");
         assert!(write_alias.requires_confirmation);
+    }
+
+    #[test]
+    fn render_tool_header_lines_do_not_pad_short_labels() {
+        let lines = render_tool_header_lines("Read", "/tmp/demo.txt", None);
+        let plain = lines
+            .iter()
+            .map(|line| line.replace(BOLD, "").replace(CYAN, "").replace(RESET, ""))
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain, vec!["  Read /tmp/demo.txt"]);
+    }
+
+    #[test]
+    fn render_tool_header_lines_use_fixed_continuation_for_long_details() {
+        let inline_lines =
+            render_tool_header_lines("Bash", "session bash_01KPJP1YHQQKBMDY66ASWNY32C", None);
+        let inline_plain = inline_lines
+            .iter()
+            .map(|line| line.replace(BOLD, "").replace(CYAN, "").replace(RESET, ""))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inline_plain,
+            vec!["  Bash session bash_01KPJP1YHQQKBMDY66ASWNY32C"]
+        );
+
+        let lines = render_tool_header_lines(
+            "Bash",
+            "cd /home/snemc/workspace/chat-cli && echo '[round 2] debug build and cli smoke checks' && cargo check && cargo test cli::tests:: -- --nocapture",
+            None,
+        );
+        let plain = lines
+            .iter()
+            .map(|line| line.replace(BOLD, "").replace(CYAN, "").replace(RESET, ""))
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain[0], "  Bash");
+        assert!(plain.iter().skip(1).all(|line| line.starts_with("    ")));
+        assert!(plain.len() >= 3);
     }
 
     #[test]
