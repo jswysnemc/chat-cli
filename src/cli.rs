@@ -42,6 +42,7 @@ pub struct Cli {
 pub enum Commands {
     Ask(AskArgs),
     Repl(ReplArgs),
+    Mcp(McpArgs),
     Session {
         #[command(subcommand)]
         command: SessionCommand,
@@ -164,6 +165,47 @@ pub struct ReplArgs {
 
     #[arg(long, value_enum)]
     pub context_status: Option<ContextStatusMode>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+
+    #[arg(long)]
+    pub server: Option<String>,
+
+    #[arg(long)]
+    pub no_cache: bool,
+
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum McpCommand {
+    Auth(McpAuthArgs),
+    Start(McpStartArgs),
+    Stop,
+    Status,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpAuthArgs {
+    #[arg(long)]
+    pub server: Option<String>,
+
+    #[arg(long)]
+    pub no_cache: bool,
+
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpStartArgs {
+    #[arg(long)]
+    pub server: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -425,6 +467,62 @@ mod tests {
                 other => panic!("expected session show command, got {other:?}"),
             },
             other => panic!("expected session command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_parses_legacy_auth_flags() {
+        let cli = Cli::try_parse_from(["chat", "mcp", "--server", "ace", "--verbose"])
+            .expect("cli should parse mcp command");
+        match cli.command {
+            Commands::Mcp(args) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.server.as_deref(), Some("ace"));
+                assert!(args.verbose);
+                assert!(!args.no_cache);
+            }
+            other => panic!("expected mcp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_start_parses_server() {
+        let cli = Cli::try_parse_from(["chat", "mcp", "start", "--server", "ace"])
+            .expect("cli should parse mcp start command");
+        match cli.command {
+            Commands::Mcp(args) => match args.command {
+                Some(super::McpCommand::Start(serve)) => {
+                    assert_eq!(serve.server.as_deref(), Some("ace"));
+                }
+                other => panic!("expected mcp start command, got {other:?}"),
+            },
+            other => panic!("expected mcp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_stop_parses() {
+        let cli = Cli::try_parse_from(["chat", "mcp", "stop"])
+            .expect("cli should parse mcp stop command");
+        match cli.command {
+            Commands::Mcp(args) => match args.command {
+                Some(super::McpCommand::Stop) => {}
+                other => panic!("expected mcp stop command, got {other:?}"),
+            },
+            other => panic!("expected mcp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_status_parses() {
+        let cli = Cli::try_parse_from(["chat", "mcp", "status"])
+            .expect("cli should parse mcp status command");
+        match cli.command {
+            Commands::Mcp(args) => match args.command {
+                Some(super::McpCommand::Status) => {}
+                other => panic!("expected mcp status command, got {other:?}"),
+            },
+            other => panic!("expected mcp command, got {other:?}"),
         }
     }
 }

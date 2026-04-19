@@ -1,6 +1,7 @@
 use crate::cli::{
-    AskArgs, AuthCommand, AuthSetArgs, Cli, Commands, ConfigCommand, ModelCommand, ModelSetArgs,
-    OutputFormat, ProviderCommand, ReplArgs, SessionCommand,
+    AskArgs, AuthCommand, AuthSetArgs, Cli, Commands, ConfigCommand, McpArgs, McpAuthArgs,
+    McpCommand, McpStartArgs, ModelCommand, ModelSetArgs, OutputFormat, ProviderCommand,
+    ReplArgs, SessionCommand,
 };
 use crate::config::{
     AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderSecret,
@@ -11,6 +12,12 @@ use crate::config::{
 use crate::context::{ContextStatusMode, prepend_context_status};
 use crate::error::{
     AppError, AppResult, EXIT_ARGS, EXIT_AUTH, EXIT_CONFIG, EXIT_MODEL, EXIT_PROVIDER,
+};
+use crate::mcp::{
+    McpWarmupHandle, authenticate_and_cache_mcp, current_mcp_daemon_status,
+    current_mcp_server_statuses, list_mcp_tools_with_daemon, load_mcp_cache, mcp_enabled,
+    run_mcp_daemon, set_cached_mcp_tools, start_mcp_daemon_process, start_mcp_warmup,
+    stop_mcp_daemon, wait_for_mcp_warmup, warmup_timeout_warning,
 };
 use crate::media::{MessageImage, read_clipboard_image, read_clipboard_text, read_image_inputs};
 use crate::output::{AskOutput, AssistantMessage, render_ask_output};
@@ -30,9 +37,10 @@ use crate::session::{
 #[cfg(test)]
 use crate::tool::execute_tool;
 use crate::tool::{
-    continue_bash_session, execute_tool_with_context, initial_tool_definitions, list_bash_sessions,
-    lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation, tool_call_side_effects,
-    tool_definitions_for_names, tool_search_matches,
+    continue_bash_session, execute_tool_with_context_and_paths,
+    initial_tool_definitions, list_bash_sessions, lookup_tool_spec, parse_tool_call,
+    tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
+    tool_search_matches,
 };
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
@@ -77,6 +85,19 @@ pub async fn run(cli: Cli) -> AppResult<()> {
             println!("initialized config at {}", paths.config_file.display());
             return Ok(());
         }
+        Commands::Mcp(args)
+            if matches!(args.command, Some(McpCommand::Start(_)))
+                && std::env::var("CHAT_CLI_MCP_DAEMON").ok().as_deref() == Some("1") =>
+        {
+            let mut config = load_config(&paths)?;
+            apply_runtime_config_defaults(&paths, &mut config);
+            ensure_dirs(&paths, &config)?;
+            let only_server = match &args.command {
+                Some(McpCommand::Start(serve)) => serve.server.as_deref(),
+                _ => None,
+            };
+            return run_mcp_daemon(&paths, &config, only_server);
+        }
         _ => {}
     }
 
@@ -88,6 +109,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
     match cli.command {
         Commands::Ask(args) => handle_ask(&root, &paths, &config, &secrets, args).await,
         Commands::Repl(args) => handle_repl(&root, &paths, &mut config, &secrets, args).await,
+        Commands::Mcp(args) => handle_mcp(&paths, &config, args),
         Commands::Session { command } => handle_session(&paths, &config, command),
         Commands::Config { command } => {
             handle_config(&paths, &mut config, &mut secrets, command).await
@@ -105,6 +127,110 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         },
         Commands::Completion { .. } => Ok(()),
     }
+}
+
+fn handle_mcp(paths: &AppPaths, config: &AppConfig, args: McpArgs) -> AppResult<()> {
+    match args.command {
+        Some(McpCommand::Auth(auth)) => handle_mcp_auth(paths, config, auth),
+        Some(McpCommand::Start(serve)) => handle_mcp_start(paths, serve),
+        Some(McpCommand::Stop) => handle_mcp_stop(paths),
+        Some(McpCommand::Status) => handle_mcp_status(paths, config),
+        None => handle_mcp_auth(
+            paths,
+            config,
+            McpAuthArgs {
+                server: args.server,
+                no_cache: args.no_cache,
+                verbose: args.verbose,
+            },
+        ),
+    }
+}
+
+fn handle_mcp_auth(paths: &AppPaths, config: &AppConfig, args: McpAuthArgs) -> AppResult<()> {
+    let probes = authenticate_and_cache_mcp(paths, config, args.server.as_deref(), !args.no_cache)?;
+    for probe in probes {
+        println!("server: {}", probe.server);
+        println!("status: {}", if probe.ok { "ok" } else { "error" });
+        println!("command: {}", probe.command);
+        println!("tools: {}", probe.tool_count);
+        if args.verbose || !probe.ok {
+            for line in probe.debug {
+                println!("debug: {line}");
+            }
+        }
+        if probe.ok {
+            for tool in probe.tools {
+                println!("tool: {}", tool.full_name);
+            }
+        }
+        if let Some(error) = probe.error {
+            println!("error: {error}");
+        }
+    }
+    if !args.no_cache {
+        let cache = load_mcp_cache(paths)?;
+        println!("cached_servers: {}", cache.servers.len());
+    }
+    Ok(())
+}
+
+fn handle_mcp_start(paths: &AppPaths, args: McpStartArgs) -> AppResult<()> {
+    let started = start_mcp_daemon_process(paths, args.server.as_deref())?;
+    println!("mcp daemon started");
+    println!("pid_file: {}", started.pid_file.display());
+    println!("log_file: {}", started.log_file.display());
+    if let Some(server) = started.server {
+        println!("server: {server}");
+    }
+    Ok(())
+}
+
+fn handle_mcp_stop(paths: &AppPaths) -> AppResult<()> {
+    let stopped = stop_mcp_daemon(paths)?;
+    println!("mcp daemon stopped");
+    println!("pid: {}", stopped.pid);
+    Ok(())
+}
+
+fn ensure_mcp_daemon_started(paths: &AppPaths, config: &AppConfig) -> AppResult<()> {
+    if cfg!(test) || !mcp_enabled(config) {
+        return Ok(());
+    }
+    let daemon = current_mcp_daemon_status(paths);
+    if daemon.running {
+        return Ok(());
+    }
+    let _ = start_mcp_daemon_process(paths, None)?;
+    Ok(())
+}
+
+fn handle_mcp_status(paths: &AppPaths, config: &AppConfig) -> AppResult<()> {
+    let daemon = current_mcp_daemon_status(paths);
+    println!("mcp_enabled: {}", mcp_enabled(config));
+    println!("daemon_running: {}", daemon.running);
+    if let Some(pid) = daemon.pid {
+        println!("daemon_pid: {pid}");
+    }
+    if let Some(port) = daemon.port {
+        println!("daemon_port: {port}");
+    }
+    println!("daemon_log: {}", daemon.log_file.display());
+    if let Some(server) = daemon.server {
+        println!("daemon_server: {server}");
+    }
+    for server in current_mcp_server_statuses(paths, config) {
+        println!("server: {}", server.server);
+        println!("enabled: {}", server.enabled);
+        println!("cache_match: {}", server.cached);
+        println!("cache_tools: {}", server.cached_tools);
+        println!("live_ok: {}", server.live_ok);
+        println!("live_tools: {}", server.live_tools);
+        if let Some(error) = server.error {
+            println!("error: {error}");
+        }
+    }
+    Ok(())
 }
 
 async fn handle_config(
@@ -1228,6 +1354,7 @@ fn execute_tool_as_message(
 fn execute_tool_as_message_with_context(
     raw_call: &Value,
     auto_confirm: bool,
+    paths: &AppPaths,
     config: &AppConfig,
     transcript: &[ChatMessage],
 ) -> ChatMessage {
@@ -1252,7 +1379,7 @@ fn execute_tool_as_message_with_context(
                     name: Some(call.name),
                 };
             }
-            match execute_tool_with_context(&call, auto_confirm, config, transcript) {
+            match execute_tool_with_context_and_paths(&call, auto_confirm, config, Some(paths), transcript) {
                 Ok(result) => ChatMessage {
                     role: "tool".to_string(),
                     content: result.content,
@@ -1651,7 +1778,7 @@ fn call_requires_prior_read(
     ))
 }
 
-fn discovered_tool_names_from_search(raw_call: &Value) -> Vec<String> {
+fn discovered_tool_names_from_search(config: &AppConfig, raw_call: &Value) -> Vec<String> {
     let Ok(call) = parse_tool_call(raw_call) else {
         return Vec::new();
     };
@@ -1660,9 +1787,9 @@ fn discovered_tool_names_from_search(raw_call: &Value) -> Vec<String> {
     }
     let query = call.arguments["query"].as_str().unwrap_or_default();
     let max_results = call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
-    tool_search_matches(query, max_results)
+    tool_search_matches(config, query, max_results)
         .into_iter()
-        .map(|spec| spec.name.to_string())
+        .filter_map(|item| item["name"].as_str().map(str::to_string))
         .collect()
 }
 
@@ -4489,6 +4616,7 @@ struct PreparedAsk {
     session_preamble: Vec<ChatMessage>,
     request: ChatRequest,
     context_status_mode: ContextStatusMode,
+    mcp_warmup: Option<McpWarmupHandle>,
 }
 
 async fn execute_ask(
@@ -4704,8 +4832,26 @@ async fn execute_ask_with_tools(
 
             for raw_call in &response.tool_calls {
                 if config.tools.progressive_loading.unwrap_or(false) {
-                    for tool_name in discovered_tool_names_from_search(raw_call) {
+                    for tool_name in discovered_tool_names_from_search(config, raw_call) {
                         loaded_tool_names.insert(tool_name);
+                    }
+                }
+                if parse_tool_call(raw_call)
+                    .ok()
+                    .is_some_and(|call| call.name.starts_with("mcp__"))
+                {
+                    if let Some(warmup) = &prepared.mcp_warmup {
+                        match wait_for_mcp_warmup(warmup, crate::mcp::MCP_WARMUP_WAIT_SECS) {
+                            Some(Ok(probes)) => {
+                                let tools = probes.into_iter().flat_map(|probe| probe.tools).collect();
+                                set_cached_mcp_tools(config, tools);
+                            }
+                            Some(Err(err)) => eprintln!("warning: {}", err.message),
+                            None => {
+                                let warning = warmup_timeout_warning(warmup);
+                                eprintln!("warning: {}", warning.message);
+                            }
+                        }
                     }
                 }
                 let auto_confirm = parse_tool_call(raw_call)
@@ -4721,6 +4867,7 @@ async fn execute_ask_with_tools(
                 let tool_message = execute_tool_as_message_with_context(
                     raw_call,
                     auto_confirm,
+                    paths,
                     config,
                     &prepared.request.messages,
                 );
@@ -5038,6 +5185,12 @@ fn prepare_ask(
         }
     }
     let is_new_session = messages.is_empty();
+    let _ = ensure_mcp_daemon_started(paths, config);
+    let mcp_live_tools = list_mcp_tools_with_daemon(paths, config).unwrap_or_default();
+    if !mcp_live_tools.is_empty() {
+        set_cached_mcp_tools(config, mcp_live_tools.clone());
+    }
+    let mcp_warmup = start_mcp_warmup(config);
     if is_new_session {
         // Build system prompt from CLI args and config file
         let cli_system = read_system_prompt(&args.system)?;
@@ -5057,7 +5210,7 @@ fn prepare_ask(
 
         let final_system = match (cli_system, file_system, mode) {
             (Some(_cli), Some(file), "override") => Some(file),
-            (Some(cli), Some(file), _) => Some(format!("{cli}\n\n{file}")), // append
+            (Some(cli), Some(file), _) => Some(format!("{cli}\n\n{file}")),
             (Some(cli), None, _) => Some(cli),
             (None, Some(file), _) => Some(file),
             (None, None, _) => None,
@@ -5144,6 +5297,7 @@ fn prepare_ask(
         session_id,
         session_preamble,
         context_status_mode,
+        mcp_warmup,
         request: ChatRequest {
             provider_id,
             provider: provider.clone(),
@@ -5549,6 +5703,74 @@ mod tests {
         let config = test_config();
         let session_id = "sess_test_repl".to_string();
         (cli, paths, config, session_id, true)
+    }
+
+    #[test]
+    fn prepare_ask_without_live_mcp_tools_keeps_running() {
+        let (paths, _base) = test_paths();
+        let cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.mcp.insert(
+            "ace".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "missing-command".to_string(),
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
+        assert_eq!(prepared.request.messages.last().unwrap().role, "user");
+    }
+
+    #[test]
+    fn ensure_mcp_daemon_started_skips_when_mcp_disabled() {
+        let (paths, _base) = test_paths();
+        let config = test_config();
+        ensure_mcp_daemon_started(&paths, &config).unwrap();
+        assert!(!crate::mcp::current_mcp_daemon_status(&paths).running);
+    }
+
+    #[test]
+    fn persisted_turn_messages_preserves_plain_messages() {
+        let prepared = PreparedAsk {
+            format: OutputFormat::Text,
+            persisted_user_content: "prompt".to_string(),
+            user_images: Vec::new(),
+            session_id: "sess_1".to_string(),
+            session_preamble: Vec::new(),
+            request: ChatRequest {
+                provider_id: "cpap".to_string(),
+                provider: ProviderConfig::default(),
+                model_id: "team-gpt-5-4".to_string(),
+                model: ModelConfig::default(),
+                api_key: String::new(),
+                messages: Vec::new(),
+                temperature: None,
+                max_output_tokens: None,
+                params: BTreeMap::new(),
+                timeout_secs: None,
+                tools: Vec::new(),
+            },
+            context_status_mode: ContextStatusMode::Off,
+            mcp_warmup: None,
+        };
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "prompt".to_string(),
+            images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let persisted = persisted_turn_messages_for_session(&prepared, &messages);
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].role, "user");
     }
 
     #[test]

@@ -173,7 +173,7 @@ Default config locations (XDG compliant):
 - Secrets: `~/.config/chat-cli/secrets.toml`
 - Sessions: `~/.local/share/chat-cli/sessions/`
 
-Run `chat config init` first. The generated default config enables tool calling by default with `defaults.tools = true`, and disables progressive tool loading by default with `tools.progressive_loading = false`.
+Run `chat config init` first. The generated default config enables tool calling by default with `defaults.tools = true`, disables progressive tool loading by default with `tools.progressive_loading = false`, and keeps MCP disabled by default with `tools.mcp = false`.
 
 ## API Setup Guide
 
@@ -326,11 +326,14 @@ chat ask "Explain this error"
 - `provider set` only creates the upstream endpoint entry; it does not create models automatically
 - `model set --remote-name` must match the upstream model name exactly
 - To send images, the model must include capability `vision`; otherwise image requests are rejected
+- `-i/--image` reads image files from paths you provide and sends those files directly to the model
+- `-I/--clipboard-image` reads the current clipboard image first, then sends that clipboard image to the model; this is a different input path from `-i`, even though both end up as image input for vision-capable models
 - `chat config provider test <id>` only checks connectivity and basic authentication; it does not prove every model under that provider is valid
 - Some OpenAI-compatible gateways expose `/models`, some only allow `/chat/completions`; the health check already falls back when `/models` returns 404
 - `defaults.tools = true` means tool calling is enabled by default for `ask` and `repl`; if the current model/provider does not support tools well, turn it off with `chat config set defaults.tools false`
 - `tools.progressive_loading = false` is now the default. Testing showed that the overall experience is better when progressive loading is disabled. Turning it on may save some tokens because only `ToolSearch` is exposed first, but weaker models may fail to infer what tools are available or what they should do next
 - If you want token savings more than tool discoverability, enable it with `chat config set tools.progressive_loading true`
+- `tools.mcp = false` is now the default. When it stays off, MCP is disabled end to end: no automatic daemon startup, no MCP tool injection, and no MCP tool execution. Enable it with `chat config set tools.mcp true` when you want MCP behavior
 - `timeout = 0` means there is no total request timeout; long reasoning requests may therefore wait for a long time
 - `chat config model use <target>` accepts either a local model id like `gpt-4.1` or a `provider/model` target like `openai/gpt-4.1`
 - `chat config auth status` shows whether an env var name is configured, whether that env var is currently present, and whether a file-based secret exists
@@ -361,6 +364,7 @@ store_format = "jsonl"                          # on-disk session format
 [tools]
 max_rounds = 20                                 # max tool-calling rounds per turn
 progressive_loading = false                    # false: expose all tool schemas upfront; true: expose ToolSearch first to save some tokens
+mcp = false                                    # false: disable MCP end to end; true: enable MCP daemon startup, tool injection, and tool execution
 
 [audit]
 enabled = true                                  # enable the dangerous-tool audit subagent

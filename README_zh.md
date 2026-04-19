@@ -175,7 +175,7 @@ chat config auth remove deepseek
 - 密钥：`~/.config/chat-cli/secrets.toml`
 - 会话：`~/.local/share/chat-cli/sessions/`
 
-先执行一次 `chat config init`。初始化生成的默认配置会把 `defaults.tools = true` 打开，也就是默认开启 tool calling；同时把 `tools.progressive_loading = false` 设为默认关闭。
+先执行一次 `chat config init`。初始化生成的默认配置会把 `defaults.tools = true` 打开，也就是默认开启 tool calling；同时把 `tools.progressive_loading = false` 设为默认关闭，并把 `tools.mcp = false` 设为默认关闭。
 
 ## API 接入说明
 
@@ -328,11 +328,14 @@ chat ask "解释这个报错"
 - `provider set` 只创建上游接口入口，不会自动创建 model
 - `model set --remote-name` 必须和上游真实模型名一致
 - 如果要发送图片，model 必须包含 `vision` capability，否则会直接拒绝请求
+- `-i/--image` 会读取你显式传入的图片文件路径，并把这些文件作为图片输入直接发送给模型
+- `-I/--clipboard-image` 会先从当前剪贴板读取图片，再把剪贴板里的图片发送给模型；它和 `-i` 走的是不同的输入路径，只是最终都会作为支持视觉的模型图片输入
 - `chat config provider test <id>` 只校验连通性和基础鉴权，不代表该 provider 下所有 model 都一定可用
 - 有些 OpenAI 兼容网关提供 `/models`，有些只支持 `/chat/completions`；当前健康检查在 `/models` 返回 404 时会自动回退
 - `defaults.tools = true` 表示 `ask` 和 `repl` 默认启用 tool calling；如果当前模型或网关对 tools 支持不好，可以执行 `chat config set defaults.tools false`
 - `tools.progressive_loading = false` 现在是默认值。测试结果表明，关闭渐进式加载时整体体验更好。开启后可能会节省一些 token，因为一开始只暴露 `ToolSearch`，但能力较弱的模型可能不知道当前有哪些工具，也不知道下一步该做什么
 - 如果更看重节省 token，而不是工具可发现性，可以执行 `chat config set tools.progressive_loading true`
+- `tools.mcp = false` 现在也是默认值。保持关闭时，MCP 会被全链路禁用：不会自动启动 daemon，不会注入 MCP 工具，也不会执行 MCP 工具。需要时再执行 `chat config set tools.mcp true`
 - `timeout = 0` 表示不限制总请求时长，长推理请求可能会等待很久
 - `chat config model use <target>` 支持本地 model id，例如 `gpt-4.1`，也支持 `provider/model` 形式，例如 `openai/gpt-4.1`
 - `chat config auth status` 会显示是否配置了环境变量名、该环境变量当前是否存在、以及文件密钥是否存在
@@ -363,6 +366,7 @@ store_format = "jsonl"                          # 会话落盘格式
 [tools]
 max_rounds = 20                                 # 单轮 ask/repl 最多允许多少轮工具调用
 progressive_loading = false                    # false: 默认直接暴露全部工具 schema；true: 先暴露 ToolSearch 以节省部分 token
+mcp = false                                    # false: 全链路关闭 MCP；true: 启用 MCP daemon 启动、工具注入和工具执行
 
 [audit]
 enabled = true                                  # 启用危险工具审核子 agent
