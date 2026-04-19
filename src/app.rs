@@ -15,9 +15,10 @@ use crate::error::{
 };
 use crate::mcp::{
     McpWarmupHandle, authenticate_and_cache_mcp, current_mcp_daemon_status,
-    current_mcp_server_statuses, list_mcp_tools_with_daemon, load_mcp_cache, mcp_enabled,
-    run_mcp_daemon, set_cached_mcp_tools, start_mcp_daemon_process, start_mcp_warmup,
-    stop_mcp_daemon, wait_for_mcp_warmup, warmup_timeout_warning,
+    current_mcp_server_statuses, has_cached_mcp_tool, hydrate_cached_mcp_tools,
+    list_mcp_tools_from_ready_daemon, load_mcp_cache, mcp_enabled, run_mcp_daemon,
+    start_mcp_daemon_process, start_mcp_warmup, stop_mcp_daemon, wait_for_mcp_warmup,
+    warmup_timeout_warning,
 };
 use crate::media::{MessageImage, read_clipboard_image, read_clipboard_text, read_image_inputs};
 use crate::output::{AskOutput, AssistantMessage, render_ask_output};
@@ -207,6 +208,7 @@ fn ensure_mcp_daemon_started(paths: &AppPaths, config: &AppConfig) -> AppResult<
 fn handle_mcp_status(paths: &AppPaths, config: &AppConfig) -> AppResult<()> {
     let daemon = current_mcp_daemon_status(paths);
     println!("mcp_enabled: {}", mcp_enabled(config));
+    println!("daemon_registered: {}", daemon.registered);
     println!("daemon_running: {}", daemon.running);
     if let Some(pid) = daemon.pid {
         println!("daemon_pid: {pid}");
@@ -217,6 +219,9 @@ fn handle_mcp_status(paths: &AppPaths, config: &AppConfig) -> AppResult<()> {
     println!("daemon_log: {}", daemon.log_file.display());
     if let Some(server) = daemon.server {
         println!("daemon_server: {server}");
+    }
+    if let Some(error) = daemon.error {
+        println!("daemon_error: {error}");
     }
     for server in current_mcp_server_statuses(paths, config) {
         println!("server: {}", server.server);
@@ -1599,12 +1604,31 @@ fn summarize_tool_call_activity(raw_call: &Value) -> String {
     }
 }
 
-fn summarize_tool_call_names(raw_calls: &[Value]) -> String {
-    raw_calls
-        .iter()
-        .map(summarize_tool_call_activity)
-        .collect::<Vec<_>>()
-        .join(", ")
+fn render_tool_call_summary(round: usize, raw_calls: &[Value], width: usize) -> String {
+    let header = format!("{DIM}[tools {round}]{RESET}");
+    if raw_calls.is_empty() {
+        return header;
+    }
+
+    let bullet_prefix = format!("{DIM}  •{RESET} ");
+    let bullet_prefix_width = visible_width("  • ");
+    let continuation_prefix = "    ";
+    let line_width = width.max(bullet_prefix_width + 8);
+    let content_width = line_width.saturating_sub(bullet_prefix_width).max(8);
+    let mut lines = vec![header];
+
+    for summary in raw_calls.iter().map(summarize_tool_call_activity) {
+        let wrapped = wrap_ansi_to_width(&summary, content_width);
+        for (index, line) in wrapped.into_iter().enumerate() {
+            if index == 0 {
+                lines.push(format!("{bullet_prefix}{line}"));
+            } else {
+                lines.push(format!("{continuation_prefix}{line}"));
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4772,10 +4796,12 @@ async fn execute_ask_with_tools(
                 }
             }
 
+            let tool_summary_width = terminal::size()
+                .map(|(cols, _)| cols.max(1) as usize)
+                .unwrap_or(80);
             eprintln!(
-                "{DIM}[tools {}]{RESET} {}",
-                round + 1,
-                summarize_tool_call_names(&response.tool_calls)
+                "{}",
+                render_tool_call_summary(round + 1, &response.tool_calls, tool_summary_width)
             );
 
             prepared.request.messages.push(ChatMessage {
@@ -4841,17 +4867,15 @@ async fn execute_ask_with_tools(
                         loaded_tool_names.insert(tool_name);
                     }
                 }
-                if parse_tool_call(raw_call)
+                if let Some(call) = parse_tool_call(raw_call)
                     .ok()
-                    .is_some_and(|call| call.name.starts_with("mcp__"))
+                    .filter(|call| call.name.starts_with("mcp__"))
                 {
-                    if let Some(warmup) = &prepared.mcp_warmup {
+                    if !has_cached_mcp_tool(config, &call.name)
+                        && let Some(warmup) = &prepared.mcp_warmup
+                    {
                         match wait_for_mcp_warmup(warmup, crate::mcp::MCP_WARMUP_WAIT_SECS) {
-                            Some(Ok(probes)) => {
-                                let tools =
-                                    probes.into_iter().flat_map(|probe| probe.tools).collect();
-                                set_cached_mcp_tools(config, tools);
-                            }
+                            Some(Ok(_)) => {}
                             Some(Err(err)) => eprintln!("warning: {}", err.message),
                             None => {
                                 let warning = warmup_timeout_warning(warmup);
@@ -5192,11 +5216,12 @@ fn prepare_ask(
     }
     let is_new_session = messages.is_empty();
     let _ = ensure_mcp_daemon_started(paths, config);
-    let mcp_live_tools = list_mcp_tools_with_daemon(paths, config).unwrap_or_default();
+    let _ = hydrate_cached_mcp_tools(paths, config);
+    let mcp_live_tools = list_mcp_tools_from_ready_daemon(paths, config).unwrap_or_default();
     if !mcp_live_tools.is_empty() {
-        set_cached_mcp_tools(config, mcp_live_tools.clone());
+        crate::mcp::merge_cached_mcp_tools(config, mcp_live_tools);
     }
-    let mcp_warmup = start_mcp_warmup(config);
+    let mcp_warmup = start_mcp_warmup(paths, config);
     if is_new_session {
         // Build system prompt from CLI args and config file
         let cli_system = read_system_prompt(&args.system)?;
@@ -5608,7 +5633,15 @@ mod tests {
         let base = std::env::temp_dir().join(format!("chat-cli-test-{}", ulid::Ulid::new()));
         let config_dir = base.join("config");
         let data_dir = base.join("data");
-        let paths = AppPaths::from_overrides(Some(config_dir), Some(data_dir)).unwrap();
+        let cache_dir = base.join("cache");
+        let paths = AppPaths {
+            config_dir: config_dir.clone(),
+            data_dir: data_dir.clone(),
+            cache_dir,
+            config_file: config_dir.join("config.toml"),
+            secrets_file: config_dir.join("secrets.toml"),
+            state_file: data_dir.join("state.toml"),
+        };
         (paths, base)
     }
 
@@ -5733,6 +5766,63 @@ mod tests {
         let prepared =
             prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
         assert_eq!(prepared.request.messages.last().unwrap().role, "user");
+    }
+
+    #[test]
+    fn prepare_ask_hydrates_matching_mcp_cache_into_runtime_cache() {
+        let (paths, _base) = test_paths();
+        let cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "ace".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "missing-command".to_string(),
+                args: vec!["serve".to_string()],
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        crate::mcp::save_mcp_cache(
+            &paths,
+            &crate::mcp::McpCache {
+                servers: BTreeMap::from([(
+                    "ace".to_string(),
+                    crate::mcp::McpServerCacheEntry {
+                        server: "ace".to_string(),
+                        command: "missing-command".to_string(),
+                        args: vec!["serve".to_string()],
+                        cwd: None,
+                        enabled_tools: Vec::new(),
+                        disabled_tools: Vec::new(),
+                        tools: vec![crate::mcp::McpToolSpec {
+                            full_name: "mcp__ace__calendar".to_string(),
+                            server: "ace".to_string(),
+                            remote_name: "calendar".to_string(),
+                            description: "Calendar".to_string(),
+                            input_schema: serde_json::json!({"type":"object"}),
+                            read_only: true,
+                        }],
+                        checked_at_unix_ms: 1,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+        let _prepared =
+            prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
+
+        assert!(crate::mcp::has_cached_mcp_tool(
+            &config,
+            "mcp__ace__calendar"
+        ));
     }
 
     #[test]
@@ -6244,6 +6334,36 @@ mod tests {
         assert!(lines[0].starts_with(DIM));
         assert!(lines[1].starts_with(DIM));
         assert!(lines.iter().all(|line| line.ends_with(RESET)));
+    }
+
+    #[test]
+    fn render_tool_call_summary_uses_multiple_lines() {
+        let raw_calls = vec![
+            json!({
+                "id": "call_webfetch",
+                "type": "function",
+                "function": {
+                    "name": "WebFetch",
+                    "arguments": "{\"url\":\"https://openai.com/index/introducing-gpt-5-4-and-more\"}"
+                }
+            }),
+            json!({
+                "id": "call_bash",
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"echo '=== Testing grok-search web_search ==='\"}"
+                }
+            }),
+        ];
+
+        let rendered = render_tool_call_summary(1, &raw_calls, 28);
+        let plain = rendered.replace(DIM, "").replace(RESET, "");
+
+        assert!(plain.starts_with("[tools 1]"));
+        assert!(plain.contains("\n  • WebFetch:"));
+        assert!(plain.contains("\n  • Bash:"));
+        assert!(rendered.lines().count() >= 3);
     }
 
     #[test]

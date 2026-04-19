@@ -124,10 +124,12 @@ pub struct McpWarmupWarning {
 #[derive(Debug, Clone)]
 pub struct McpDaemonStatus {
     pub running: bool,
+    pub registered: bool,
     pub pid: Option<u32>,
     pub port: Option<u16>,
     pub log_file: PathBuf,
     pub server: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +199,7 @@ struct McpProcess {
 }
 
 struct DaemonServerSession {
+    name: String,
     config: McpServerConfig,
     client: McpProcess,
     tools: Vec<McpToolSpec>,
@@ -251,19 +254,26 @@ fn save_mcp_daemon_state(paths: &AppPaths, state: &McpDaemonState) -> AppResult<
 
 pub fn current_mcp_daemon_status(paths: &AppPaths) -> McpDaemonStatus {
     match load_mcp_daemon_state(paths) {
-        Ok(state) => McpDaemonStatus {
-            running: true,
-            pid: Some(state.pid),
-            port: Some(state.port),
-            log_file: state.log_file,
-            server: state.server,
-        },
+        Ok(state) => {
+            let ping = ping_mcp_daemon(&state);
+            McpDaemonStatus {
+                running: ping.is_ok(),
+                registered: true,
+                pid: Some(state.pid),
+                port: Some(state.port),
+                log_file: state.log_file,
+                server: state.server,
+                error: ping.err().map(|err| err.message),
+            }
+        }
         Err(_) => McpDaemonStatus {
             running: false,
+            registered: false,
             pid: None,
             port: None,
             log_file: mcp_daemon_log_path(paths),
             server: None,
+            error: None,
         },
     }
 }
@@ -320,6 +330,27 @@ pub fn load_mcp_cache(paths: &AppPaths) -> AppResult<McpCache> {
     serde_json::from_str(&text).code(EXIT_CONFIG, "failed to parse MCP cache")
 }
 
+fn set_cache_entry(
+    cache: &mut McpCache,
+    server_name: &str,
+    server: &McpServerConfig,
+    tools: Vec<McpToolSpec>,
+) {
+    cache.servers.insert(
+        server_name.to_string(),
+        McpServerCacheEntry {
+            server: server_name.to_string(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+            cwd: server.cwd.clone(),
+            enabled_tools: server.enabled_tools.clone(),
+            disabled_tools: server.disabled_tools.clone(),
+            tools,
+            checked_at_unix_ms: now_unix_ms(),
+        },
+    );
+}
+
 pub fn save_mcp_cache(paths: &AppPaths, cache: &McpCache) -> AppResult<()> {
     let path = mcp_cache_path(paths);
     if let Some(parent) = path.parent() {
@@ -367,19 +398,7 @@ pub fn authenticate_and_cache_mcp(
         }
         for probe in &probes {
             if let Some(server) = enabled_mcp_servers(config).get(&probe.server) {
-                cache.servers.insert(
-                    probe.server.clone(),
-                    McpServerCacheEntry {
-                        server: probe.server.clone(),
-                        command: server.command.clone(),
-                        args: server.args.clone(),
-                        cwd: server.cwd.clone(),
-                        enabled_tools: server.enabled_tools.clone(),
-                        disabled_tools: server.disabled_tools.clone(),
-                        tools: probe.tools.clone(),
-                        checked_at_unix_ms: now_unix_ms(),
-                    },
-                );
+                set_cache_entry(&mut cache, &probe.server, server, probe.tools.clone());
             }
         }
         save_mcp_cache(paths, &cache)?;
@@ -417,7 +436,7 @@ pub fn start_mcp_daemon_process(
     if let Some(config_dir) = paths.config_file.parent() {
         command.arg("--config-dir").arg(config_dir);
     }
-    command.arg("mcp").arg("serve");
+    command.arg("mcp").arg("start");
     if let Some(server) = only_server {
         command.arg("--server").arg(server);
     }
@@ -462,6 +481,7 @@ pub fn run_mcp_daemon(
         scoped.mcp.retain(|name, _| name == server_name);
     }
     let mut sessions = build_daemon_sessions(&scoped)?;
+    persist_daemon_sessions_to_cache(paths, &sessions)?;
     set_cached_mcp_tools(
         &scoped,
         sessions
@@ -502,6 +522,12 @@ pub fn run_mcp_daemon(
                         .flat_map(|session| session.tools.clone())
                         .collect(),
                 ),
+                error: None,
+            },
+            "health" => McpDaemonResponse {
+                ok: true,
+                content: Some("ok".to_string()),
+                tools: None,
                 error: None,
             },
             "call" => match request.full_name.as_deref() {
@@ -563,6 +589,13 @@ pub fn stop_mcp_daemon(paths: &AppPaths) -> AppResult<McpDaemonStop> {
 
 fn call_mcp_daemon(paths: &AppPaths, request: &McpDaemonRequest) -> AppResult<McpDaemonResponse> {
     let state = load_mcp_daemon_state(paths)?;
+    call_mcp_daemon_with_state(&state, request)
+}
+
+fn call_mcp_daemon_with_state(
+    state: &McpDaemonState,
+    request: &McpDaemonRequest,
+) -> AppResult<McpDaemonResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", state.port))
         .code(EXIT_CONFIG, "failed to connect MCP daemon")?;
     let body = serde_json::to_string(request).map_err(|err| {
@@ -582,6 +615,26 @@ fn call_mcp_daemon(paths: &AppPaths, request: &McpDaemonRequest) -> AppResult<Mc
     serde_json::from_str(&reply).code(EXIT_CONFIG, "failed to parse MCP daemon response")
 }
 
+fn ping_mcp_daemon(state: &McpDaemonState) -> AppResult<()> {
+    let response = call_mcp_daemon_with_state(
+        state,
+        &McpDaemonRequest {
+            kind: "health".to_string(),
+            full_name: None,
+            arguments: None,
+        },
+    )?;
+    if response.ok {
+        return Ok(());
+    }
+    Err(AppError::new(
+        EXIT_CONFIG,
+        response
+            .error
+            .unwrap_or_else(|| "MCP daemon health check failed".to_string()),
+    ))
+}
+
 fn write_daemon_response(stream: &mut TcpStream, response: &McpDaemonResponse) -> AppResult<()> {
     let body = serde_json::to_string(response).map_err(|err| {
         AppError::new(
@@ -594,10 +647,107 @@ fn write_daemon_response(stream: &mut TcpStream, response: &McpDaemonResponse) -
         .code(EXIT_CONFIG, "failed to write MCP daemon response")
 }
 
-pub fn start_mcp_warmup(config: &AppConfig) -> Option<McpWarmupHandle> {
+fn persist_successful_probe_tools(
+    paths: &AppPaths,
+    config: &AppConfig,
+    probes: &[McpServerProbe],
+) -> AppResult<()> {
+    let mut cache = load_mcp_cache(paths).unwrap_or_default();
+    let enabled = enabled_mcp_servers(config);
+    for probe in probes.iter().filter(|probe| probe.ok) {
+        if let Some(server) = enabled.get(&probe.server) {
+            set_cache_entry(&mut cache, &probe.server, server, probe.tools.clone());
+        }
+    }
+    save_mcp_cache(paths, &cache)
+}
+
+fn persist_daemon_sessions_to_cache(
+    paths: &AppPaths,
+    sessions: &[DaemonServerSession],
+) -> AppResult<()> {
+    let mut cache = load_mcp_cache(paths).unwrap_or_default();
+    for session in sessions {
+        set_cache_entry(
+            &mut cache,
+            &session.name,
+            &session.config,
+            session.tools.clone(),
+        );
+    }
+    save_mcp_cache(paths, &cache)
+}
+
+fn merge_tool_specs(existing: Vec<McpToolSpec>, fresh: Vec<McpToolSpec>) -> Vec<McpToolSpec> {
+    let mut merged = BTreeMap::new();
+    for tool in existing {
+        merged.insert(tool.full_name.clone(), tool);
+    }
+    for tool in fresh {
+        merged.insert(tool.full_name.clone(), tool);
+    }
+    merged.into_values().collect()
+}
+
+pub fn cached_mcp_tools_from_disk(paths: &AppPaths, config: &AppConfig) -> Vec<McpToolSpec> {
+    if !mcp_enabled(config) {
+        return Vec::new();
+    }
+    let cache = load_mcp_cache(paths).unwrap_or_default();
+    enabled_mcp_servers(config)
+        .into_iter()
+        .filter_map(|(server_name, server)| {
+            cache
+                .servers
+                .get(&server_name)
+                .filter(|entry| server_matches_cache_entry(&server, entry))
+                .map(|entry| entry.tools.clone())
+        })
+        .flatten()
+        .collect()
+}
+
+pub fn hydrate_cached_mcp_tools(paths: &AppPaths, config: &AppConfig) -> Vec<McpToolSpec> {
+    let tools = cached_mcp_tools_from_disk(paths, config);
+    if !tools.is_empty() {
+        set_cached_mcp_tools(config, tools.clone());
+    }
+    tools
+}
+
+pub fn merge_cached_mcp_tools(config: &AppConfig, tools: Vec<McpToolSpec>) -> Vec<McpToolSpec> {
+    let merged = merge_tool_specs(cached_mcp_tools_for_config(config), tools);
+    set_cached_mcp_tools(config, merged.clone());
+    merged
+}
+
+pub fn list_mcp_tools_from_ready_daemon(
+    paths: &AppPaths,
+    config: &AppConfig,
+) -> Option<Vec<McpToolSpec>> {
+    if !mcp_enabled(config) {
+        return Some(Vec::new());
+    }
+    let response = call_mcp_daemon(
+        paths,
+        &McpDaemonRequest {
+            kind: "tools".to_string(),
+            full_name: None,
+            arguments: None,
+        },
+    )
+    .ok()?;
+    if !response.ok {
+        return None;
+    }
+    Some(response.tools.unwrap_or_default())
+}
+
+pub fn start_mcp_warmup(paths: &AppPaths, config: &AppConfig) -> Option<McpWarmupHandle> {
     if enabled_mcp_servers(config).is_empty() {
         return None;
     }
+    let paths = paths.clone();
     let config = config.clone();
     let state = Arc::new(Mutex::new(McpWarmupState {
         started_at_unix_ms: now_unix_ms(),
@@ -606,6 +756,15 @@ pub fn start_mcp_warmup(config: &AppConfig) -> Option<McpWarmupHandle> {
     let state_for_thread = state.clone();
     thread::spawn(move || {
         let probes = probe_mcp_servers(&config, None);
+        let successful_tools = probes
+            .iter()
+            .filter(|probe| probe.ok)
+            .flat_map(|probe| probe.tools.clone())
+            .collect::<Vec<_>>();
+        if !successful_tools.is_empty() {
+            let _ = persist_successful_probe_tools(&paths, &config, &probes);
+            let _ = merge_cached_mcp_tools(&config, successful_tools);
+        }
         let mut guard = state_for_thread.lock().unwrap();
         if let Some(failed) = probes.iter().find(|probe| !probe.ok) {
             guard.result = Some(Err(AppError::new(
@@ -763,31 +922,6 @@ fn execute_mcp_tool_direct_for_server(
     call_mcp_tool(&server, &tool.remote_name, arguments)
 }
 
-pub fn list_mcp_tools_with_daemon(
-    paths: &AppPaths,
-    config: &AppConfig,
-) -> AppResult<Vec<McpToolSpec>> {
-    if !mcp_enabled(config) {
-        return Ok(Vec::new());
-    }
-    if let Ok(response) = call_mcp_daemon(
-        paths,
-        &McpDaemonRequest {
-            kind: "tools".to_string(),
-            full_name: None,
-            arguments: None,
-        },
-    ) {
-        if response.ok {
-            return Ok(response.tools.unwrap_or_default());
-        }
-        if let Some(error) = response.error {
-            return Err(AppError::new(EXIT_CONFIG, error));
-        }
-    }
-    list_mcp_tools(config)
-}
-
 pub fn execute_mcp_tool_with_daemon(
     paths: &AppPaths,
     config: &AppConfig,
@@ -841,6 +975,10 @@ pub fn set_cached_mcp_tools(config: &AppConfig, tools: Vec<McpToolSpec>) {
     let key = cache_key(config);
     let cache = MCP_TOOL_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     cache.lock().unwrap().insert(key, tools);
+}
+
+pub fn has_cached_mcp_tool(config: &AppConfig, full_name: &str) -> bool {
+    find_cached_mcp_tool(config, full_name).is_some()
 }
 
 fn find_cached_mcp_tool(config: &AppConfig, full_name: &str) -> Option<McpToolSpec> {
@@ -942,6 +1080,7 @@ fn build_daemon_sessions(config: &AppConfig) -> AppResult<Vec<DaemonServerSessio
         let result = client.request("tools/list", json!({}), server.tool_timeout_sec)?;
         let tools = decode_tool_specs(&server_name, &server, &result);
         sessions.push(DaemonServerSession {
+            name: server_name,
             config: server,
             client,
             tools,
@@ -1402,7 +1541,96 @@ mod tests {
         let (paths, _base) = temp_paths();
         let status = current_mcp_daemon_status(&paths);
         assert!(!status.running);
+        assert!(!status.registered);
         assert!(status.pid.is_none());
         assert!(status.port.is_none());
+        assert!(status.error.is_none());
+    }
+
+    #[test]
+    fn current_mcp_daemon_status_reports_stale_registration() {
+        let (paths, _base) = temp_paths();
+        let state = McpDaemonState {
+            pid: 123,
+            port: 4567,
+            started_at_unix_ms: 1,
+            log_file: mcp_daemon_log_path(&paths),
+            server: Some("ace".to_string()),
+        };
+        save_mcp_daemon_state(&paths, &state).unwrap();
+
+        let status = current_mcp_daemon_status(&paths);
+        assert!(status.registered);
+        assert!(!status.running);
+        assert_eq!(status.pid, Some(123));
+        assert_eq!(status.port, Some(4567));
+        assert!(status.error.is_some());
+    }
+
+    #[test]
+    fn cached_mcp_tools_from_disk_filters_to_matching_servers() {
+        let (paths, _base) = temp_paths();
+        let mut config = AppConfig::default();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "ace".to_string(),
+            McpServerConfig {
+                command: "auggie".to_string(),
+                args: vec!["serve".to_string()],
+                ..McpServerConfig::default()
+            },
+        );
+        save_mcp_cache(
+            &paths,
+            &McpCache {
+                servers: BTreeMap::from([
+                    (
+                        "ace".to_string(),
+                        McpServerCacheEntry {
+                            server: "ace".to_string(),
+                            command: "auggie".to_string(),
+                            args: vec!["serve".to_string()],
+                            cwd: None,
+                            enabled_tools: Vec::new(),
+                            disabled_tools: Vec::new(),
+                            tools: vec![McpToolSpec {
+                                full_name: "mcp__ace__calendar".to_string(),
+                                server: "ace".to_string(),
+                                remote_name: "calendar".to_string(),
+                                description: "Calendar".to_string(),
+                                input_schema: json!({"type":"object"}),
+                                read_only: true,
+                            }],
+                            checked_at_unix_ms: 1,
+                        },
+                    ),
+                    (
+                        "stale".to_string(),
+                        McpServerCacheEntry {
+                            server: "stale".to_string(),
+                            command: "old".to_string(),
+                            args: vec![],
+                            cwd: None,
+                            enabled_tools: Vec::new(),
+                            disabled_tools: Vec::new(),
+                            tools: vec![McpToolSpec {
+                                full_name: "mcp__stale__tool".to_string(),
+                                server: "stale".to_string(),
+                                remote_name: "tool".to_string(),
+                                description: "Old".to_string(),
+                                input_schema: json!({"type":"object"}),
+                                read_only: true,
+                            }],
+                            checked_at_unix_ms: 1,
+                        },
+                    ),
+                ]),
+            },
+        )
+        .unwrap();
+
+        let tools = cached_mcp_tools_from_disk(&paths, &config);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].full_name, "mcp__ace__calendar");
     }
 }
