@@ -1,6 +1,7 @@
 use crate::cli::OutputFormat;
 use crate::context::ContextStatusMode;
 use crate::error::{AppError, AppResult, EXIT_CONFIG, ResultCodeExt};
+use crate::mcp::{McpConfigCompat, McpServerConfig, validate_mcp_config};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -84,6 +85,8 @@ pub struct AppConfig {
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerConfig>,
 }
 
 impl Default for AppConfig {
@@ -96,6 +99,7 @@ impl Default for AppConfig {
             skills: SkillsConfig::default(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
+            mcp: BTreeMap::new(),
         }
     }
 }
@@ -154,6 +158,7 @@ impl Default for SessionConfig {
 pub struct ToolsConfig {
     pub max_rounds: Option<u32>,
     pub progressive_loading: Option<bool>,
+    pub mcp: Option<bool>,
 }
 
 impl Default for ToolsConfig {
@@ -161,6 +166,7 @@ impl Default for ToolsConfig {
         Self {
             max_rounds: Some(20),
             progressive_loading: Some(false),
+            mcp: Some(false),
         }
     }
 }
@@ -297,7 +303,14 @@ pub fn load_config(paths: &AppPaths) -> AppResult<AppConfig> {
     }
     let text =
         fs::read_to_string(&paths.config_file).code(EXIT_CONFIG, "failed to read config file")?;
-    toml::from_str(&text).code(EXIT_CONFIG, "failed to parse config.toml")
+    let mut config: AppConfig =
+        toml::from_str(&text).code(EXIT_CONFIG, "failed to parse config.toml")?;
+    let compat: McpConfigCompat =
+        toml::from_str(&text).code(EXIT_CONFIG, "failed to parse config.toml")?;
+    if config.mcp.is_empty() {
+        config.mcp = compat.into_servers();
+    }
+    Ok(config)
 }
 
 pub fn save_config(paths: &AppPaths, config: &AppConfig) -> AppResult<()> {
@@ -326,7 +339,7 @@ pub fn save_secrets(paths: &AppPaths, secrets: &SecretsConfig) -> AppResult<()> 
 }
 
 pub fn validate_config(config: &AppConfig) -> Vec<String> {
-    let mut issues = Vec::new();
+    let mut issues = validate_mcp_config(config);
     if let Some(provider) = &config.defaults.provider {
         if !config.providers.contains_key(provider) {
             issues.push(format!(
@@ -432,6 +445,7 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .progressive_loading
             .unwrap_or(false)
             .to_string()),
+        "tools.mcp" => Ok(config.tools.mcp.unwrap_or(false).to_string()),
         "audit.enabled" => Ok(config.audit.enabled.unwrap_or(false).to_string()),
         "audit.model" => Ok(config.audit.model.clone().unwrap_or_default()),
         "audit.default_prompt_file" => {
@@ -493,6 +507,9 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         }
         "tools.progressive_loading" => {
             config.tools.progressive_loading = Some(parse_bool(value)?);
+        }
+        "tools.mcp" => {
+            config.tools.mcp = Some(parse_bool(value)?);
         }
         "audit.enabled" => {
             config.audit.enabled = Some(parse_bool(value)?);
@@ -678,6 +695,7 @@ mod tests {
             config.skills.paths,
             vec![".claude/skills", "~/.claude/skills"]
         );
+        assert!(config.mcp.is_empty());
         assert_eq!(config.defaults.tools, Some(true));
         assert_eq!(
             render_config_value(&config, "defaults.tools").unwrap(),
@@ -696,6 +714,25 @@ mod tests {
         let mut config = AppConfig::default();
         set_config_value(&mut config, "skills.paths", "[\"a\",\"b\"]").unwrap();
         assert_eq!(config.skills.paths, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn load_config_accepts_mcp_servers_compat_shape() {
+        let base = std::env::temp_dir().join(format!("chat-cli-mcp-test-{}", ulid::Ulid::new()));
+        let paths =
+            AppPaths::from_overrides(Some(base.join("config")), Some(base.join("data"))).unwrap();
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            &paths.config_file,
+            "[mcp_servers.demo]\ntype = \"stdio\"\ncommand = \"uvx\"\nargs = [\"demo\"]\n",
+        )
+        .unwrap();
+
+        let config = load_config(&paths).unwrap();
+        assert_eq!(config.mcp.get("demo").unwrap().command, "uvx");
+        assert_eq!(config.mcp.get("demo").unwrap().r#type.as_deref(), Some("stdio"));
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -719,6 +756,14 @@ mod tests {
             render_config_value(&config, "defaults.context_status").unwrap(),
             "latest"
         );
+    }
+
+    #[test]
+    fn set_config_value_parses_tools_mcp_flag() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "tools.mcp", "true").unwrap();
+        assert_eq!(config.tools.mcp, Some(true));
+        assert_eq!(render_config_value(&config, "tools.mcp").unwrap(), "true");
     }
 
     #[test]
@@ -805,8 +850,10 @@ mod tests {
 
         assert_eq!(config.defaults.tools, Some(true));
         assert_eq!(config.tools.progressive_loading, Some(false));
+        assert_eq!(config.tools.mcp, Some(false));
         assert!(config_text.contains("tools = true"));
         assert!(config_text.contains("progressive_loading = false"));
+        assert!(config_text.contains("mcp = false"));
 
         let _ = fs::remove_dir_all(base);
     }

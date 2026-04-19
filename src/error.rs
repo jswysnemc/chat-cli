@@ -9,7 +9,7 @@ pub const EXIT_PROVIDER: i32 = 7;
 pub const EXIT_MODEL: i32 = 8;
 pub const EXIT_SESSION: i32 = 10;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppError {
     pub code: i32,
     pub message: String,

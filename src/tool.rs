@@ -1,5 +1,9 @@
-use crate::config::{AppConfig, expand_tilde};
+use crate::config::{AppConfig, AppPaths, expand_tilde};
 use crate::error::{AppError, AppResult, EXIT_ARGS};
+use crate::mcp::{
+    execute_mcp_tool_with_daemon, mcp_tool_definition_for_name, mcp_tool_definitions,
+    search_mcp_tools,
+};
 use crate::media::MessageImage;
 use crate::provider::ChatMessage;
 use serde::{Deserialize, Serialize};
@@ -326,16 +330,46 @@ const BUILTIN_TOOL_HANDLERS: [ToolHandler; 11] = [
     },
 ];
 
-fn deferred_tool_names() -> Vec<&'static str> {
-    builtin_tool_handlers()
+fn deferred_tool_names(config: &AppConfig) -> Vec<String> {
+    let mut names = builtin_tool_handlers()
         .iter()
         .filter(|handler| handler.spec.defer_loading)
-        .map(|handler| handler.spec.name)
-        .collect()
+        .map(|handler| handler.spec.name.to_string())
+        .collect::<Vec<_>>();
+    names.extend(
+        mcp_tool_definitions(config)
+            .into_iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string)),
+    );
+    names
 }
 
 fn define_tool_search_tool() -> Value {
-    let available = deferred_tool_names().join(", ");
+    json!({
+        "type": "function",
+        "function": {
+            "name": "ToolSearch",
+            "description": "Search deferred tools and load their schemas for later turns.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Tool name or capability phrase to search for."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of tool schemas to load. Default 5."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+fn define_tool_search_tool_with_config(config: &AppConfig) -> Value {
+    let available = deferred_tool_names(config).join(", ");
     json!({
         "type": "function",
         "function": {
@@ -702,12 +736,14 @@ fn progressive_loading_enabled(config: &AppConfig) -> bool {
     config.tools.progressive_loading.unwrap_or(false)
 }
 
-fn full_tool_definitions() -> Vec<Value> {
-    builtin_tool_handlers()
+fn full_tool_definitions(config: &AppConfig) -> Vec<Value> {
+    let mut defs = builtin_tool_handlers()
         .iter()
         .filter(|handler| handler.spec.name != "ToolSearch")
         .map(|handler| (handler.spec.definition)())
-        .collect()
+        .collect::<Vec<_>>();
+    defs.extend(mcp_tool_definitions(config));
+    defs
 }
 
 fn find_tool_handler(name: &str) -> Option<&'static ToolHandler> {
@@ -728,6 +764,9 @@ pub fn tool_call_side_effects(call: &ToolCall) -> ToolSideEffects {
     {
         return ToolSideEffects::ReadOnly;
     }
+    if call.name.starts_with("mcp__") {
+        return ToolSideEffects::External;
+    }
     lookup_tool_spec(&call.name)
         .map(|spec| spec.side_effects)
         .unwrap_or(ToolSideEffects::Mutating)
@@ -744,18 +783,14 @@ pub fn tool_call_requires_confirmation(call: &ToolCall) -> bool {
 
 pub fn initial_tool_definitions(config: &AppConfig) -> Vec<Value> {
     if !progressive_loading_enabled(config) {
-        return full_tool_definitions();
+        return full_tool_definitions(config);
     }
-    builtin_tool_handlers()
-        .iter()
-        .filter(|handler| handler.spec.name == "ToolSearch")
-        .map(|handler| (handler.spec.definition)())
-        .collect()
+    vec![define_tool_search_tool_with_config(config)]
 }
 
 pub fn tool_definitions_for_names(config: &AppConfig, names: &[String]) -> Vec<Value> {
     if !progressive_loading_enabled(config) {
-        return full_tool_definitions();
+        return full_tool_definitions(config);
     }
     let mut tools = initial_tool_definitions(config);
     for name in names {
@@ -763,12 +798,16 @@ pub fn tool_definitions_for_names(config: &AppConfig, names: &[String]) -> Vec<V
             && handler.spec.defer_loading
         {
             tools.push((handler.spec.definition)());
+            continue;
+        }
+        if let Some(tool) = mcp_tool_definition_for_name(config, name) {
+            tools.push(tool);
         }
     }
     tools
 }
 
-pub fn tool_search_matches(query: &str, max_results: usize) -> Vec<&'static ToolSpec> {
+pub fn tool_search_matches(config: &AppConfig, query: &str, max_results: usize) -> Vec<Value> {
     let query = query.trim().to_ascii_lowercase();
     let mut matches = builtin_tool_handlers()
         .iter()
@@ -797,19 +836,64 @@ pub fn tool_search_matches(query: &str, max_results: usize) -> Vec<&'static Tool
             {
                 score += 10;
             }
-            (score, &handler.spec)
+            (
+                score,
+                json!({
+                    "name": handler.spec.name,
+                    "description": handler.spec.description,
+                    "aliases": handler.spec.aliases,
+                    "side_effects": match handler.spec.side_effects {
+                        ToolSideEffects::ReadOnly => "read_only",
+                        ToolSideEffects::Mutating => "mutating",
+                        ToolSideEffects::External => "external",
+                    },
+                    "schema": if handler.spec.name == "ToolSearch" {
+                        define_tool_search_tool_with_config(config)
+                    } else {
+                        (handler.spec.definition)()
+                    },
+                }),
+            )
         })
         .filter(|(score, _)| *score > 0)
         .collect::<Vec<_>>();
-    matches.sort_by(|(left_score, left_spec), (right_score, right_spec)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_spec.name.cmp(right_spec.name))
+    matches.extend(search_mcp_tools(config, query.as_str(), max_results).into_iter().map(|tool| {
+        let mut score = 0usize;
+        let full_name = tool.full_name.to_ascii_lowercase();
+        let remote_name = tool.remote_name.to_ascii_lowercase();
+        let description = tool.description.to_ascii_lowercase();
+        if full_name == query || remote_name == query {
+            score += 100;
+        }
+        if full_name.contains(&query) || remote_name.contains(&query) {
+            score += 50;
+        }
+        if description.contains(&query) {
+            score += 10;
+        }
+        (
+            score,
+            json!({
+                "name": tool.full_name,
+                "description": tool.description,
+                "aliases": [],
+                "side_effects": if tool.read_only { "read_only" } else { "external" },
+                "schema": mcp_tool_definition_for_name(config, &tool.full_name).unwrap_or_else(|| json!({})),
+            }),
+        )
+    }));
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score.cmp(left_score).then_with(|| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        })
     });
     matches
         .into_iter()
         .take(max_results.max(1))
-        .map(|(_, spec)| spec)
+        .map(|(_, item)| item)
         .collect()
 }
 
@@ -842,10 +926,21 @@ pub fn execute_tool(
     execute_tool_with_context(call, auto_confirm, config, &[])
 }
 
+#[cfg(test)]
 pub fn execute_tool_with_context(
     call: &ToolCall,
     auto_confirm: bool,
     config: &AppConfig,
+    transcript: &[ChatMessage],
+) -> AppResult<ToolResult> {
+    execute_tool_with_context_and_paths(call, auto_confirm, config, None, transcript)
+}
+
+pub fn execute_tool_with_context_and_paths(
+    call: &ToolCall,
+    auto_confirm: bool,
+    config: &AppConfig,
+    paths: Option<&AppPaths>,
     transcript: &[ChatMessage],
 ) -> AppResult<ToolResult> {
     let context = ToolRuntimeContext {
@@ -855,6 +950,13 @@ pub fn execute_tool_with_context(
     };
     let (content, images) = match find_tool_handler(&call.name) {
         Some(handler) => (handler.execute)(call, &context)?,
+        None if call.name.starts_with("mcp__") => (
+            match paths {
+                Some(paths) => execute_mcp_tool_with_daemon(paths, config, &call.name, &call.arguments)?,
+                None => crate::mcp::execute_mcp_tool(config, &call.name, &call.arguments)?,
+            },
+            Vec::new(),
+        ),
         None => (format!("error: unknown tool '{}'", call.name), Vec::new()),
     };
     Ok(ToolResult {
@@ -872,28 +974,10 @@ fn execute_tool_search_tool(
         .as_str()
         .ok_or_else(|| AppError::new(EXIT_ARGS, "ToolSearch: missing 'query' argument"))?;
     let max_results = call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
-    let matches = tool_search_matches(query, max_results);
-    if matches.is_empty() {
+    let results = tool_search_matches(_context.config, query, max_results);
+    if results.is_empty() {
         return Ok(("no matching tools found".to_string(), Vec::new()));
     }
-    let results = matches
-        .into_iter()
-        .filter_map(|spec| {
-            find_tool_handler(spec.name).map(|handler| {
-                json!({
-                    "name": spec.name,
-                    "description": spec.description,
-                    "aliases": spec.aliases,
-                    "side_effects": match spec.side_effects {
-                        ToolSideEffects::ReadOnly => "read_only",
-                        ToolSideEffects::Mutating => "mutating",
-                        ToolSideEffects::External => "external",
-                    },
-                    "schema": (handler.spec.definition)(),
-                })
-            })
-        })
-        .collect::<Vec<_>>();
     let content = serde_json::to_string_pretty(&json!({
         "loaded_tools": results.iter().map(|item| item["name"].clone()).collect::<Vec<_>>(),
         "results": results,
@@ -2988,27 +3072,31 @@ mod tests {
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Status"));
         assert!(names.contains(&"TodoWrite"));
-        assert_eq!(defs.len(), 10);
+        assert!(defs.len() >= 10);
     }
 
     #[test]
     fn tool_search_matches_claude_style_tools() {
-        let matches = tool_search_matches("shell", 3);
-        let names = matches.iter().map(|spec| spec.name).collect::<Vec<_>>();
+        let config = AppConfig::default();
+        let matches = tool_search_matches(&config, "shell", 3);
+        let names = matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
         assert!(names.contains(&"Bash"));
 
-        let write_matches = tool_search_matches("write", 3);
+        let write_matches = tool_search_matches(&config, "write", 3);
         let write_names = write_matches
             .iter()
-            .map(|spec| spec.name)
+            .filter_map(|spec| spec["name"].as_str())
             .collect::<Vec<_>>();
         assert!(write_names.contains(&"Edit"));
         assert!(!write_names.contains(&"Write"));
 
-        let todo_matches = tool_search_matches("todo", 3);
+        let todo_matches = tool_search_matches(&config, "todo", 3);
         let todo_names = todo_matches
             .iter()
-            .map(|spec| spec.name)
+            .filter_map(|spec| spec["name"].as_str())
             .collect::<Vec<_>>();
         assert!(todo_names.contains(&"TodoWrite"));
     }

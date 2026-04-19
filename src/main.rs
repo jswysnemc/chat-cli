@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod context;
 mod error;
+mod mcp;
 mod media;
 mod output;
 mod provider;
