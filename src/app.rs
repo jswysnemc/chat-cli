@@ -61,6 +61,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const BOLD: &str = "\x1b[1m";
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const GREEN: &str = "\x1b[32m";
@@ -839,6 +840,23 @@ fn render_session_turns_with_width(
         .join(&format!("\n\n{DIM}{}{RESET}\n\n", "─".repeat(56)))
 }
 
+fn render_repl_session_turns_with_width(
+    config: &AppConfig,
+    turns: &[Vec<SessionMessage>],
+    width: usize,
+) -> String {
+    turns
+        .iter()
+        .map(|turn| {
+            turn.iter()
+                .map(|message| render_repl_session_message(config, message, width))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .collect::<Vec<_>>()
+        .join(&format!("\n\n{DIM}{}{RESET}\n\n", "─".repeat(56)))
+}
+
 fn render_repl_session_history(
     paths: &AppPaths,
     config: &AppConfig,
@@ -847,12 +865,7 @@ fn render_repl_session_history(
 ) -> AppResult<String> {
     let events = read_events(paths, config, session_id)?;
     let turns = filter_session_turns_for_repl(&session_turns_from_events(&events));
-    Ok(render_session_turns_with_width(
-        config,
-        &turns,
-        None,
-        Some(width),
-    ))
+    Ok(render_repl_session_turns_with_width(config, &turns, width))
 }
 
 fn render_repl_transcript(
@@ -890,6 +903,16 @@ fn render_repl_runtime_panel(panel: &ReplRuntimePanel) -> String {
         ReplRuntimePanelKind::Error => render_runtime_panel(&panel.title, &panel.body, RED),
         ReplRuntimePanelKind::Todo => render_compact_runtime_panel(&panel.title, &panel.body, CYAN),
     }
+}
+
+fn print_repl_runtime_panel(stdout: &mut io::Stdout, panel: &ReplRuntimePanel) -> AppResult<()> {
+    let rendered = render_repl_runtime_panel(panel);
+    writeln!(stdout, "{rendered}")
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write REPL panel: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush REPL panel: {err}")))?;
+    Ok(())
 }
 
 fn render_runtime_panel(title: &str, body: &str, accent: &str) -> String {
@@ -1036,8 +1059,13 @@ fn render_repl_submission_preview(
     width: usize,
     prompt: &str,
     images: &[MessageImage],
+    include_history: bool,
 ) -> AppResult<()> {
-    let history = render_repl_session_history(paths, config, session_id, width).unwrap_or_default();
+    let history = if include_history {
+        render_repl_session_history(paths, config, session_id, width).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let inline = join_inline_prompt_segments(&[
         (!images.is_empty()).then(|| image_badges(images.len())),
         (!prompt.trim().is_empty()).then(|| prompt.to_string()),
@@ -1083,6 +1111,21 @@ fn render_session_message(
     }
 }
 
+fn render_repl_session_message(
+    config: &AppConfig,
+    message: &SessionMessage,
+    width: usize,
+) -> String {
+    let label = session_message_label(message);
+    let body = render_repl_session_message_body(config, message, width);
+
+    match message.role.as_str() {
+        "user" => render_user_message_block(&label, &body),
+        _ if body.is_empty() => label,
+        _ => format!("{label}\n{body}"),
+    }
+}
+
 fn session_message_label(message: &SessionMessage) -> String {
     match message.role.as_str() {
         "user" => format!("{GREEN}User{RESET}"),
@@ -1094,6 +1137,60 @@ fn session_message_label(message: &SessionMessage) -> String {
         "system" => format!("{MAGENTA}System{RESET}"),
         other => format!("{DIM}{other}{RESET}"),
     }
+}
+
+const REPL_TOOL_RESULT_SUMMARY_MAX_LINES: usize = 3;
+const REPL_TOOL_RESULT_SUMMARY_MAX_CHARS: usize = 160;
+
+fn summarize_repl_tool_result(content: &str, width: usize) -> String {
+    let preview_width = width.max(20).min(REPL_TOOL_RESULT_SUMMARY_MAX_CHARS);
+    let normalized_lines = content
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if normalized_lines.is_empty() {
+        return format!("{DIM}[empty tool result]{RESET}");
+    }
+
+    let shown = normalized_lines
+        .iter()
+        .take(REPL_TOOL_RESULT_SUMMARY_MAX_LINES)
+        .map(|line| {
+            let truncated = if line.chars().count() > preview_width {
+                format!(
+                    "{}…",
+                    line.chars()
+                        .take(preview_width.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                line.clone()
+            };
+            format!("{DIM}↳{RESET} {truncated}")
+        })
+        .collect::<Vec<_>>();
+
+    let mut rendered = shown;
+    let remaining = normalized_lines
+        .len()
+        .saturating_sub(REPL_TOOL_RESULT_SUMMARY_MAX_LINES);
+    if remaining > 0 {
+        rendered.push(format!("{DIM}… +{remaining} lines{RESET}"));
+    }
+    rendered.join("\n")
+}
+
+fn render_repl_session_message_body(
+    config: &AppConfig,
+    message: &SessionMessage,
+    width: usize,
+) -> String {
+    if message.role == "tool" {
+        return summarize_repl_tool_result(&message.content, width.saturating_sub(4));
+    }
+    render_session_message_body(config, message, Some(width))
 }
 
 fn render_session_message_body(
@@ -1112,13 +1209,8 @@ fn render_session_message_body(
     }
 
     if !message.tool_calls.is_empty() {
-        let tool_lines = message
-            .tool_calls
-            .iter()
-            .map(|raw_call| format!("{DIM}•{RESET} {}", summarize_tool_call_activity(raw_call)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        sections.push(format!("{DIM}tool calls{RESET}\n{tool_lines}"));
+        let tool_width = width.unwrap_or(80);
+        sections.push(render_tool_call_list(&message.tool_calls, tool_width));
     }
 
     if !message.images.is_empty() {
@@ -1215,6 +1307,55 @@ async fn handle_doctor(
     if let Some(code) = doctor_code {
         return Err(AppError::new(code, "doctor found issues"));
     }
+    Ok(())
+}
+
+fn print_repl_session_history_once(
+    stdout: &mut io::Stdout,
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    width: usize,
+) -> AppResult<()> {
+    let history = render_repl_session_history(paths, config, session_id, width).unwrap_or_default();
+    if history.trim().is_empty() {
+        return Ok(());
+    }
+    writeln!(stdout, "{history}")
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write REPL history: {err}")))?;
+    writeln!(stdout)
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write REPL spacer: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush REPL history: {err}")))?;
+    Ok(())
+}
+
+fn reserve_inline_repl_rows(
+    stdout: &mut io::Stdout,
+    screen_rows: u16,
+    additional_rows: u16,
+) -> AppResult<()> {
+    if additional_rows == 0 || screen_rows == 0 {
+        return Ok(());
+    }
+    execute!(stdout, MoveTo(0, screen_rows.saturating_sub(1))).map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to position inline REPL viewport: {err}"),
+        )
+    })?;
+    for _ in 0..additional_rows {
+        writeln!(stdout).map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to grow inline REPL area: {err}"))
+        })?;
+    }
+    stdout.flush().map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to flush inline REPL area: {err}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -1522,113 +1663,236 @@ fn truncate_tool_call_id(id: &str) -> String {
     }
 }
 
-fn summarize_tool_call_activity(raw_call: &Value) -> String {
-    match parse_tool_call(raw_call) {
-        Ok(call) => match call.name.as_str() {
-            "ToolSearch" | "tool_search" => format!(
-                "ToolSearch: {}",
-                audit_preview_text(call.arguments["query"].as_str().unwrap_or(""), 32)
-            ),
-            "bash" => format!(
-                "bash: {}",
-                audit_preview_text(call.arguments["command"].as_str().unwrap_or(""), 40)
-            ),
-            "Bash" => format!(
-                "Bash: {}",
-                audit_preview_text(call.arguments["command"].as_str().unwrap_or(""), 40)
-            ),
-            "Write" | "write" | "Edit" | "edit" => format!(
-                "Edit: {}",
-                audit_preview_text(
-                    call.arguments["file_path"]
-                        .as_str()
-                        .or_else(|| call.arguments["path"].as_str())
-                        .unwrap_or(""),
-                    32
-                )
-            ),
-            "read" => format!(
-                "read: {}",
-                audit_preview_text(call.arguments["path"].as_str().unwrap_or(""), 32)
-            ),
-            "Read" => format!(
-                "Read: {}",
-                audit_preview_text(
-                    call.arguments["file_path"]
-                        .as_str()
-                        .or_else(|| call.arguments["path"].as_str())
-                        .unwrap_or(""),
-                    32
-                )
-            ),
-            "fetch" => format!(
-                "fetch: {}",
-                audit_preview_text(call.arguments["url"].as_str().unwrap_or(""), 40)
-            ),
-            "WebFetch" | "web_fetch" => format!(
-                "WebFetch: {}",
-                audit_preview_text(call.arguments["url"].as_str().unwrap_or(""), 40)
-            ),
-            "grep" => format!(
-                "grep: {}",
-                audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
-            ),
-            "Grep" => format!(
-                "Grep: {}",
-                audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
-            ),
-            "Glob" | "glob" => format!(
-                "Glob: {}",
-                audit_preview_text(call.arguments["pattern"].as_str().unwrap_or(""), 24)
-            ),
-            "skill_read" => format!(
-                "skill_read: {}",
-                audit_preview_text(call.arguments["name"].as_str().unwrap_or(""), 24)
-            ),
-            "SkillRead" => format!(
-                "SkillRead: {}",
-                audit_preview_text(call.arguments["name"].as_str().unwrap_or(""), 24)
-            ),
-            "skills_list" => "skills_list".to_string(),
-            "SkillsList" => "SkillsList".to_string(),
-            "todo" | "todo_write" | "TodoWrite" => {
-                let count = call.arguments["todos"]
-                    .as_array()
-                    .map(|items| items.len())
-                    .unwrap_or(0);
-                format!("TodoWrite: {count} item(s)")
-            }
-            other => other.to_string(),
-        },
-        Err(_) => "unknown_tool".to_string(),
+#[derive(Debug, Clone)]
+struct ToolCallDisplay {
+    name: String,
+    detail: Option<String>,
+}
+
+fn canonical_tool_call_name(name: &str) -> String {
+    match name {
+        "tool_search" => "ToolSearch".to_string(),
+        "bash" => "Bash".to_string(),
+        "write" | "edit" => "Edit".to_string(),
+        "read" => "Read".to_string(),
+        "fetch" | "web_fetch" => "WebFetch".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "skill_read" => "SkillRead".to_string(),
+        "skills_list" => "SkillsList".to_string(),
+        "todo" | "todo_write" => "TodoWrite".to_string(),
+        other if other.starts_with("mcp__") => other.to_string(),
+        other => other.to_string(),
     }
 }
 
-fn render_tool_call_summary(round: usize, raw_calls: &[Value], width: usize) -> String {
-    let header = format!("{DIM}[tools {round}]{RESET}");
-    if raw_calls.is_empty() {
-        return header;
+fn preview_multiline_text(value: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut lines = value
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
     }
 
-    let bullet_prefix = format!("{DIM}  •{RESET} ");
-    let bullet_prefix_width = visible_width("  • ");
-    let continuation_prefix = "    ";
-    let line_width = width.max(bullet_prefix_width + 8);
-    let content_width = line_width.saturating_sub(bullet_prefix_width).max(8);
-    let mut lines = vec![header];
+    let mut truncated = false;
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        truncated = true;
+    }
+    let mut preview = lines.join("\n");
+    if preview.chars().count() > max_chars {
+        preview = format!(
+            "{}…",
+            preview
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        );
+        truncated = false;
+    }
+    if truncated && !preview.ends_with('…') {
+        preview.push('…');
+    }
+    preview
+}
 
-    for summary in raw_calls.iter().map(summarize_tool_call_activity) {
-        let wrapped = wrap_ansi_to_width(&summary, content_width);
-        for (index, line) in wrapped.into_iter().enumerate() {
-            if index == 0 {
-                lines.push(format!("{bullet_prefix}{line}"));
+fn tool_call_display(raw_call: &Value) -> ToolCallDisplay {
+    match parse_tool_call(raw_call) {
+        Ok(call) => {
+            let name = canonical_tool_call_name(&call.name);
+            let detail = match call.name.as_str() {
+                "ToolSearch" | "tool_search" => Some(audit_preview_text(
+                    call.arguments["query"].as_str().unwrap_or(""),
+                    96,
+                )),
+                "bash" | "Bash" => Some(preview_multiline_text(
+                    call.arguments["command"].as_str().unwrap_or(""),
+                    4,
+                    240,
+                )),
+                "Write" | "write" | "Edit" | "edit" => Some(audit_preview_text(
+                    call.arguments["file_path"]
+                        .as_str()
+                        .or_else(|| call.arguments["path"].as_str())
+                        .unwrap_or(""),
+                    120,
+                )),
+                "read" | "Read" => Some(audit_preview_text(
+                    call.arguments["file_path"]
+                        .as_str()
+                        .or_else(|| call.arguments["path"].as_str())
+                        .unwrap_or(""),
+                    120,
+                )),
+                "fetch" | "WebFetch" | "web_fetch" => Some(audit_preview_text(
+                    call.arguments["url"].as_str().unwrap_or(""),
+                    200,
+                )),
+                "grep" | "Grep" | "Glob" | "glob" => Some(audit_preview_text(
+                    call.arguments["pattern"].as_str().unwrap_or(""),
+                    120,
+                )),
+                "skill_read" | "SkillRead" => Some(audit_preview_text(
+                    call.arguments["name"].as_str().unwrap_or(""),
+                    120,
+                )),
+                "todo" | "todo_write" | "TodoWrite" => {
+                    let count = call.arguments["todos"]
+                        .as_array()
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    Some(format!("{count} item(s)"))
+                }
+                other if other.starts_with("mcp__") => {
+                    Some(audit_preview_value(&call.arguments, 200))
+                }
+                _ => {
+                    let preview = audit_preview_value(&call.arguments, 160);
+                    (!preview.is_empty() && preview != "{}").then_some(preview)
+                }
+            }
+            .filter(|detail| !detail.trim().is_empty());
+            ToolCallDisplay { name, detail }
+        }
+        Err(_) => ToolCallDisplay {
+            name: "unknown_tool".to_string(),
+            detail: None,
+        },
+    }
+}
+
+fn wrap_plain_tokens_to_width(text: &str, width: usize) -> Vec<String> {
+    if text.trim().is_empty() {
+        return vec![String::new()];
+    }
+    if width == 0 {
+        return vec![text.trim().to_string()];
+    }
+
+    let mut lines = Vec::new();
+    for source_line in text.lines() {
+        let words = source_line.split_whitespace().collect::<Vec<_>>();
+        if words.is_empty() {
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for word in words {
+            let word_width = display_width(word);
+            let rendered_word = if word_width > width {
+                format!(
+                    "{}…",
+                    truncate_plain_to_width(word, width.saturating_sub(1).max(1))
+                )
             } else {
-                lines.push(format!("{continuation_prefix}{line}"));
+                word.to_string()
+            };
+            let rendered_word_width = visible_width(&rendered_word);
+
+            if current.is_empty() {
+                current = rendered_word;
+                current_width = rendered_word_width;
+                continue;
+            }
+
+            if current_width + 1 + rendered_word_width <= width {
+                current.push(' ');
+                current.push_str(&rendered_word);
+                current_width += 1 + rendered_word_width;
+            } else {
+                lines.push(current);
+                current = rendered_word;
+                current_width = rendered_word_width;
+            }
+        }
+
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn render_tool_call_display_block(raw_call: &Value, width: usize) -> String {
+    let display = tool_call_display(raw_call);
+    let header_prefix = format!("{DIM}•{RESET} {BOLD}{}{RESET}", display.name);
+    let line_width = width.max(8);
+    let header_width = visible_width(&format!("• {}", display.name));
+    let continuation_prefix = "    ";
+    let continuation_width = line_width
+        .saturating_sub(visible_width(continuation_prefix))
+        .max(8);
+
+    let Some(detail) = display.detail.as_ref() else {
+        return header_prefix;
+    };
+
+    let mut rendered_lines = Vec::new();
+    let detail_lines = detail.lines().collect::<Vec<_>>();
+    let first_line = detail_lines.first().copied().unwrap_or_default();
+    let inline_threshold = 24usize;
+    let can_inline_first_line = detail_lines.len() == 1
+        && !first_line.is_empty()
+        && line_width.saturating_sub(header_width + 1) >= inline_threshold;
+
+    if can_inline_first_line {
+        let first_prefix = format!("{header_prefix} ");
+        let first_width = line_width.saturating_sub(header_width + 1).max(8);
+        let wrapped_first = wrap_plain_tokens_to_width(first_line, first_width);
+        if let Some(first_segment) = wrapped_first.first() {
+            rendered_lines.push(format!("{first_prefix}{first_segment}"));
+        } else {
+            rendered_lines.push(first_prefix.trim_end().to_string());
+        }
+        for segment in wrapped_first.into_iter().skip(1) {
+            rendered_lines.push(format!("{continuation_prefix}{segment}"));
+        }
+    } else {
+        rendered_lines.push(header_prefix);
+        for line in detail_lines {
+            for segment in wrap_plain_tokens_to_width(line, continuation_width) {
+                rendered_lines.push(format!("{continuation_prefix}{segment}"));
             }
         }
     }
 
-    lines.join("\n")
+    rendered_lines.join("\n")
+}
+
+fn render_tool_call_list(raw_calls: &[Value], width: usize) -> String {
+    raw_calls
+        .iter()
+        .map(|raw_call| render_tool_call_display_block(raw_call, width))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2535,15 +2799,33 @@ async fn handle_repl(
     };
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let ui_mode = if stdin.is_terminal() && stdout.is_terminal() {
+        Some(ReplUiMode::Inline)
+    } else {
+        None
+    };
+    let mut inline_history_session: Option<String> = None;
     loop {
         if ensure_repl_session_id(paths, config, &mut session_id, session_temp)? {
             session_temp = is_temp_session(&session_id) || args.temp;
         }
-        sync_repl_todo_panel(paths, config, &session_id, &mut repl_state);
+        if ui_mode == Some(ReplUiMode::Fullscreen) {
+            sync_repl_todo_panel(paths, config, &session_id, &mut repl_state);
+        }
+        if ui_mode == Some(ReplUiMode::Inline)
+            && inline_history_session.as_deref() != Some(session_id.as_str())
+        {
+            let width = terminal::size()
+                .map(|(cols, _)| cols.max(1) as usize)
+                .unwrap_or(80);
+            print_repl_session_history_once(&mut stdout, paths, config, &session_id, width)?;
+            inline_history_session = Some(session_id.clone());
+        }
         let input = read_repl_input(
             &stdin,
             &mut stdout,
             args.multiline,
+            ui_mode,
             cli,
             paths,
             config,
@@ -2554,6 +2836,7 @@ async fn handle_repl(
             input,
             &mut repl_state,
             &mut stdout,
+            ui_mode == Some(ReplUiMode::Fullscreen),
             cli,
             paths,
             config,
@@ -2577,6 +2860,7 @@ async fn handle_repl(
                         .unwrap_or(80),
                     &input.prompt,
                     &input.images,
+                    ui_mode == Some(ReplUiMode::Fullscreen),
                 )?;
                 let submitted_prompt = input.prompt.clone();
                 let submitted_images = input.images.clone();
@@ -2662,11 +2946,26 @@ async fn handle_repl(
                         first_turn = false;
                     }
                     Err(err) => {
-                        push_repl_panel(
-                            &mut repl_state,
-                            build_repl_user_panel(config, &submitted_prompt, &submitted_images),
-                        );
-                        push_repl_panel(&mut repl_state, build_repl_error_panel(&err.message));
+                        if ui_mode == Some(ReplUiMode::Fullscreen) {
+                            push_repl_panel(
+                                &mut repl_state,
+                                build_repl_user_panel(config, &submitted_prompt, &submitted_images),
+                            );
+                            push_repl_panel(&mut repl_state, build_repl_error_panel(&err.message));
+                        } else {
+                            print_repl_runtime_panel(
+                                &mut stdout,
+                                &build_repl_user_panel(
+                                    config,
+                                    &submitted_prompt,
+                                    &submitted_images,
+                                ),
+                            )?;
+                            print_repl_runtime_panel(
+                                &mut stdout,
+                                &build_repl_error_panel(&err.message),
+                            )?;
+                        }
                     }
                 }
             }
@@ -2679,14 +2978,15 @@ fn read_repl_input(
     stdin: &io::Stdin,
     stdout: &mut io::Stdout,
     multiline: bool,
+    ui_mode: Option<ReplUiMode>,
     cli: &Cli,
     paths: &AppPaths,
     config: &AppConfig,
     session_id: &str,
     state: &mut ReplState,
 ) -> AppResult<ReplInput> {
-    if stdin.is_terminal() && stdout.is_terminal() {
-        return read_repl_tui_input(stdout, cli, paths, config, session_id, state);
+    if let Some(mode) = ui_mode {
+        return read_repl_tui_input(stdout, cli, paths, config, session_id, state, mode);
     }
     Ok(ReplInput {
         prompt: read_repl_prompt(stdin, stdout, multiline)?,
@@ -2721,6 +3021,13 @@ fn read_repl_prompt(
 
 struct ReplTerminalGuard {
     supports_keyboard_enhancement: bool,
+    mouse_capture_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplUiMode {
+    Inline,
+    Fullscreen,
 }
 
 #[derive(Debug, Clone)]
@@ -2839,17 +3146,26 @@ const REPL_MIN_TRANSCRIPT_HEIGHT: u16 = 3;
 const REPL_MAX_VISIBLE_POPUP_LINES: usize = 8;
 
 impl ReplTerminalGuard {
-    fn enter(stdout: &mut io::Stdout) -> AppResult<Self> {
+    fn enter(stdout: &mut io::Stdout, mode: ReplUiMode) -> AppResult<Self> {
         terminal::enable_raw_mode()
             .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to enable raw mode: {err}")))?;
         let supports_keyboard_enhancement =
             matches!(terminal::supports_keyboard_enhancement(), Ok(true));
-        execute!(stdout, EnableBracketedPaste, EnableMouseCapture).map_err(|err| {
+        execute!(stdout, EnableBracketedPaste).map_err(|err| {
             AppError::new(
                 EXIT_ARGS,
                 format!("failed to initialize REPL terminal mode: {err}"),
             )
         })?;
+        let mouse_capture_enabled = mode == ReplUiMode::Fullscreen;
+        if mouse_capture_enabled {
+            execute!(stdout, EnableMouseCapture).map_err(|err| {
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("failed to enable REPL mouse capture: {err}"),
+                )
+            })?;
+        }
         if supports_keyboard_enhancement {
             execute!(
                 stdout,
@@ -2867,6 +3183,7 @@ impl ReplTerminalGuard {
         }
         Ok(Self {
             supports_keyboard_enhancement,
+            mouse_capture_enabled,
         })
     }
 }
@@ -2877,12 +3194,10 @@ impl Drop for ReplTerminalGuard {
         if self.supports_keyboard_enhancement {
             let _ = queue!(stdout, PopKeyboardEnhancementFlags);
         }
-        let _ = execute!(
-            stdout,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            cursor::Show
-        );
+        if self.mouse_capture_enabled {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        let _ = execute!(stdout, DisableBracketedPaste, cursor::Show);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -2894,20 +3209,49 @@ fn read_repl_tui_input(
     config: &AppConfig,
     session_id: &str,
     state: &mut ReplState,
+    mode: ReplUiMode,
 ) -> AppResult<ReplInput> {
-    let _guard = ReplTerminalGuard::enter(stdout)?;
-    let (cols, _) = terminal::size()
+    let _guard = ReplTerminalGuard::enter(stdout, mode)?;
+    let (cols, screen_rows) = terminal::size()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
-    let view = build_repl_screen_view(cli, paths, config, session_id, cols, state);
     let mut draft = ReplEditorDraft {
         transcript_scroll: usize::MAX,
         ..ReplEditorDraft::default()
     };
+    let mut inline_reserved_height = 0u16;
 
     loop {
+        let view = build_repl_screen_view(cli, paths, config, session_id, cols, state, mode);
         let popup_model = repl_popup_model(&draft, cli, paths, config, state);
         sync_repl_popup_selection(&mut draft, popup_model.as_ref());
-        render_repl_editor(stdout, &view, &draft, popup_model.as_ref())?;
+        let composer_body_height = repl_composer_body_height(cols, screen_rows, &draft);
+        let popup_max_height = max_repl_popup_height(screen_rows, composer_body_height) as usize;
+        let popup_view =
+            repl_slash_popup_view(popup_model.as_ref(), &draft, cols, popup_max_height);
+        let inline_layout =
+            compute_inline_repl_layout(composer_body_height, popup_view.lines.len() as u16);
+        let inline_needed_height = inline_layout.status_row.saturating_add(1);
+        if mode == ReplUiMode::Inline && inline_needed_height > inline_reserved_height {
+            reserve_inline_repl_rows(
+                stdout,
+                screen_rows,
+                inline_needed_height.saturating_sub(inline_reserved_height),
+            )?;
+            inline_reserved_height = inline_needed_height;
+        }
+        let row_offset = if mode == ReplUiMode::Inline {
+            screen_rows.saturating_sub(inline_reserved_height)
+        } else {
+            0
+        };
+        render_repl_editor(
+            stdout,
+            &view,
+            &draft,
+            popup_model.as_ref(),
+            row_offset,
+            mode,
+        )?;
         let event = event::read().map_err(|err| {
             AppError::new(EXIT_ARGS, format!("failed to read terminal event: {err}"))
         })?;
@@ -3173,6 +3517,7 @@ fn build_repl_screen_view(
     session_id: &str,
     cols: u16,
     state: &ReplState,
+    mode: ReplUiMode,
 ) -> ReplScreenView {
     let provider_id =
         repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string());
@@ -3184,14 +3529,18 @@ fn build_repl_screen_view(
                 .map(|name| name.to_string_lossy().to_string())
         })
         .unwrap_or_else(|| ".".to_string());
-    let transcript = render_repl_transcript(
-        paths,
-        config,
-        session_id,
-        cols.max(1) as usize,
-        &state.panels,
-        state.transient_panel.as_ref(),
-    );
+    let transcript = if mode == ReplUiMode::Inline {
+        String::new()
+    } else {
+        render_repl_transcript(
+            paths,
+            config,
+            session_id,
+            cols.max(1) as usize,
+            &state.panels,
+            state.transient_panel.as_ref(),
+        )
+    };
     ReplScreenView {
         transcript,
         provider_id,
@@ -3208,9 +3557,16 @@ fn render_repl_editor(
     view: &ReplScreenView,
     draft: &ReplEditorDraft,
     popup_model: Option<&ReplPopupModel>,
+    viewport_top: u16,
+    mode: ReplUiMode,
 ) -> AppResult<()> {
-    let (cols, rows) = terminal::size()
+    let (cols, screen_rows) = terminal::size()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
+    let rows = if mode == ReplUiMode::Inline {
+        screen_rows.saturating_sub(viewport_top)
+    } else {
+        screen_rows
+    };
     if cols == 0 || rows == 0 {
         return Ok(());
     }
@@ -3218,7 +3574,11 @@ fn render_repl_editor(
     let composer_body_height = repl_composer_body_height(cols, rows, draft);
     let popup_max_height = max_repl_popup_height(rows, composer_body_height) as usize;
     let popup_view = repl_slash_popup_view(popup_model, draft, cols, popup_max_height);
-    let layout = compute_repl_layout(rows, composer_body_height, popup_view.lines.len() as u16);
+    let layout = if mode == ReplUiMode::Inline {
+        compute_inline_repl_layout(composer_body_height, popup_view.lines.len() as u16)
+    } else {
+        compute_repl_layout(rows, composer_body_height, popup_view.lines.len() as u16)
+    };
     let transcript_lines = clipped_repl_transcript_lines(
         &view.transcript,
         cols,
@@ -3227,21 +3587,45 @@ fn render_repl_editor(
     );
     let composer_view = repl_composer_view(draft, cols, layout.composer_body_height);
     let status_bar = build_repl_status_bar(view, draft, cols);
+    let row_offset = if mode == ReplUiMode::Inline {
+        viewport_top
+    } else {
+        0
+    };
 
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
-        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to draw REPL editor: {err}")))?;
-
-    for (row, line) in transcript_lines.iter().enumerate() {
-        write_repl_line(stdout, row as u16, line)?;
+    if mode == ReplUiMode::Inline {
+        execute!(
+            stdout,
+            MoveTo(0, row_offset),
+            Clear(ClearType::FromCursorDown)
+        )
+        .map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to clear inline REPL viewport: {err}"),
+            )
+        })?;
+    } else {
+        execute!(stdout, MoveTo(0, 0), Clear(ClearType::All)).map_err(|err| {
+            AppError::new(EXIT_ARGS, format!("failed to draw REPL editor: {err}"))
+        })?;
     }
 
-    draw_repl_slash_popup(stdout, cols, &layout, &popup_view)?;
-    draw_repl_composer(stdout, cols, &layout, &composer_view)?;
-    write_repl_line(stdout, layout.status_row, &status_bar)?;
+    for (row, line) in transcript_lines.iter().enumerate() {
+        write_repl_line(stdout, row_offset + row as u16, line)?;
+    }
+
+    draw_repl_slash_popup(stdout, cols, &layout, &popup_view, row_offset)?;
+    draw_repl_composer(stdout, cols, &layout, &composer_view, row_offset)?;
+    write_repl_line(stdout, row_offset + layout.status_row, &status_bar)?;
 
     let cursor = repl_cursor_position(cols, &layout, &composer_view);
-    execute!(stdout, MoveTo(cursor.0, cursor.1), cursor::Show)
-        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to place REPL cursor: {err}")))?;
+    execute!(
+        stdout,
+        MoveTo(cursor.0, row_offset + cursor.1),
+        cursor::Show
+    )
+    .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to place REPL cursor: {err}")))?;
     stdout
         .flush()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush REPL editor: {err}")))?;
@@ -3263,6 +3647,21 @@ fn compute_repl_layout(rows: u16, composer_body_height: u16, popup_height: u16) 
     let composer_top = rows.saturating_sub(composer_body_height + 3 + popup_height);
     let popup_top = composer_top + composer_body_height + 2;
     let transcript_height = composer_top;
+    ReplLayout {
+        transcript_height,
+        popup_top,
+        popup_height,
+        composer_top,
+        composer_body_height,
+        status_row,
+    }
+}
+
+fn compute_inline_repl_layout(composer_body_height: u16, popup_height: u16) -> ReplLayout {
+    let transcript_height = 0;
+    let composer_top = 0;
+    let popup_top = composer_top + composer_body_height + 2;
+    let status_row = popup_top + popup_height;
     ReplLayout {
         transcript_height,
         popup_top,
@@ -3679,23 +4078,24 @@ fn draw_repl_composer(
     cols: u16,
     layout: &ReplLayout,
     composer_view: &ReplComposerView,
+    row_offset: u16,
 ) -> AppResult<()> {
     let inner_width = cols.saturating_sub(2) as usize;
     let top_border = full_width_rule(cols);
     let bottom_border = full_width_rule(cols);
-    write_repl_line(stdout, layout.composer_top, &top_border)?;
+    write_repl_line(stdout, row_offset + layout.composer_top, &top_border)?;
 
     for index in 0..layout.composer_body_height as usize {
         let content = composer_view.lines.get(index).cloned().unwrap_or_default();
         let truncated = ansi_truncate(&content, inner_width);
         let padding = inner_width.saturating_sub(visible_width(&truncated));
-        let row = layout.composer_top + 1 + index as u16;
+        let row = row_offset + layout.composer_top + 1 + index as u16;
         let line = format!(" {truncated}{}", " ".repeat(padding));
         write_repl_line(stdout, row, &line)?;
     }
     write_repl_line(
         stdout,
-        layout.composer_top + layout.composer_body_height + 1,
+        row_offset + layout.composer_top + layout.composer_body_height + 1,
         &bottom_border,
     )?;
     Ok(())
@@ -3711,6 +4111,7 @@ fn draw_repl_slash_popup(
     cols: u16,
     layout: &ReplLayout,
     popup_view: &ReplSlashPopupView,
+    row_offset: u16,
 ) -> AppResult<()> {
     if popup_view.lines.is_empty() || layout.popup_height == 0 {
         return Ok(());
@@ -3720,7 +4121,7 @@ fn draw_repl_slash_popup(
         let content = popup_view.lines.get(index).cloned().unwrap_or_default();
         let truncated = ansi_truncate(&content, inner_width);
         let padding = inner_width.saturating_sub(visible_width(&truncated));
-        let row = layout.popup_top + index as u16;
+        let row = row_offset + layout.popup_top + index as u16;
         let line = format!(" {truncated}{}", " ".repeat(padding));
         write_repl_line(stdout, row, &line)?;
     }
@@ -4161,7 +4562,8 @@ fn display_width_char(ch: char) -> usize {
 fn handle_repl_directive(
     input: ReplInput,
     state: &mut ReplState,
-    _stdout: &mut io::Stdout,
+    stdout: &mut io::Stdout,
+    use_tui: bool,
     cli: &Cli,
     paths: &AppPaths,
     config: &AppConfig,
@@ -4207,10 +4609,12 @@ fn handle_repl_directive(
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::Status => {
-                set_repl_transient_panel(
-                    state,
-                    build_repl_status_panel(cli, config, session_id, state),
-                );
+                let panel = build_repl_status_panel(cli, config, session_id, state);
+                if use_tui {
+                    set_repl_transient_panel(state, panel);
+                } else {
+                    print_repl_runtime_panel(stdout, &panel)?;
+                }
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::New => {
@@ -4801,7 +5205,7 @@ async fn execute_ask_with_tools(
                 .unwrap_or(80);
             eprintln!(
                 "{}",
-                render_tool_call_summary(round + 1, &response.tool_calls, tool_summary_width)
+                render_tool_call_list(&response.tool_calls, tool_summary_width)
             );
 
             prepared.request.messages.push(ChatMessage {
@@ -5935,6 +6339,7 @@ mod tests {
             },
             &mut state,
             &mut stdout,
+            false,
             &cli,
             &paths,
             &config,
@@ -5966,6 +6371,7 @@ mod tests {
             },
             &mut state,
             &mut stdout,
+            false,
             &cli,
             &paths,
             &config,
@@ -6337,7 +6743,7 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_call_summary_uses_multiple_lines() {
+    fn render_tool_call_list_uses_tool_names_without_tools_header() {
         let raw_calls = vec![
             json!({
                 "id": "call_webfetch",
@@ -6357,13 +6763,104 @@ mod tests {
             }),
         ];
 
-        let rendered = render_tool_call_summary(1, &raw_calls, 28);
-        let plain = rendered.replace(DIM, "").replace(RESET, "");
+        let rendered = render_tool_call_list(&raw_calls, 28);
+        let plain = rendered
+            .replace(BOLD, "")
+            .replace(DIM, "")
+            .replace(RESET, "");
 
-        assert!(plain.starts_with("[tools 1]"));
-        assert!(plain.contains("\n  • WebFetch:"));
-        assert!(plain.contains("\n  • Bash:"));
-        assert!(rendered.lines().count() >= 3);
+        assert!(!plain.contains("[tools"));
+        let lines = plain.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "• WebFetch");
+        assert!(lines[1].starts_with("    "));
+        assert!(plain.contains("\n• Bash\n"));
+        assert!(rendered.lines().count() >= 4);
+    }
+
+    #[test]
+    fn render_tool_call_list_uses_fixed_continuation_for_long_tool_names() {
+        let raw_calls = vec![json!({
+            "id": "call_mcp",
+            "type": "function",
+            "function": {
+                "name": "mcp__augment-context-engine__codebase-retrieval",
+                "arguments": "{\"directory_path\":\"/home/snemc/workspace/chat-cli\",\"information_request\":\"need detailed information about long command rendering and wrapping behavior in the terminal UI\"}"
+            }
+        })];
+
+        let rendered = render_tool_call_list(&raw_calls, 48);
+        let plain = rendered
+            .replace(BOLD, "")
+            .replace(DIM, "")
+            .replace(RESET, "");
+        let lines = plain.lines().collect::<Vec<_>>();
+
+        assert!(lines[0].starts_with("• mcp__augment-context-engine__codebase-retrieval"));
+        assert!(lines.iter().skip(1).all(|line| line.starts_with("    ")));
+    }
+
+    #[test]
+    fn render_tool_call_list_places_multiline_bash_preview_on_following_lines() {
+        let raw_calls = vec![json!({
+            "id": "call_bash",
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "arguments": "{\"command\":\"cd /tmp\\nprintf 'hello world from a very long command preview that should wrap nicely without wasting left space'\"}"
+            }
+        })];
+
+        let rendered = render_tool_call_list(&raw_calls, 42);
+        let plain = rendered
+            .replace(BOLD, "")
+            .replace(DIM, "")
+            .replace(RESET, "");
+        let lines = plain.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "• Bash");
+        assert!(lines.iter().skip(1).all(|line| line.starts_with("    ")));
+        assert!(lines.len() >= 3);
+    }
+
+    #[test]
+    fn repl_history_summarizes_tool_results() {
+        let config = test_config();
+        let turns = vec![vec![
+            SessionMessage {
+                role: "user".to_string(),
+                content: "show me the result".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            },
+            SessionMessage {
+                role: "tool".to_string(),
+                content: "line one\nline two\nline three\nline four".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".to_string()),
+                name: Some("Read".to_string()),
+                created_at: now_rfc3339(),
+            },
+        ]];
+
+        let rendered = render_repl_session_turns_with_width(&config, &turns, 40);
+        assert!(rendered.contains("Tool:"));
+        assert!(rendered.contains("line one"));
+        assert!(rendered.contains("line three"));
+        assert!(rendered.contains("+1 lines"));
+        assert!(!rendered.contains("line four"));
+    }
+
+    #[test]
+    fn compute_inline_repl_layout_reserves_no_transcript_rows() {
+        let layout = compute_inline_repl_layout(3, 2);
+        assert_eq!(layout.transcript_height, 0);
+        assert_eq!(layout.composer_top, 0);
+        assert_eq!(layout.popup_top, 5);
+        assert_eq!(layout.status_row, 7);
     }
 
     #[test]
