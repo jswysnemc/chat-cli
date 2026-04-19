@@ -952,7 +952,9 @@ pub fn execute_tool_with_context_and_paths(
         Some(handler) => (handler.execute)(call, &context)?,
         None if call.name.starts_with("mcp__") => (
             match paths {
-                Some(paths) => execute_mcp_tool_with_daemon(paths, config, &call.name, &call.arguments)?,
+                Some(paths) => {
+                    execute_mcp_tool_with_daemon(paths, config, &call.name, &call.arguments)?
+                }
                 None => crate::mcp::execute_mcp_tool(config, &call.name, &call.arguments)?,
             },
             Vec::new(),

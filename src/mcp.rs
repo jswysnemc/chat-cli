@@ -60,7 +60,11 @@ impl Default for McpServerConfig {
 pub struct McpConfigCompat {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerConfig>,
-    #[serde(default, alias = "mcpServers", skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        alias = "mcpServers",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
@@ -236,8 +240,12 @@ fn save_mcp_daemon_state(paths: &AppPaths, state: &McpDaemonState) -> AppResult<
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).code(EXIT_CONFIG, "failed to create MCP daemon dir")?;
     }
-    let text = serde_json::to_string_pretty(state)
-        .map_err(|err| AppError::new(EXIT_CONFIG, format!("failed to encode MCP daemon state: {err}")))?;
+    let text = serde_json::to_string_pretty(state).map_err(|err| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!("failed to encode MCP daemon state: {err}"),
+        )
+    })?;
     fs::write(path, text).code(EXIT_CONFIG, "failed to write MCP daemon state")
 }
 
@@ -286,7 +294,8 @@ pub fn current_mcp_server_statuses(paths: &AppPaths, config: &AppConfig) -> Vec<
         .iter()
         .map(|(name, server)| {
             let cached_entry = cache.servers.get(name);
-            let cached = cached_entry.is_some_and(|entry| server_matches_cache_entry(server, entry));
+            let cached =
+                cached_entry.is_some_and(|entry| server_matches_cache_entry(server, entry));
             let cached_tools = cached_entry.map(|entry| entry.tools.len()).unwrap_or(0);
             let probe = probes.get(name);
             McpServerStatus {
@@ -387,7 +396,10 @@ pub fn authenticate_and_cache_mcp(
     Ok(probes)
 }
 
-pub fn start_mcp_daemon_process(paths: &AppPaths, only_server: Option<&str>) -> AppResult<McpDaemonStart> {
+pub fn start_mcp_daemon_process(
+    paths: &AppPaths,
+    only_server: Option<&str>,
+) -> AppResult<McpDaemonStart> {
     let exe = std::env::current_exe().code(EXIT_CONFIG, "failed to locate current executable")?;
     let log_file = mcp_daemon_log_path(paths);
     if let Some(parent) = log_file.parent() {
@@ -398,7 +410,9 @@ pub fn start_mcp_daemon_process(paths: &AppPaths, only_server: Option<&str>) -> 
         .append(true)
         .open(&log_file)
         .code(EXIT_CONFIG, "failed to open MCP daemon log")?;
-    let log_err = log.try_clone().code(EXIT_CONFIG, "failed to clone MCP daemon log")?;
+    let log_err = log
+        .try_clone()
+        .code(EXIT_CONFIG, "failed to clone MCP daemon log")?;
     let mut command = Command::new(exe);
     if let Some(config_dir) = paths.config_file.parent() {
         command.arg("--config-dir").arg(config_dir);
@@ -411,7 +425,9 @@ pub fn start_mcp_daemon_process(paths: &AppPaths, only_server: Option<&str>) -> 
     command.stdin(Stdio::null());
     command.stdout(Stdio::from(log));
     command.stderr(Stdio::from(log_err));
-    let _child = command.spawn().code(EXIT_CONFIG, "failed to spawn MCP daemon")?;
+    let _child = command
+        .spawn()
+        .code(EXIT_CONFIG, "failed to spawn MCP daemon")?;
     Ok(McpDaemonStart {
         pid_file: mcp_daemon_pid_path(paths),
         log_file,
@@ -419,7 +435,11 @@ pub fn start_mcp_daemon_process(paths: &AppPaths, only_server: Option<&str>) -> 
     })
 }
 
-pub fn run_mcp_daemon(paths: &AppPaths, config: &AppConfig, only_server: Option<&str>) -> AppResult<()> {
+pub fn run_mcp_daemon(
+    paths: &AppPaths,
+    config: &AppConfig,
+    only_server: Option<&str>,
+) -> AppResult<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .code(EXIT_CONFIG, "failed to bind MCP daemon listener")?;
     listener
@@ -450,21 +470,26 @@ pub fn run_mcp_daemon(paths: &AppPaths, config: &AppConfig, only_server: Option<
             .collect(),
     );
     loop {
-        let (mut stream, _) = listener.accept().code(EXIT_CONFIG, "MCP daemon accept failed")?;
+        let (mut stream, _) = listener
+            .accept()
+            .code(EXIT_CONFIG, "MCP daemon accept failed")?;
         let mut body = String::new();
         stream
             .read_to_string(&mut body)
             .code(EXIT_CONFIG, "failed to read MCP daemon request")?;
-        let request: McpDaemonRequest = serde_json::from_str(&body)
-            .code(EXIT_CONFIG, "failed to parse MCP daemon request")?;
+        let request: McpDaemonRequest =
+            serde_json::from_str(&body).code(EXIT_CONFIG, "failed to parse MCP daemon request")?;
         let response = match request.kind.as_str() {
             "stop" => {
-                write_daemon_response(&mut stream, &McpDaemonResponse {
-                    ok: true,
-                    content: Some("stopping".to_string()),
-                    tools: None,
-                    error: None,
-                })?;
+                write_daemon_response(
+                    &mut stream,
+                    &McpDaemonResponse {
+                        ok: true,
+                        content: Some("stopping".to_string()),
+                        tools: None,
+                        error: None,
+                    },
+                )?;
                 let _ = fs::remove_file(mcp_daemon_pid_path(paths));
                 return Ok(());
             }
@@ -503,7 +528,7 @@ pub fn run_mcp_daemon(paths: &AppPaths, config: &AppConfig, only_server: Option<
                     tools: None,
                     error: Some("missing full_name".to_string()),
                 },
-            }
+            },
             other => McpDaemonResponse {
                 ok: false,
                 content: None,
@@ -517,15 +542,20 @@ pub fn run_mcp_daemon(paths: &AppPaths, config: &AppConfig, only_server: Option<
 
 pub fn stop_mcp_daemon(paths: &AppPaths) -> AppResult<McpDaemonStop> {
     let state = load_mcp_daemon_state(paths)?;
-    let response = call_mcp_daemon(paths, &McpDaemonRequest {
-        kind: "stop".to_string(),
-        full_name: None,
-        arguments: None,
-    })?;
+    let response = call_mcp_daemon(
+        paths,
+        &McpDaemonRequest {
+            kind: "stop".to_string(),
+            full_name: None,
+            arguments: None,
+        },
+    )?;
     if !response.ok {
         return Err(AppError::new(
             EXIT_CONFIG,
-            response.error.unwrap_or_else(|| "failed to stop MCP daemon".to_string()),
+            response
+                .error
+                .unwrap_or_else(|| "failed to stop MCP daemon".to_string()),
         ));
     }
     Ok(McpDaemonStop { pid: state.pid })
@@ -535,8 +565,12 @@ fn call_mcp_daemon(paths: &AppPaths, request: &McpDaemonRequest) -> AppResult<Mc
     let state = load_mcp_daemon_state(paths)?;
     let mut stream = TcpStream::connect(("127.0.0.1", state.port))
         .code(EXIT_CONFIG, "failed to connect MCP daemon")?;
-    let body = serde_json::to_string(request)
-        .map_err(|err| AppError::new(EXIT_CONFIG, format!("failed to encode MCP daemon request: {err}")))?;
+    let body = serde_json::to_string(request).map_err(|err| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!("failed to encode MCP daemon request: {err}"),
+        )
+    })?;
     stream
         .write_all(body.as_bytes())
         .code(EXIT_CONFIG, "failed to write MCP daemon request")?;
@@ -549,8 +583,12 @@ fn call_mcp_daemon(paths: &AppPaths, request: &McpDaemonRequest) -> AppResult<Mc
 }
 
 fn write_daemon_response(stream: &mut TcpStream, response: &McpDaemonResponse) -> AppResult<()> {
-    let body = serde_json::to_string(response)
-        .map_err(|err| AppError::new(EXIT_CONFIG, format!("failed to encode MCP daemon response: {err}")))?;
+    let body = serde_json::to_string(response).map_err(|err| {
+        AppError::new(
+            EXIT_CONFIG,
+            format!("failed to encode MCP daemon response: {err}"),
+        )
+    })?;
     stream
         .write_all(body.as_bytes())
         .code(EXIT_CONFIG, "failed to write MCP daemon response")
@@ -584,7 +622,10 @@ pub fn start_mcp_warmup(config: &AppConfig) -> Option<McpWarmupHandle> {
     Some(McpWarmupHandle { state })
 }
 
-pub fn wait_for_mcp_warmup(handle: &McpWarmupHandle, timeout_sec: f64) -> Option<AppResult<Vec<McpServerProbe>>> {
+pub fn wait_for_mcp_warmup(
+    handle: &McpWarmupHandle,
+    timeout_sec: f64,
+) -> Option<AppResult<Vec<McpServerProbe>>> {
     let timeout = duration_from_secs_f64(timeout_sec)?;
     let start = SystemTime::now();
     loop {
@@ -722,7 +763,10 @@ fn execute_mcp_tool_direct_for_server(
     call_mcp_tool(&server, &tool.remote_name, arguments)
 }
 
-pub fn list_mcp_tools_with_daemon(paths: &AppPaths, config: &AppConfig) -> AppResult<Vec<McpToolSpec>> {
+pub fn list_mcp_tools_with_daemon(
+    paths: &AppPaths,
+    config: &AppConfig,
+) -> AppResult<Vec<McpToolSpec>> {
     if !mcp_enabled(config) {
         return Ok(Vec::new());
     }
@@ -829,7 +873,11 @@ fn find_mcp_tool(config: &AppConfig, full_name: &str) -> AppResult<Option<McpToo
         .find(|tool| tool.full_name == full_name))
 }
 
-fn decode_tool_specs(server_name: &str, server: &McpServerConfig, result: &Value) -> Vec<McpToolSpec> {
+fn decode_tool_specs(
+    server_name: &str,
+    server: &McpServerConfig,
+    result: &Value,
+) -> Vec<McpToolSpec> {
     let tools = result["tools"].as_array().cloned().unwrap_or_default();
     let enabled = &server.enabled_tools;
     let disabled = &server.disabled_tools;
@@ -911,7 +959,10 @@ fn call_daemon_session_tool(
         .iter_mut()
         .find(|session| session.tools.iter().any(|tool| tool.full_name == full_name))
     else {
-        return Err(AppError::new(EXIT_ARGS, format!("unknown MCP tool `{full_name}`")));
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("unknown MCP tool `{full_name}`"),
+        ));
     };
     let tool = session
         .tools
@@ -1311,7 +1362,10 @@ mod tests {
         .unwrap();
         let cache = load_mcp_cache(&paths).unwrap();
         assert_eq!(cache.servers.len(), 1);
-        assert_eq!(cache.servers["ace"].tools[0].full_name, "mcp__ace__codebase-retrieval");
+        assert_eq!(
+            cache.servers["ace"].tools[0].full_name,
+            "mcp__ace__codebase-retrieval"
+        );
     }
 
     #[test]

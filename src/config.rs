@@ -730,7 +730,10 @@ mod tests {
 
         let config = load_config(&paths).unwrap();
         assert_eq!(config.mcp.get("demo").unwrap().command, "uvx");
-        assert_eq!(config.mcp.get("demo").unwrap().r#type.as_deref(), Some("stdio"));
+        assert_eq!(
+            config.mcp.get("demo").unwrap().r#type.as_deref(),
+            Some("stdio")
+        );
 
         let _ = fs::remove_dir_all(base);
     }

@@ -1,7 +1,7 @@
 use crate::cli::{
     AskArgs, AuthCommand, AuthSetArgs, Cli, Commands, ConfigCommand, McpArgs, McpAuthArgs,
-    McpCommand, McpStartArgs, ModelCommand, ModelSetArgs, OutputFormat, ProviderCommand,
-    ReplArgs, SessionCommand,
+    McpCommand, McpStartArgs, ModelCommand, ModelSetArgs, OutputFormat, ProviderCommand, ReplArgs,
+    SessionCommand,
 };
 use crate::config::{
     AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderSecret,
@@ -37,10 +37,9 @@ use crate::session::{
 #[cfg(test)]
 use crate::tool::execute_tool;
 use crate::tool::{
-    continue_bash_session, execute_tool_with_context_and_paths,
-    initial_tool_definitions, list_bash_sessions, lookup_tool_spec, parse_tool_call,
-    tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
-    tool_search_matches,
+    continue_bash_session, execute_tool_with_context_and_paths, initial_tool_definitions,
+    list_bash_sessions, lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation,
+    tool_call_side_effects, tool_definitions_for_names, tool_search_matches,
 };
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
@@ -1379,7 +1378,13 @@ fn execute_tool_as_message_with_context(
                     name: Some(call.name),
                 };
             }
-            match execute_tool_with_context_and_paths(&call, auto_confirm, config, Some(paths), transcript) {
+            match execute_tool_with_context_and_paths(
+                &call,
+                auto_confirm,
+                config,
+                Some(paths),
+                transcript,
+            ) {
                 Ok(result) => ChatMessage {
                     role: "tool".to_string(),
                     content: result.content,
@@ -4843,7 +4848,8 @@ async fn execute_ask_with_tools(
                     if let Some(warmup) = &prepared.mcp_warmup {
                         match wait_for_mcp_warmup(warmup, crate::mcp::MCP_WARMUP_WAIT_SECS) {
                             Some(Ok(probes)) => {
-                                let tools = probes.into_iter().flat_map(|probe| probe.tools).collect();
+                                let tools =
+                                    probes.into_iter().flat_map(|probe| probe.tools).collect();
                                 set_cached_mcp_tools(config, tools);
                             }
                             Some(Err(err)) => eprintln!("warning: {}", err.message),
@@ -5724,7 +5730,8 @@ mod tests {
                 ..crate::mcp::McpServerConfig::default()
             },
         );
-        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
+        let prepared =
+            prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
         assert_eq!(prepared.request.messages.last().unwrap().role, "user");
     }
 
