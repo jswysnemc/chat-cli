@@ -21,6 +21,23 @@ cargo build --release
 cargo install --path .
 ```
 
+GitHub Release 会发布 `linux-x86_64`、`macos-x86_64`、`macos-arm64`、`windows-x86_64` 的预编译产物。
+
+## 平台说明
+
+建议准备的本地依赖：
+
+- `rg` / ripgrep：内建 `Grep` 工具必需，Linux、macOS、Windows 都一样
+- Nerd Font：可选，但在符号回退较弱的终端里能改善 REPL 显示效果
+- `fzf`：可选，方便模型和会话切换
+- `uv`：可选，但一些 MCP 服务或辅助脚本会更适合搭配它
+
+剪贴板后端：
+
+- Linux：`wl-paste` 或 `xclip`
+- macOS：文本走 `pbpaste`，图片走 `pngpaste`
+- Windows：使用 PowerShell 自带的剪贴板接口
+
 ## 快速开始
 
 ```bash
@@ -46,9 +63,15 @@ chat session list
 chat config provider set openai --kind openai_compatible --base-url https://api.openai.com/v1
 ```
 
+## 内建工具说明
+
+- `Grep` 直接调用外部 `rg` 二进制。Windows 只要 `rg.exe` 在 `PATH` 里就可以正常工作。`glob`/`include` 会传给 ripgrep 的 `--glob`，`output_mode` 支持 `content`、`files_with_matches`、`count`。
+- `Glob` 用 Rust 内部实现，基于 `walkdir` 和 glob 转正则，不会调用 `rg`。模式是相对 `path` 匹配的，例如 `pattern="src/*.rs"` 且 `path="."` 时会匹配 `src/main.rs`。
+- `Status` 已按跨平台方式实现，会输出当前工作区、git 状态、操作系统、shell 工具可用性，以及常见开发依赖是否已安装，其中包含 `rg`。
+
 ## Shell 快捷命令示例
 
-如果你平时主要在 shell 里使用，可以在 `~/.zshrc` 或 `~/.bashrc` 里加入这些快捷命令：
+下面这些 alias 示例适用于 `zsh` 和 `bash`。如果你平时主要在 POSIX shell 里使用，可以在 `~/.zshrc` 或 `~/.bashrc` 里加入这些快捷命令：
 
 ```bash
 alias ca='chat ask --stream'
@@ -61,6 +84,16 @@ alias ct='chat ask --stream --new-session --temp'
 - `ca`：流式单次提问或继续当前会话
 - `cn`：流式提问，并强制新建会话
 - `ct`：流式提问，并创建临时会话
+
+PowerShell 可以在 `$PROFILE` 里加入对应函数：
+
+```powershell
+function ca { chat ask --stream @args }
+function cn { chat ask --stream --new-session @args }
+function ct { chat ask --stream --new-session --temp @args }
+```
+
+下面的 `fzf` 示例默认你使用的是 POSIX shell：
 
 模型切换如果要配合 `fzf` 交互选择，建议写成函数，不要写成 alias：
 
@@ -90,6 +123,12 @@ ccs() {
 source ~/.zshrc
 # 或
 source ~/.bashrc
+```
+
+PowerShell：
+
+```powershell
+. $PROFILE
 ```
 
 ## 命令
@@ -153,9 +192,11 @@ chat config init              # 初始化配置目录
 chat config path              # 打印配置/数据/缓存路径
 chat config show              # 显示完整配置
 chat config get defaults.model
+chat config get defaults.collapse_thinking
 chat config get defaults.context_status
 chat config get defaults.context_window
 chat config get defaults.reasoning_effort
+chat config set defaults.collapse_thinking true
 chat config set defaults.context_status system-once
 chat config set defaults.context_window 128000
 chat config set defaults.reasoning_effort high
@@ -178,12 +219,21 @@ chat config auth status
 chat config auth remove deepseek
 ```
 
+### `chat thinking`
+
+显示最近一次本地保存的思考内容。
+
+```bash
+chat thinking
+```
+
 ## 配置
 
-默认配置路径（符合 XDG 规范）：
-- 配置：`~/.config/chat-cli/config.toml`
-- 密钥：`~/.config/chat-cli/secrets.toml`
-- 会话：`~/.local/share/chat-cli/sessions/`
+默认配置路径和平台有关。可以执行 `chat config path` 查看当前机器实际使用的路径。
+
+- Linux：`~/.config/chat-cli/config.toml`、`~/.config/chat-cli/secrets.toml`、`~/.local/share/chat-cli/sessions/`
+- macOS：`~/Library/Application Support/chat-cli/config.toml`、`~/Library/Application Support/chat-cli/secrets.toml`、`~/Library/Application Support/chat-cli/sessions/`
+- Windows：`%APPDATA%\chat-cli\config.toml`、`%APPDATA%\chat-cli\secrets.toml`、`%LOCALAPPDATA%\chat-cli\sessions\`
 
 先执行一次 `chat config init`。初始化生成的默认配置会把 `defaults.tools = true` 打开，也就是默认开启 tool calling；同时把 `tools.progressive_loading = false` 设为默认关闭，并把 `tools.mcp = false` 设为默认关闭。
 
@@ -339,7 +389,7 @@ chat ask "解释这个报错"
 - `model set --remote-name` 必须和上游真实模型名一致
 - 如果要发送图片，model 必须包含 `vision` capability，否则会直接拒绝请求
 - `-i/--image` 会读取你显式传入的图片文件路径，并把这些文件作为图片输入直接发送给模型
-- `-I/--clipboard-image` 会先从当前剪贴板读取图片，再把剪贴板里的图片发送给模型；它和 `-i` 走的是不同的输入路径，只是最终都会作为支持视觉的模型图片输入
+- `-I/--clipboard-image` 会先从当前剪贴板读取图片，再把剪贴板里的图片发送给模型；它和 `-i` 走的是不同的输入路径，只是最终都会作为支持视觉的模型图片输入。Linux 依赖 `wl-paste` 或 `xclip`，macOS 依赖 `pngpaste`，Windows 使用 PowerShell 剪贴板接口
 - `chat config provider test <id>` 只校验连通性和基础鉴权，不代表该 provider 下所有 model 都一定可用
 - 有些 OpenAI 兼容网关提供 `/models`，有些只支持 `/chat/completions`；当前健康检查在 `/models` 返回 404 时会自动回退
 - `defaults.tools = true` 表示 `ask` 和 `repl` 默认启用 tool calling；如果当前模型或网关对 tools 支持不好，可以执行 `chat config set defaults.tools false`
@@ -423,6 +473,14 @@ capabilities = ["chat", "reasoning"]           # 例如 chat reasoning vision im
 - `always`：每轮用户消息前都注入状态，并保留到会话历史里
 - `latest`：只对当前这轮用户消息注入，回复完成后落盘原始用户消息，不保留注入状态
 - `system-once`：只在会话开始时作为一条 system message 注入一次，位置在初始 system prompt 之后，后续不再刷新
+
+思考与运行时上下文控制：
+
+- `collapse_thinking = false`：普通文本渲染时保留 `<think>...</think>` 内容
+- `collapse_thinking = true`：普通渲染时隐藏 `<think>...</think>`，但最近一次思考内容仍会保存在本地，可通过 `chat thinking` 查看
+- `context_window`：运行时上下文提示值。生效优先级是 REPL 的 `/context` 或命令行 `--context-window`，然后 `models.<id>.context_window`，最后 `defaults.context_window`
+- `reasoning_effort`：运行时推理强度提示。生效优先级是 REPL 的 `/reasoning` 或命令行 `--reasoning-effort`，然后 `defaults.reasoning_effort`，最后 `models.<id>.reasoning_effort`
+- `reasoning_effort = "auto"`：不向上游显式传递推理强度提示
 
 ### `secrets.toml` 脱敏示例
 

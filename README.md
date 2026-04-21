@@ -23,6 +23,23 @@ cargo build --release
 cargo install --path .
 ```
 
+Prebuilt release archives are published for `linux-x86_64`, `macos-x86_64`, `macos-arm64`, and `windows-x86_64`.
+
+## Platform Notes
+
+Recommended local dependencies:
+
+- `rg` / ripgrep: required by the built-in `Grep` tool on Linux, macOS, and Windows
+- Nerd Font: optional, but improves REPL rendering in terminals with weak symbol fallback
+- `fzf`: optional for shell helpers and quick session/model switching
+- `uv`: optional but useful when MCP servers or helper scripts expect it
+
+Clipboard backends:
+
+- Linux: `wl-paste` or `xclip`
+- macOS: `pbpaste` for text and `pngpaste` for images
+- Windows: built-in PowerShell clipboard APIs
+
 ## Quick Start
 
 ```bash
@@ -42,9 +59,15 @@ chat session list
 chat config provider set openai --kind openai_compatible --base-url https://api.openai.com/v1
 ```
 
+## Built-in Tool Notes
+
+- `Grep` calls the external `rg` binary directly. On Windows this works as long as `rg.exe` is on `PATH`. `glob`/`include` is passed to ripgrep via `--glob`, and `output_mode` supports `content`, `files_with_matches`, and `count`.
+- `Glob` is implemented in Rust with `walkdir` plus glob-to-regex conversion. It does not call `rg`, and patterns are matched relative to `path`. For example, `pattern="src/*.rs"` with `path="."` matches `src/main.rs`.
+- `Status` is cross-platform and reports the current workspace, git context, OS, shell tool availability, and common developer dependencies, including whether `rg` is installed.
+
 ## Shell shortcuts
 
-If you use the tool mostly from a shell, you can add these shortcuts to `~/.zshrc` or `~/.bashrc`:
+The alias examples below are for `zsh` and `bash`. If you use the tool mostly from a POSIX shell, you can add these shortcuts to `~/.zshrc` or `~/.bashrc`:
 
 ```bash
 alias ca='chat ask --stream'
@@ -57,6 +80,16 @@ Meaning:
 - `ca`: streaming ask against the current session flow
 - `cn`: streaming ask with a forced new session
 - `ct`: streaming ask with a new temporary session
+
+For PowerShell, add similar functions to `$PROFILE`:
+
+```powershell
+function ca { chat ask --stream @args }
+function cn { chat ask --stream --new-session @args }
+function ct { chat ask --stream --new-session --temp @args }
+```
+
+The `fzf` examples below assume a POSIX shell:
 
 For model switching with `fzf`, use a shell function rather than an alias:
 
@@ -86,6 +119,12 @@ Reload your shell config after editing:
 source ~/.zshrc
 # or
 source ~/.bashrc
+```
+
+PowerShell:
+
+```powershell
+. $PROFILE
 ```
 
 ## Commands
@@ -151,9 +190,11 @@ chat config init                 # initialize config directory
 chat config path                 # print config/data/cache paths
 chat config show                 # show full config
 chat config get defaults.model   # read one config value
+chat config get defaults.collapse_thinking
 chat config get defaults.context_status
 chat config get defaults.context_window
 chat config get defaults.reasoning_effort
+chat config set defaults.collapse_thinking true
 chat config set defaults.context_status system-once
 chat config set defaults.context_window 128000
 chat config set defaults.reasoning_effort high
@@ -176,12 +217,21 @@ chat config auth status
 chat config auth remove deepseek
 ```
 
+### `chat thinking`
+
+Display the last saved thinking content from a local response.
+
+```bash
+chat thinking
+```
+
 ## Configuration
 
-Default config locations (XDG compliant):
-- Config: `~/.config/chat-cli/config.toml`
-- Secrets: `~/.config/chat-cli/secrets.toml`
-- Sessions: `~/.local/share/chat-cli/sessions/`
+Default config locations depend on the platform. Run `chat config path` to inspect the active values on the current machine.
+
+- Linux: `~/.config/chat-cli/config.toml`, `~/.config/chat-cli/secrets.toml`, `~/.local/share/chat-cli/sessions/`
+- macOS: `~/Library/Application Support/chat-cli/config.toml`, `~/Library/Application Support/chat-cli/secrets.toml`, `~/Library/Application Support/chat-cli/sessions/`
+- Windows: `%APPDATA%\chat-cli\config.toml`, `%APPDATA%\chat-cli\secrets.toml`, `%LOCALAPPDATA%\chat-cli\sessions\`
 
 Run `chat config init` first. The generated default config enables tool calling by default with `defaults.tools = true`, disables progressive tool loading by default with `tools.progressive_loading = false`, and keeps MCP disabled by default with `tools.mcp = false`.
 
@@ -337,7 +387,7 @@ chat ask "Explain this error"
 - `model set --remote-name` must match the upstream model name exactly
 - To send images, the model must include capability `vision`; otherwise image requests are rejected
 - `-i/--image` reads image files from paths you provide and sends those files directly to the model
-- `-I/--clipboard-image` reads the current clipboard image first, then sends that clipboard image to the model; this is a different input path from `-i`, even though both end up as image input for vision-capable models
+- `-I/--clipboard-image` reads the current clipboard image first, then sends that clipboard image to the model; this is a different input path from `-i`, even though both end up as image input for vision-capable models. Linux uses `wl-paste` or `xclip`, macOS uses `pngpaste`, and Windows uses PowerShell clipboard APIs
 - `chat config provider test <id>` only checks connectivity and basic authentication; it does not prove every model under that provider is valid
 - Some OpenAI-compatible gateways expose `/models`, some only allow `/chat/completions`; the health check already falls back when `/models` returns 404
 - `defaults.tools = true` means tool calling is enabled by default for `ask` and `repl`; if the current model/provider does not support tools well, turn it off with `chat config set defaults.tools false`
@@ -421,6 +471,14 @@ capabilities = ["chat", "reasoning"]           # e.g. chat reasoning vision imag
 - `always`: inject status before every user turn and keep it in session history
 - `latest`: inject status only for the current user turn, then persist the raw user message without the injected status
 - `system-once`: inject status once as a system message right after the initial system prompt for a session, then never refresh it again
+
+Thinking and runtime context controls:
+
+- `collapse_thinking = false`: keep `<think>...</think>` content visible in normal text rendering
+- `collapse_thinking = true`: hide `<think>...</think>` content in rendered output, while still saving the latest thinking content for `chat thinking`
+- `context_window`: runtime context hint. Effective priority is REPL `/context` or CLI `--context-window`, then `models.<id>.context_window`, then `defaults.context_window`
+- `reasoning_effort`: runtime reasoning hint. Effective priority is REPL `/reasoning` or CLI `--reasoning-effort`, then `defaults.reasoning_effort`, then `models.<id>.reasoning_effort`
+- `reasoning_effort = "auto"`: do not send an explicit reasoning hint upstream
 
 ### Sanitized `secrets.toml` Example
 

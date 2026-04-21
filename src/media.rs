@@ -67,28 +67,56 @@ pub fn read_image_file(path: &Path) -> AppResult<MessageImage> {
 }
 
 pub fn read_clipboard_image() -> AppResult<MessageImage> {
-    try_read_wayland_clipboard_image()
-        .or_else(try_read_xclip_clipboard_image)
-        .or_else(try_read_pngpaste_clipboard_image)
-        .ok_or_else(|| {
-            AppError::new(
-                EXIT_ARGS,
-                "failed to read clipboard image; copy an image first and ensure `wl-paste`, `xclip`, or `pngpaste` is available",
-            )
-        })
+    clipboard_image_from_supported_sources()
+        .ok_or_else(|| AppError::new(EXIT_ARGS, clipboard_image_error_message()))
 }
 
 pub fn read_clipboard_text() -> AppResult<String> {
+    clipboard_text_from_supported_sources()
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| AppError::new(EXIT_ARGS, clipboard_text_error_message()))
+}
+
+fn clipboard_image_from_supported_sources() -> Option<MessageImage> {
+    #[cfg(windows)]
+    if let Some(image) = try_read_windows_clipboard_image() {
+        return Some(image);
+    }
+
+    try_read_wayland_clipboard_image()
+        .or_else(try_read_xclip_clipboard_image)
+        .or_else(try_read_pngpaste_clipboard_image)
+}
+
+fn clipboard_text_from_supported_sources() -> Option<String> {
+    #[cfg(windows)]
+    if let Some(text) = try_read_windows_clipboard_text() {
+        return Some(text);
+    }
+
     try_read_wayland_clipboard_text()
         .or_else(try_read_xclip_clipboard_text)
         .or_else(try_read_pbpaste_clipboard_text)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| {
-            AppError::new(
-                EXIT_ARGS,
-                "failed to read clipboard text; copy some text first and ensure `wl-paste`, `xclip`, or `pbpaste` is available",
-            )
-        })
+}
+
+fn clipboard_image_error_message() -> &'static str {
+    if cfg!(windows) {
+        "failed to read clipboard image; copy an image first and ensure PowerShell clipboard access is available"
+    } else if cfg!(target_os = "macos") {
+        "failed to read clipboard image; copy an image first and ensure `pngpaste` is available"
+    } else {
+        "failed to read clipboard image; copy an image first and ensure `wl-paste` or `xclip` is available"
+    }
+}
+
+fn clipboard_text_error_message() -> &'static str {
+    if cfg!(windows) {
+        "failed to read clipboard text; copy some text first and ensure PowerShell clipboard access is available"
+    } else if cfg!(target_os = "macos") {
+        "failed to read clipboard text; copy some text first and ensure `pbpaste` is available"
+    } else {
+        "failed to read clipboard text; copy some text first and ensure `wl-paste` or `xclip` is available"
+    }
 }
 
 fn try_read_wayland_clipboard_image() -> Option<MessageImage> {
@@ -171,6 +199,58 @@ fn try_read_pbpaste_clipboard_text() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(windows)]
+fn try_read_windows_clipboard_image() -> Option<MessageImage> {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 1 }
+$image = [System.Windows.Forms.Clipboard]::GetImage()
+if ($null -eq $image) { exit 1 }
+$stream = New-Object System.IO.MemoryStream
+try {
+    $image.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bytes = $stream.ToArray()
+    [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)
+} finally {
+    $stream.Dispose()
+    if ($image -is [System.IDisposable]) { $image.Dispose() }
+}
+"#;
+    let output = run_windows_powershell(&["-NoLogo", "-NoProfile", "-Sta", "-Command", script])?;
+    if output.stdout.is_empty() {
+        return None;
+    }
+    Some(MessageImage::from_bytes(&output.stdout, "image/png"))
+}
+
+#[cfg(windows)]
+fn try_read_windows_clipboard_text() -> Option<String> {
+    let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$text = Get-Clipboard -Raw
+if ($null -eq $text) { exit 1 }
+[Console]::Out.Write($text)
+"#;
+    let output = run_windows_powershell(&["-NoLogo", "-NoProfile", "-Sta", "-Command", script])?;
+    if output.stdout.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(windows)]
+fn run_windows_powershell(args: &[&str]) -> Option<std::process::Output> {
+    for program in ["powershell.exe", "pwsh.exe"] {
+        if let Ok(output) = Command::new(program).args(args).output()
+            && output.status.success()
+        {
+            return Some(output);
+        }
+    }
+    None
 }
 
 pub fn detect_image_media_type(path: &Path, bytes: &[u8]) -> Option<&'static str> {

@@ -616,7 +616,15 @@ pub fn read_system_prompt(value: &Option<String>) -> AppResult<Option<String>> {
 }
 
 pub fn expand_tilde(input: &str) -> PathBuf {
-    if let Some(stripped) = input.strip_prefix("~/") {
+    if input == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    if let Some(stripped) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\"))
+    {
         if let Some(home) = dirs::home_dir() {
             return home.join(stripped);
         }
@@ -940,6 +948,14 @@ mod tests {
         assert!(edit_text.contains("文件编辑"));
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn expand_tilde_supports_unix_and_windows_style_prefixes() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/demo"), home.join("demo"));
+        assert_eq!(expand_tilde("~\\demo"), home.join("demo"));
     }
 
     #[test]

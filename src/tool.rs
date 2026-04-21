@@ -381,7 +381,7 @@ const BUILTIN_TOOL_HANDLERS: [ToolHandler; 11] = [
         spec: ToolSpec {
             name: "Status",
             aliases: &["status"],
-            description: "Get current environment status information including time, user, working directory, file tree, git info, and dev tool versions.",
+            description: "Get current environment status information including time, user, working directory, file tree, git info, shell tool availability, and dev tool versions.",
             search_hint: "get current environment status",
             side_effects: ToolSideEffects::ReadOnly,
             parallelism: ToolParallelism::ParallelSafe,
@@ -567,7 +567,7 @@ fn define_grep_tool() -> Value {
         "type": "function",
         "function": {
             "name": "Grep",
-            "description": "Search for a regex pattern in files.",
+            "description": "Search for a regex pattern in files using ripgrep (`rg`). ripgrep must be installed and available on PATH.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -600,7 +600,7 @@ fn define_glob_tool() -> Value {
         "type": "function",
         "function": {
             "name": "Glob",
-            "description": "Find files by glob pattern.",
+            "description": "Find files by glob pattern. Patterns are matched relative to the provided base path and the returned results use normalized paths.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -687,7 +687,7 @@ fn define_status_tool() -> Value {
         "type": "function",
         "function": {
             "name": "Status",
-            "description": "Get current environment status information. Returns: current time, current user, working directory (with empty check), file tree (recursive up to 2 levels, ignoring common build/cache dirs), git repo status (branch, commit), OS info, and versions of common dev tools (python, node, rust, go, java).",
+            "description": "Get current environment status information. Returns: current time, current user, working directory (with empty check), file tree (recursive up to 2 levels, ignoring common build/cache dirs), git repo status (branch, commit), OS info, shell tool availability, and versions of common dev tools including git, ripgrep, python, node, rust, cargo, uv, fzf, go, and java.",
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -1912,13 +1912,28 @@ fn tool_glob(pattern: &str, path: &str) -> AppResult<String> {
         return Err(AppError::new(EXIT_ARGS, format!("path not found: {path}")));
     }
     let regex = glob_to_regex(pattern)?;
+    let root_is_dir = root.is_dir();
     let mut matches = walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| {
+            let relative = if root_is_dir {
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or_else(|_| entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            } else {
+                entry
+                    .path()
+                    .file_name()
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default()
+            };
             let display = entry.path().to_string_lossy().replace('\\', "/");
-            regex.is_match(&display).then_some(display)
+            (regex.is_match(&relative) || regex.is_match(&display)).then_some(display)
         })
         .collect::<Vec<_>>();
     matches.sort();
@@ -1951,15 +1966,7 @@ fn tool_grep(
 
     match output_mode {
         "content" => {
-            let output = Command::new("rg")
-                .args(build_ripgrep_args(pattern, path, include))
-                .output()
-                .map_err(|err| {
-                    AppError::new(
-                        EXIT_ARGS,
-                        format!("failed to execute ripgrep (`rg`): {err}"),
-                    )
-                })?;
+            let output = run_ripgrep(build_ripgrep_args(pattern, path, include))?;
             match output.status.code() {
                 Some(0) | Some(1) => {}
                 Some(_) | None => {
@@ -1990,12 +1997,7 @@ fn tool_grep(
             args.push("--".to_string());
             args.push(pattern.to_string());
             args.push(path.to_string());
-            let output = Command::new("rg").args(args).output().map_err(|err| {
-                AppError::new(
-                    EXIT_ARGS,
-                    format!("failed to execute ripgrep (`rg`): {err}"),
-                )
-            })?;
+            let output = run_ripgrep(args)?;
             let stdout = handle_ripgrep_plain_output(output, "ripgrep search failed")?;
             let mut files = stdout
                 .lines()
@@ -2021,12 +2023,7 @@ fn tool_grep(
             args.push("--".to_string());
             args.push(pattern.to_string());
             args.push(path.to_string());
-            let output = Command::new("rg").args(args).output().map_err(|err| {
-                AppError::new(
-                    EXIT_ARGS,
-                    format!("failed to execute ripgrep (`rg`): {err}"),
-                )
-            })?;
+            let output = run_ripgrep(args)?;
             let stdout = handle_ripgrep_plain_output(output, "ripgrep count failed")?;
             let lines = stdout
                 .lines()
@@ -2049,6 +2046,17 @@ fn tool_grep(
             format!("unsupported Grep output_mode `{other}`"),
         )),
     }
+}
+
+fn run_ripgrep(args: Vec<String>) -> AppResult<std::process::Output> {
+    Command::new("rg").args(args).output().map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!(
+                "failed to execute ripgrep (`rg`): {err}. install ripgrep and ensure `rg` is available on PATH"
+            ),
+        )
+    })
 }
 
 fn handle_ripgrep_plain_output(
@@ -3299,6 +3307,21 @@ mod tests {
         let (results, truncated) = parse_ripgrep_matches(stdout, 1).unwrap();
         assert_eq!(results, vec!["a.rs:1: first"]);
         assert!(truncated);
+    }
+
+    #[test]
+    fn glob_matches_patterns_relative_to_base_path() {
+        let temp_root = make_temp_dir("glob-relative");
+        let src_dir = temp_root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(temp_root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        let output = tool_glob("src/*.rs", &temp_root.display().to_string()).unwrap();
+        assert!(output.contains("src/main.rs"));
+        assert!(!output.contains("Cargo.toml"));
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]

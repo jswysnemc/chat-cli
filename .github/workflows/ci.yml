@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  checks:
+  fmt:
     runs-on: ubuntu-latest
 
     steps:
@@ -28,6 +28,50 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+  test:
+    name: Build And Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux
+            os: ubuntu-latest
+            shell: bash
+            install_cmd: |
+              if ! command -v rg >/dev/null 2>&1; then
+                sudo apt-get update
+                sudo apt-get install -y ripgrep
+              fi
+          - label: macOS
+            os: macos-latest
+            shell: bash
+            install_cmd: |
+              if ! command -v rg >/dev/null 2>&1; then
+                brew install ripgrep
+              fi
+          - label: Windows
+            os: windows-latest
+            shell: pwsh
+            install_cmd: |
+              if (-not (Get-Command rg -ErrorAction SilentlyContinue)) {
+                choco install ripgrep -y
+              }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install tool dependencies
+        shell: ${{ matrix.shell }}
+        run: ${{ matrix.install_cmd }}
 
       - name: Run tests
         run: cargo test
