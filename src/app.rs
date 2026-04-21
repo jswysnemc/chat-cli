@@ -1182,29 +1182,57 @@ fn summarize_repl_tool_result(content: &str, width: usize) -> String {
     rendered.join("\n")
 }
 
-fn render_repl_session_message_body(
-    config: &AppConfig,
-    message: &SessionMessage,
-    width: usize,
-) -> String {
-    if message.role == "tool" {
-        return summarize_repl_tool_result(&message.content, width.saturating_sub(4));
+fn collapse_markdown_blank_lines_outside_code_blocks(content: &str) -> String {
+    let mut in_fenced_code = false;
+    let mut blank_streak = 0usize;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fenced_code = !in_fenced_code;
+            blank_streak = 0;
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if in_fenced_code {
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if line.trim().is_empty() {
+            if blank_streak == 0 {
+                lines.push(String::new());
+            }
+            blank_streak += 1;
+            continue;
+        }
+
+        blank_streak = 0;
+        lines.push(line.to_string());
     }
-    render_session_message_body(config, message, Some(width))
+
+    lines.join("\n")
 }
 
-fn render_session_message_body(
+fn render_session_message_body_with_options(
     config: &AppConfig,
     message: &SessionMessage,
     width: Option<usize>,
+    compact_blank_lines: bool,
 ) -> String {
     let mut sections = Vec::new();
     let collapse = config.defaults.collapse_thinking.unwrap_or(false);
 
     if !message.content.is_empty() {
+        let content = if compact_blank_lines {
+            collapse_markdown_blank_lines_outside_code_blocks(&message.content)
+        } else {
+            message.content.clone()
+        };
         sections.push(match width {
-            Some(width) => render_markdown_with_width(&message.content, collapse, width),
-            None => render_markdown(&message.content, collapse),
+            Some(width) => render_markdown_with_width(&content, collapse, width),
+            None => render_markdown(&content, collapse),
         });
     }
 
@@ -1225,6 +1253,25 @@ fn render_session_message_body(
     }
 
     sections.join("\n")
+}
+
+fn render_repl_session_message_body(
+    config: &AppConfig,
+    message: &SessionMessage,
+    width: usize,
+) -> String {
+    if message.role == "tool" {
+        return summarize_repl_tool_result(&message.content, width.saturating_sub(4));
+    }
+    render_session_message_body_with_options(config, message, Some(width), true)
+}
+
+fn render_session_message_body(
+    config: &AppConfig,
+    message: &SessionMessage,
+    width: Option<usize>,
+) -> String {
+    render_session_message_body_with_options(config, message, width, true)
 }
 
 fn render_user_message_block(label: &str, body: &str) -> String {
@@ -6855,6 +6902,38 @@ mod tests {
     }
 
     #[test]
+    fn repl_history_collapses_repeated_blank_lines_in_assistant_messages() {
+        let config = test_config();
+        let turns = vec![vec![SessionMessage {
+            role: "assistant".to_string(),
+            content: "line one\n\n\nline two".to_string(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            created_at: now_rfc3339(),
+        }]];
+
+        let rendered = render_repl_session_turns_with_width(&config, &turns, 80);
+        let plain = rendered
+            .replace(CYAN, "")
+            .replace(RESET, "")
+            .replace(BOLD, "")
+            .replace(DIM, "");
+
+        assert!(plain.contains("Assistant\nline one\n\nline two"));
+        assert!(!plain.contains("line one\n\n\nline two"));
+    }
+
+    #[test]
+    fn repl_history_preserves_blank_lines_inside_code_blocks() {
+        let collapsed = collapse_markdown_blank_lines_outside_code_blocks(
+            "```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```",
+        );
+        assert!(collapsed.contains("fn main() {\n\n    println!(\"hi\");"));
+    }
+
+    #[test]
     fn compute_inline_repl_layout_reserves_no_transcript_rows() {
         let layout = compute_inline_repl_layout(3, 2);
         assert_eq!(layout.transcript_height, 0);
@@ -7237,6 +7316,30 @@ mod tests {
         let rendered = render_session_turns(&config, &turns, None);
         assert!(rendered.contains("第一条"));
         assert!(rendered.contains("第二条"));
+    }
+
+    #[test]
+    fn render_session_turns_collapses_repeated_blank_lines_in_assistant_messages() {
+        let config = test_config();
+        let turns = vec![vec![SessionMessage {
+            role: "assistant".to_string(),
+            content: "line one\n\n\nline two".to_string(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            created_at: now_rfc3339(),
+        }]];
+
+        let rendered = render_session_turns(&config, &turns, Some(1));
+        let plain = rendered
+            .replace(CYAN, "")
+            .replace(RESET, "")
+            .replace(BOLD, "")
+            .replace(DIM, "");
+
+        assert!(plain.contains("Assistant\nline one\n\nline two"));
+        assert!(!plain.contains("line one\n\n\nline two"));
     }
 
     #[test]
