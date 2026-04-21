@@ -47,12 +47,89 @@ const BASH_READ_COMMANDS: &[&str] = &[
 ];
 const BASH_LIST_COMMANDS: &[&str] = &["ls", "tree", "du"];
 const BASH_NEUTRAL_COMMANDS: &[&str] = &["echo", "printf", "true", "false", ":"];
+#[cfg(windows)]
+const POWERSHELL_READ_COMMANDS: &[&str] = &[
+    "cat",
+    "date",
+    "dir",
+    "echo",
+    "gc",
+    "gci",
+    "get-childitem",
+    "get-command",
+    "get-content",
+    "get-date",
+    "get-item",
+    "get-itemproperty",
+    "get-location",
+    "get-process",
+    "ls",
+    "measure-object",
+    "pwd",
+    "resolve-path",
+    "select-object",
+    "select-string",
+    "sort-object",
+    "test-path",
+    "type",
+    "whoami",
+    "write-host",
+    "write-output",
+];
+#[cfg(windows)]
+const SHELL_TOOL_ALIASES: &[&str] = &["powershell", "pwsh", "bash"];
+#[cfg(not(windows))]
+const SHELL_TOOL_ALIASES: &[&str] = &["bash"];
 const BASH_SESSION_IDLE_TIMEOUT: Duration = Duration::from_millis(350);
 const BASH_SESSION_START_TIMEOUT: Duration = Duration::from_millis(900);
 const BASH_SESSION_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const BASH_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const BASH_SESSION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(2);
 const BASH_SESSION_MAX_OUTPUT_CHARS: usize = 16 * 1024;
+
+#[cfg(windows)]
+pub const fn shell_tool_name() -> &'static str {
+    "PowerShell"
+}
+
+#[cfg(not(windows))]
+pub const fn shell_tool_name() -> &'static str {
+    "Bash"
+}
+
+#[cfg(windows)]
+pub const fn shell_tool_alias() -> &'static str {
+    "powershell"
+}
+
+#[cfg(not(windows))]
+pub const fn shell_tool_alias() -> &'static str {
+    "bash"
+}
+
+#[cfg(windows)]
+pub const fn shell_session_label() -> &'static str {
+    "PowerShell"
+}
+
+#[cfg(not(windows))]
+pub const fn shell_session_label() -> &'static str {
+    "bash"
+}
+
+#[cfg(windows)]
+const fn shell_session_prefix() -> &'static str {
+    "powershell"
+}
+
+#[cfg(not(windows))]
+const fn shell_session_prefix() -> &'static str {
+    "bash"
+}
+
+pub fn is_shell_tool_call_name(name: &str) -> bool {
+    matches!(name, "Bash" | "bash" | "PowerShell" | "powershell" | "pwsh")
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -218,8 +295,8 @@ const BUILTIN_TOOL_HANDLERS: [ToolHandler; 11] = [
     },
     ToolHandler {
         spec: ToolSpec {
-            name: "Bash",
-            aliases: &["bash"],
+            name: shell_tool_name(),
+            aliases: SHELL_TOOL_ALIASES,
             description: "Run a shell command.",
             search_hint: "execute shell commands",
             side_effects: ToolSideEffects::Mutating,
@@ -457,26 +534,26 @@ fn define_bash_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "Bash",
+            "name": shell_tool_name(),
             "description": "Run a shell command and return its stdout and stderr. If the command becomes interactive, the tool returns a session_id that can be continued with more input.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The bash command to execute for a new session."
+                        "description": format!("The {} command to execute for a new session.", shell_session_label())
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Continue an existing interactive bash session instead of starting a new command. Only include this when resuming a real session_id returned by Bash; omit it for new commands and never send empty or placeholder values."
+                        "description": format!("Continue an existing interactive {} session instead of starting a new command. Only include this when resuming a real session_id returned by {}; omit it for new commands and never send empty or placeholder values.", shell_session_label(), shell_tool_name())
                     },
                     "input": {
                         "type": "string",
-                        "description": "Optional text to send to an existing interactive bash session. A trailing newline is added automatically. Omit this field when you only want to poll for more output."
+                        "description": format!("Optional text to send to an existing interactive {} session. A trailing newline is added automatically. Omit this field when you only want to poll for more output.", shell_session_label())
                     },
                     "close": {
                         "type": "boolean",
-                        "description": "Terminate an existing interactive bash session."
+                        "description": format!("Terminate an existing interactive {} session.", shell_session_label())
                     }
                 },
                 "additionalProperties": false
@@ -719,7 +796,10 @@ pub fn continue_bash_session(
     let Some(mut session) = sessions.remove(session_id) else {
         return Err(AppError::new(
             EXIT_ARGS,
-            format!("Bash: unknown interactive session `{session_id}`"),
+            format!(
+                "{}: unknown interactive session `{session_id}`",
+                shell_tool_name()
+            ),
         ));
     };
     let update = update_bash_session(session_id, &mut session, input, close)?;
@@ -769,7 +849,7 @@ pub fn lookup_tool_spec(name: &str) -> Option<&'static ToolSpec> {
 }
 
 pub fn tool_call_side_effects(call: &ToolCall) -> ToolSideEffects {
-    if matches!(call.name.as_str(), "Bash" | "bash")
+    if is_shell_tool_call_name(&call.name)
         && call.arguments["command"]
             .as_str()
             .is_some_and(is_read_only_bash_command)
@@ -1117,23 +1197,31 @@ fn execute_bash_tool(
     context: &ToolRuntimeContext<'_>,
 ) -> AppResult<(String, Vec<MessageImage>)> {
     if let Some(session_id) = tool_argument_non_empty_str(&call.arguments, "session_id") {
-        print_tool_header("Bash", &format!("session {session_id}"));
+        print_tool_header(shell_tool_name(), &format!("session {session_id}"));
         let input = call.arguments["input"].as_str();
         let close = call.arguments["close"].as_bool().unwrap_or(false);
         let content = continue_bash_session(session_id, input, close)?;
         return Ok((content, Vec::new()));
     }
 
-    let command = call.arguments["command"]
-        .as_str()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "Bash: missing 'command' argument"))?;
-    print_tool_header("Bash", &truncate_preview(command, 120));
+    let command = call.arguments["command"].as_str().ok_or_else(|| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("{}: missing 'command' argument", shell_tool_name()),
+        )
+    })?;
+    print_tool_header(shell_tool_name(), &truncate_preview(command, 120));
     let auto_confirm = context.auto_confirm || is_read_only_bash_command(command);
     let content = match confirm_tool_action("run", Some(command), auto_confirm)? {
         ConfirmResult::Yes => tool_bash(command)?,
-        ConfirmResult::No(None) => "user declined the bash execution".to_string(),
+        ConfirmResult::No(None) => {
+            format!("user declined the {} execution", shell_session_label())
+        }
         ConfirmResult::No(Some(feedback)) => {
-            format!("user declined the bash execution. user feedback: {feedback}")
+            format!(
+                "user declined the {} execution. user feedback: {feedback}",
+                shell_session_label()
+            )
         }
         ConfirmResult::Edit(new_cmd) => tool_bash(&new_cmd)?,
     };
@@ -1524,28 +1612,27 @@ fn validate_edit_inputs(path: &str, old_string: &str, new_string: &str) -> AppRe
 }
 
 fn tool_bash(command: &str) -> AppResult<String> {
-    let session_id = format!("bash_{}", Ulid::new());
-    let mut child = Command::new("bash")
-        .arg("-lc")
-        .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to execute bash: {err}")))?;
+    let session_id = format!("{}_{}", shell_session_prefix(), Ulid::new());
+    let mut child = spawn_shell_command(command)?;
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "failed to capture bash stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "failed to capture bash stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::new(EXIT_ARGS, "failed to capture bash stderr"))?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to capture {} stdin", shell_session_label()),
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to capture {} stdout", shell_session_label()),
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to capture {} stderr", shell_session_label()),
+        )
+    })?;
     let (sender, receiver) = mpsc::channel();
     spawn_bash_reader(stdout, sender.clone(), false);
     spawn_bash_reader(stderr, sender, true);
@@ -1566,6 +1653,39 @@ fn tool_bash(command: &str) -> AppResult<String> {
     match update {
         BashSessionUpdate::Completed(result) | BashSessionUpdate::Waiting(result) => Ok(result),
     }
+}
+
+#[cfg(not(windows))]
+fn spawn_shell_command(command: &str) -> AppResult<Child> {
+    Command::new("bash")
+        .arg("-lc")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to execute bash: {err}")))
+}
+
+#[cfg(windows)]
+fn spawn_shell_command(command: &str) -> AppResult<Child> {
+    let mut errors = Vec::new();
+    for program in ["pwsh.exe", "powershell.exe"] {
+        let mut candidate = Command::new(program);
+        candidate
+            .args(["-NoLogo", "-NoProfile", "-Command", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match candidate.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err) => errors.push(format!("{program}: {err}")),
+        }
+    }
+    Err(AppError::new(
+        EXIT_ARGS,
+        format!("failed to execute PowerShell: {}", errors.join("; ")),
+    ))
 }
 
 fn spawn_bash_reader<R>(mut reader: R, sender: mpsc::Sender<BashOutputChunk>, stderr: bool)
@@ -1604,21 +1724,31 @@ fn update_bash_session(
         let _ = session.child.kill();
         let _ = session.child.wait();
         return Ok(BashSessionUpdate::Completed(format!(
-            "terminated interactive bash session `{session_id}`"
+            "terminated interactive {} session `{session_id}`",
+            shell_session_label()
         )));
     }
 
     if let Some(input) = input {
         session.stdin.write_all(input.as_bytes()).map_err(|err| {
-            AppError::new(EXIT_ARGS, format!("failed to write bash stdin: {err}"))
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to write {} stdin: {err}", shell_session_label()),
+            )
         })?;
         if !input.ends_with('\n') {
             session.stdin.write_all(b"\n").map_err(|err| {
-                AppError::new(EXIT_ARGS, format!("failed to write bash stdin: {err}"))
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("failed to write {} stdin: {err}", shell_session_label()),
+                )
             })?;
         }
         session.stdin.flush().map_err(|err| {
-            AppError::new(EXIT_ARGS, format!("failed to flush bash stdin: {err}"))
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to flush {} stdin: {err}", shell_session_label()),
+            )
         })?;
     }
 
@@ -1640,7 +1770,10 @@ fn update_bash_session(
         }
 
         if let Some(status) = session.child.try_wait().map_err(|err| {
-            AppError::new(EXIT_ARGS, format!("failed to poll bash process: {err}"))
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to poll {} process: {err}", shell_session_label()),
+            )
         })? {
             // The process can exit before the stdout/stderr reader threads have forwarded
             // the final chunk into the channel. Keep draining until the channel goes quiet
@@ -1766,7 +1899,9 @@ fn format_bash_waiting_message(
         body
     };
     format!(
-        "interactive bash session is still running\nsession_id: {session_id}\ncommand: {command}\nstatus: waiting_for_input\nreason: {reason}\nnext_step: call Bash again with {{\"session_id\":\"{session_id}\",\"input\":\"...\"}} to continue, call it with only session_id to poll for more output, or set {{\"session_id\":\"{session_id}\",\"close\":true}} to terminate. If the model cannot continue safely, ask the user for the missing input.\n\n{rendered_output}"
+        "interactive {} session is still running\nsession_id: {session_id}\ncommand: {command}\nstatus: waiting_for_input\nreason: {reason}\nnext_step: call {} again with {{\"session_id\":\"{session_id}\",\"input\":\"...\"}} to continue, call it with only session_id to poll for more output, or set {{\"session_id\":\"{session_id}\",\"close\":true}} to terminate. If the model cannot continue safely, ask the user for the missing input.\n\n{rendered_output}",
+        shell_session_label(),
+        shell_tool_name()
     )
 }
 
@@ -2651,7 +2786,7 @@ fn discover_skills(config: &AppConfig) -> AppResult<Vec<SkillEntry>> {
 fn skill_roots(config: &AppConfig) -> Vec<(String, PathBuf)> {
     let mut roots = Vec::new();
     let current_dir = std::env::current_dir().ok();
-    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    let home_dir = dirs::home_dir();
     for configured in &config.skills.paths {
         let expanded = expand_tilde(configured);
         let root = if expanded.is_relative() {
@@ -3076,7 +3211,7 @@ fn redirection_target<'a>(token: &'a str, next: Option<&'a str>) -> Option<(&'a 
 }
 
 fn is_non_mutating_redirection_target(target: &str) -> bool {
-    matches!(target, "/dev/null" | "&1" | "&2")
+    matches!(target, "/dev/null" | "nul" | "$null" | "&1" | "&2")
 }
 
 fn is_read_only_bash_command(command: &str) -> bool {
@@ -3093,17 +3228,22 @@ fn is_read_only_bash_command(command: &str) -> bool {
         let Some(base) = command_base_name(&segment) else {
             continue;
         };
-        if BASH_NEUTRAL_COMMANDS.contains(&base) {
+        let base_lower = base.to_ascii_lowercase();
+        if BASH_NEUTRAL_COMMANDS.contains(&base_lower.as_str()) {
             continue;
         }
         has_non_neutral = true;
-        if BASH_SEARCH_COMMANDS.contains(&base)
-            || BASH_READ_COMMANDS.contains(&base)
-            || BASH_LIST_COMMANDS.contains(&base)
+        if BASH_SEARCH_COMMANDS.contains(&base_lower.as_str())
+            || BASH_READ_COMMANDS.contains(&base_lower.as_str())
+            || BASH_LIST_COMMANDS.contains(&base_lower.as_str())
         {
             continue;
         }
-        if base == "git" {
+        #[cfg(windows)]
+        if POWERSHELL_READ_COMMANDS.contains(&base_lower.as_str()) {
+            continue;
+        }
+        if base_lower == "git" {
             let sub = segment.split_whitespace().nth(1).unwrap_or_default();
             if matches!(
                 sub,
@@ -3122,6 +3262,10 @@ mod tests {
     use super::*;
     use regex::Regex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn expected_shell_tool_name() -> &'static str {
+        shell_tool_name()
+    }
 
     #[test]
     fn build_ripgrep_args_includes_expected_flags() {
@@ -3245,19 +3389,25 @@ mod tests {
 
     #[test]
     fn render_tool_header_lines_use_fixed_continuation_for_long_details() {
-        let inline_lines =
-            render_tool_header_lines("Bash", "session bash_01KPJP1YHQQKBMDY66ASWNY32C", None);
+        let inline_lines = render_tool_header_lines(
+            expected_shell_tool_name(),
+            "session bash_01KPJP1YHQQKBMDY66ASWNY32C",
+            None,
+        );
         let inline_plain = inline_lines
             .iter()
             .map(|line| line.replace(BOLD, "").replace(CYAN, "").replace(RESET, ""))
             .collect::<Vec<_>>();
         assert_eq!(
             inline_plain,
-            vec!["  Bash session bash_01KPJP1YHQQKBMDY66ASWNY32C"]
+            vec![format!(
+                "  {} session bash_01KPJP1YHQQKBMDY66ASWNY32C",
+                expected_shell_tool_name()
+            )]
         );
 
         let lines = render_tool_header_lines(
-            "Bash",
+            expected_shell_tool_name(),
             "cd /home/snemc/workspace/chat-cli && echo '[round 2] debug build and cli smoke checks' && cargo check && cargo test cli::tests:: -- --nocapture",
             None,
         );
@@ -3266,7 +3416,7 @@ mod tests {
             .map(|line| line.replace(BOLD, "").replace(CYAN, "").replace(RESET, ""))
             .collect::<Vec<_>>();
 
-        assert_eq!(plain[0], "  Bash");
+        assert_eq!(plain[0], format!("  {}", expected_shell_tool_name()));
         assert!(plain.iter().skip(1).all(|line| line.starts_with("    ")));
         assert!(plain.len() >= 3);
     }
@@ -3290,7 +3440,7 @@ mod tests {
             .filter_map(|def| def["function"]["name"].as_str())
             .collect::<Vec<_>>();
         assert!(!names.contains(&"ToolSearch"));
-        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&expected_shell_tool_name()));
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Status"));
@@ -3309,13 +3459,14 @@ mod tests {
             .filter_map(|def| def["function"]["name"].as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"ToolSearch"));
-        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&expected_shell_tool_name()));
         assert!(names.contains(&"Read"));
         assert!(!names.contains(&"mcp__test__tool"));
     }
 
     #[test]
-    fn initial_tool_definitions_exposes_tool_search_when_only_builtin_progressive_loading_enabled() {
+    fn initial_tool_definitions_exposes_tool_search_when_only_builtin_progressive_loading_enabled()
+    {
         let mut config = AppConfig::default();
         config.tools.progressive_loading = Some(true);
         config.tools.mcp_progressive_loading = Some(false);
@@ -3325,7 +3476,7 @@ mod tests {
             .filter_map(|def| def["function"]["name"].as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"ToolSearch"));
-        assert!(!names.contains(&"Bash"));
+        assert!(!names.contains(&expected_shell_tool_name()));
         assert!(!names.contains(&"Read"));
     }
 
@@ -3337,7 +3488,7 @@ mod tests {
             .iter()
             .filter_map(|spec| spec["name"].as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&expected_shell_tool_name()));
 
         let write_matches = tool_search_matches(&config, "write", 3);
         let write_names = write_matches
@@ -3415,6 +3566,15 @@ mod tests {
 
     #[test]
     fn bash_read_only_detection_distinguishes_safe_and_mutating_commands() {
+        if cfg!(windows) {
+            assert!(is_read_only_bash_command("Get-ChildItem"));
+            assert!(is_read_only_bash_command("Get-Location; Get-Date"));
+            assert!(is_read_only_bash_command("Get-ChildItem > $null"));
+            assert!(!is_read_only_bash_command("Set-Content .\\out.txt hi"));
+            assert!(!is_read_only_bash_command("Get-ChildItem > out.txt"));
+            assert!(!is_read_only_bash_command("Remove-Item .\\out.txt"));
+            return;
+        }
         assert!(is_read_only_bash_command("ls -la"));
         assert!(is_read_only_bash_command("pwd && date && uname -a"));
         assert!(is_read_only_bash_command(
@@ -3430,12 +3590,12 @@ mod tests {
     fn tool_call_side_effects_downgrades_read_only_bash() {
         let read_only_call = ToolCall {
             id: "call_1".to_string(),
-            name: "Bash".to_string(),
+            name: expected_shell_tool_name().to_string(),
             arguments: json!({"command":"ls -la"}),
         };
         let mutating_call = ToolCall {
             id: "call_2".to_string(),
-            name: "Bash".to_string(),
+            name: expected_shell_tool_name().to_string(),
             arguments: json!({"command":"rm -f /tmp/x"}),
         };
         assert_eq!(
@@ -3526,6 +3686,9 @@ mod tests {
 
     #[test]
     fn bash_tool_can_continue_interactive_session() {
+        if cfg!(windows) {
+            return;
+        }
         let first =
             tool_bash("printf 'name: '; read name; printf 'hello %s\\n' \"$name\"").unwrap();
         assert!(first.contains("interactive bash session is still running"));
@@ -3560,7 +3723,7 @@ mod tests {
     fn bash_tool_ignores_empty_session_id_when_starting_new_command() {
         let call = ToolCall {
             id: "call_1".to_string(),
-            name: "Bash".to_string(),
+            name: expected_shell_tool_name().to_string(),
             arguments: json!({
                 "command": "printf 'ok\\n'",
                 "session_id": "",
@@ -3578,7 +3741,7 @@ mod tests {
     fn bash_tool_ignores_whitespace_session_id_when_starting_new_command() {
         let call = ToolCall {
             id: "call_1".to_string(),
-            name: "Bash".to_string(),
+            name: expected_shell_tool_name().to_string(),
             arguments: json!({
                 "command": "printf 'trimmed\\n'",
                 "session_id": "   ",
@@ -3596,7 +3759,7 @@ mod tests {
     fn bash_tool_still_rejects_unknown_non_empty_session_id() {
         let call = ToolCall {
             id: "call_1".to_string(),
-            name: "Bash".to_string(),
+            name: expected_shell_tool_name().to_string(),
             arguments: json!({
                 "command": "printf 'unused\\n'",
                 "session_id": "0",
