@@ -4,6 +4,7 @@ use crate::error::{AppError, AppResult, EXIT_CONFIG, ResultCodeExt};
 use crate::mcp::{McpConfigCompat, McpServerConfig, validate_mcp_config};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -32,25 +33,11 @@ impl AppPaths {
         config_dir: Option<PathBuf>,
         data_dir: Option<PathBuf>,
     ) -> AppResult<Self> {
-        let home = env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| AppError::new(EXIT_CONFIG, "HOME is not set"))?;
-        let config_dir = config_dir.unwrap_or_else(|| {
-            env::var("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| home.join(".config"))
-                .join("chat-cli")
-        });
-        let data_dir = data_dir.unwrap_or_else(|| {
-            env::var("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| home.join(".local").join("share"))
-                .join("chat-cli")
-        });
-        let cache_dir = env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".cache"))
-            .join("chat-cli");
+        let home = dirs::home_dir()
+            .ok_or_else(|| AppError::new(EXIT_CONFIG, "home directory is not set"))?;
+        let config_dir = config_dir.unwrap_or_else(|| default_config_root(&home).join("chat-cli"));
+        let data_dir = data_dir.unwrap_or_else(|| default_data_root(&home).join("chat-cli"));
+        let cache_dir = default_cache_root(&home).join("chat-cli");
         Ok(Self {
             config_file: config_dir.join("config.toml"),
             secrets_file: config_dir.join("secrets.toml"),
@@ -67,6 +54,28 @@ impl AppPaths {
             None => self.data_dir.join("sessions"),
         }
     }
+}
+
+fn default_config_root(home: &Path) -> PathBuf {
+    env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::config_dir().unwrap_or_else(|| home.join(".config")))
+}
+
+fn default_data_root(home: &Path) -> PathBuf {
+    env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::data_local_dir()
+                .or_else(dirs::data_dir)
+                .unwrap_or_else(|| home.join(".local").join("share"))
+        })
+}
+
+fn default_cache_root(home: &Path) -> PathBuf {
+    env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::cache_dir().unwrap_or_else(|| home.join(".cache")))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,11 +617,23 @@ pub fn read_system_prompt(value: &Option<String>) -> AppResult<Option<String>> {
 
 pub fn expand_tilde(input: &str) -> PathBuf {
     if let Some(stripped) = input.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(stripped);
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
         }
     }
     PathBuf::from(input)
+}
+
+fn default_bash_audit_prompt_template() -> Cow<'static, str> {
+    if cfg!(windows) {
+        Cow::Owned(
+            DEFAULT_AUDIT_BASH_PROMPT_TEMPLATE
+                .replace("Bash", "PowerShell")
+                .replace("bash", "powershell"),
+        )
+    } else {
+        Cow::Borrowed(DEFAULT_AUDIT_BASH_PROMPT_TEMPLATE)
+    }
 }
 
 fn default_audit_prompt_path(paths: &AppPaths, file_name: &str) -> PathBuf {
@@ -642,7 +663,7 @@ fn ensure_default_audit_prompt_files(paths: &AppPaths) -> AppResult<()> {
     )?;
     ensure_default_audit_prompt_file(
         &default_audit_prompt_path(paths, DEFAULT_AUDIT_BASH_PROMPT_FILE),
-        DEFAULT_AUDIT_BASH_PROMPT_TEMPLATE,
+        default_bash_audit_prompt_template().as_ref(),
     )?;
     ensure_default_audit_prompt_file(
         &default_audit_prompt_path(paths, DEFAULT_AUDIT_EDIT_PROMPT_FILE),
@@ -911,7 +932,11 @@ mod tests {
         let bash_text = fs::read_to_string(&bash_path).unwrap();
         let edit_text = fs::read_to_string(&edit_path).unwrap();
         assert!(default_text.contains("\"results\""));
-        assert!(bash_text.contains("Bash"));
+        if cfg!(windows) {
+            assert!(bash_text.contains("PowerShell"));
+        } else {
+            assert!(bash_text.contains("Bash"));
+        }
         assert!(edit_text.contains("文件编辑"));
 
         let _ = fs::remove_dir_all(base);

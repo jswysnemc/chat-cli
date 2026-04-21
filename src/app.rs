@@ -39,7 +39,8 @@ use crate::session::{
 use crate::tool::execute_tool;
 use crate::tool::{
     continue_bash_session, execute_tool_with_context_and_paths, initial_tool_definitions,
-    list_bash_sessions, lookup_tool_spec, parse_tool_call, progressive_loading_enabled,
+    is_shell_tool_call_name, list_bash_sessions, lookup_tool_spec, parse_tool_call,
+    progressive_loading_enabled, shell_session_label, shell_tool_alias, shell_tool_name,
     tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
     tool_search_matches,
 };
@@ -1743,7 +1744,7 @@ struct ToolCallDisplay {
 fn canonical_tool_call_name(name: &str) -> String {
     match name {
         "tool_search" => "ToolSearch".to_string(),
-        "bash" => "Bash".to_string(),
+        name if is_shell_tool_call_name(name) => shell_tool_name().to_string(),
         "write" | "edit" => "Edit".to_string(),
         "read" => "Read".to_string(),
         "fetch" | "web_fetch" => "WebFetch".to_string(),
@@ -1798,7 +1799,7 @@ fn tool_call_display(raw_call: &Value) -> ToolCallDisplay {
                     call.arguments["query"].as_str().unwrap_or(""),
                     96,
                 )),
-                "bash" | "Bash" => Some(preview_multiline_text(
+                name if is_shell_tool_call_name(name) => Some(preview_multiline_text(
                     call.arguments["command"].as_str().unwrap_or(""),
                     4,
                     240,
@@ -2166,7 +2167,7 @@ enum AuditPromptKind {
 
 fn audit_prompt_kind(call: &crate::tool::ToolCall) -> AuditPromptKind {
     match call.name.as_str() {
-        "Bash" | "bash" => AuditPromptKind::Bash,
+        name if is_shell_tool_call_name(name) => AuditPromptKind::Bash,
         "Edit" | "edit" | "Write" | "write" => AuditPromptKind::Edit,
         _ => AuditPromptKind::Default,
     }
@@ -2789,7 +2790,7 @@ impl ReplSlashCommand {
             ReplSlashCommand::Status => "status",
             ReplSlashCommand::New => "new",
             ReplSlashCommand::Clear => "clear",
-            ReplSlashCommand::Bash => "bash",
+            ReplSlashCommand::Bash => shell_tool_alias(),
             ReplSlashCommand::Quit => "quit",
             ReplSlashCommand::Exit => "exit",
         }
@@ -2806,7 +2807,13 @@ impl ReplSlashCommand {
             ReplSlashCommand::Status => "/status",
             ReplSlashCommand::New => "/new [temp]",
             ReplSlashCommand::Clear => "/clear",
-            ReplSlashCommand::Bash => "/bash ...",
+            ReplSlashCommand::Bash => {
+                if cfg!(windows) {
+                    "/powershell ..."
+                } else {
+                    "/bash ..."
+                }
+            }
             ReplSlashCommand::Quit => "/quit",
             ReplSlashCommand::Exit => "/exit",
         }
@@ -2823,7 +2830,13 @@ impl ReplSlashCommand {
             ReplSlashCommand::Status => "show current REPL session and runtime config",
             ReplSlashCommand::New => "start a new chat session",
             ReplSlashCommand::Clear => "clear the current session history",
-            ReplSlashCommand::Bash => "inspect or continue interactive bash sessions",
+            ReplSlashCommand::Bash => {
+                if cfg!(windows) {
+                    "inspect or continue interactive PowerShell sessions"
+                } else {
+                    "inspect or continue interactive bash sessions"
+                }
+            }
             ReplSlashCommand::Quit | ReplSlashCommand::Exit => "exit the REPL",
         }
     }
@@ -3198,7 +3211,7 @@ impl ReplSlashMode {
             Self::Session => Some("sessions"),
             Self::Audit => Some("audit"),
             Self::ToolSearch => Some("tool-search"),
-            Self::Bash => Some("bash"),
+            Self::Bash => Some(shell_tool_alias()),
         }
     }
 
@@ -3215,7 +3228,13 @@ impl ReplSlashMode {
             Self::Session => "Filter sessions. Press Enter to switch.",
             Self::Audit => "Choose an audit setting. Press Enter to apply.",
             Self::ToolSearch => "Choose a tool search setting. Press Enter to apply.",
-            Self::Bash => "Choose a bash subcommand. Press Enter to apply.",
+            Self::Bash => {
+                if cfg!(windows) {
+                    "Choose a PowerShell subcommand. Press Enter to apply."
+                } else {
+                    "Choose a bash subcommand. Press Enter to apply."
+                }
+            }
         }
     }
 }
@@ -4036,18 +4055,25 @@ fn build_repl_session_popup_items(
 }
 
 fn build_repl_bash_popup_items(query: &str) -> Vec<ReplPopupItem> {
-    [
-        ("help", "show bash REPL subcommands"),
-        ("sessions", "list interactive bash sessions"),
-    ]
-    .into_iter()
-    .filter(|(label, _)| matches_popup_query(label, query))
-    .map(|(label, detail)| ReplPopupItem {
-        label: label.to_string(),
-        detail: detail.to_string(),
-        action: ReplPopupAction::SubmitPrompt(format!("/bash {label}")),
-    })
-    .collect()
+    let help_detail = if cfg!(windows) {
+        "show PowerShell REPL subcommands"
+    } else {
+        "show bash REPL subcommands"
+    };
+    let sessions_detail = if cfg!(windows) {
+        "list interactive PowerShell sessions"
+    } else {
+        "list interactive bash sessions"
+    };
+    [("help", help_detail), ("sessions", sessions_detail)]
+        .into_iter()
+        .filter(|(label, _)| matches_popup_query(label, query))
+        .map(|(label, detail)| ReplPopupItem {
+            label: label.to_string(),
+            detail: detail.to_string(),
+            action: ReplPopupAction::SubmitPrompt(format!("/{} {label}", shell_tool_alias())),
+        })
+        .collect()
 }
 
 fn build_repl_model_popup_items(config: &AppConfig, query: &str) -> Vec<ReplPopupItem> {
@@ -4803,17 +4829,19 @@ fn handle_repl_directive(
 }
 
 fn handle_repl_bash_command(rest: &str) -> AppResult<()> {
+    let shell_command = shell_tool_alias();
+    let shell_label = shell_session_label();
     match rest {
         "" | "help" => {
-            println!("/bash sessions");
-            println!("/bash read <session_id>");
-            println!("/bash input <session_id> <text>");
-            println!("/bash close <session_id>");
+            println!("/{shell_command} sessions");
+            println!("/{shell_command} read <session_id>");
+            println!("/{shell_command} input <session_id> <text>");
+            println!("/{shell_command} close <session_id>");
         }
         "sessions" => {
             let sessions = list_bash_sessions();
             if sessions.is_empty() {
-                println!("no interactive bash sessions");
+                println!("no interactive {shell_label} sessions");
             } else {
                 for session in sessions {
                     println!("{} {}", session.session_id, session.command);
@@ -4831,11 +4859,14 @@ fn handle_repl_bash_command(rest: &str) -> AppResult<()> {
         _ if rest.starts_with("input ") => {
             let args = rest["input ".len()..].trim();
             let (session_id, text) = args.split_once(' ').ok_or_else(|| {
-                AppError::new(EXIT_ARGS, "usage: /bash input <session_id> <text>")
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("usage: /{shell_command} input <session_id> <text>"),
+                )
             })?;
             println!("{}", continue_bash_session(session_id, Some(text), false)?);
         }
-        _ => println!("unknown /bash command; use /bash help"),
+        _ => println!("unknown /{shell_command} command; use /{shell_command} help"),
     }
     Ok(())
 }
@@ -4857,7 +4888,7 @@ fn parse_repl_slash_command(input: &str) -> Option<(ReplSlashCommand, &str)> {
         "status" => ReplSlashCommand::Status,
         "new" => ReplSlashCommand::New,
         "clear" => ReplSlashCommand::Clear,
-        "bash" => ReplSlashCommand::Bash,
+        "bash" | "powershell" | "pwsh" => ReplSlashCommand::Bash,
         "quit" => ReplSlashCommand::Quit,
         "exit" => ReplSlashCommand::Exit,
         _ => return None,
@@ -7230,7 +7261,7 @@ mod tests {
                 "id": "call_bash",
                 "type": "function",
                 "function": {
-                    "name": "Bash",
+                    "name": shell_tool_name(),
                     "arguments": "{\"command\":\"echo '=== Testing grok-search web_search ==='\"}"
                 }
             }),
@@ -7246,7 +7277,7 @@ mod tests {
         let lines = plain.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "• WebFetch");
         assert!(lines[1].starts_with("    "));
-        assert!(plain.contains("\n• Bash\n"));
+        assert!(plain.contains(&format!("\n• {}\n", shell_tool_name())));
         assert!(rendered.lines().count() >= 4);
     }
 
@@ -7278,7 +7309,7 @@ mod tests {
             "id": "call_bash",
             "type": "function",
             "function": {
-                "name": "Bash",
+                "name": shell_tool_name(),
                 "arguments": "{\"command\":\"cd /tmp\\nprintf 'hello world from a very long command preview that should wrap nicely without wasting left space'\"}"
             }
         })];
@@ -7290,7 +7321,7 @@ mod tests {
             .replace(RESET, "");
         let lines = plain.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines[0], "• Bash");
+        assert_eq!(lines[0], format!("• {}", shell_tool_name()));
         assert!(lines.iter().skip(1).all(|line| line.starts_with("    ")));
         assert!(lines.len() >= 3);
     }
@@ -7861,7 +7892,7 @@ mod tests {
     fn audit_prompt_kind_routes_bash_and_edit_calls() {
         let bash_call = crate::tool::ToolCall {
             id: "call_bash".to_string(),
-            name: "Bash".to_string(),
+            name: shell_tool_name().to_string(),
             arguments: json!({"command":"git status"}),
         };
         let edit_call = crate::tool::ToolCall {
@@ -7984,7 +8015,7 @@ mod tests {
         let raw_call = json!({
             "id": "call_bash",
             "function": {
-                "name": "Bash",
+                "name": shell_tool_name(),
                 "arguments": "{\"command\":\"rm -f /tmp/chat-cli-test\"}"
             }
         });
@@ -7995,7 +8026,10 @@ mod tests {
             message
                 .content
                 .contains("interactive confirmation unavailable")
-                || message.content.contains("user declined the bash execution")
+                || message.content.contains(&format!(
+                    "user declined the {} execution",
+                    shell_session_label()
+                ))
         );
     }
 
