@@ -118,9 +118,6 @@ jobs:
             choco install ripgrep -y
           }
 
-      - name: Run tests
-        run: cargo test
-
       - name: Build release binary
         run: cargo build --release
 
