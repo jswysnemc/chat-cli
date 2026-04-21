@@ -43,7 +43,7 @@ jobs:
           fi
 
           manifest_version="$(
-            python -c 'import pathlib, re, sys; text = pathlib.Path("Cargo.toml").read_text(); match = re.search(r"^version\\s*=\\s*\"([^\"]+)\"", text, re.MULTILINE); print(match.group(1)) if match else sys.exit("failed to read version from Cargo.toml")'
+            python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["version"])'
           )"
           version="${tag#v}"
 
