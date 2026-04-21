@@ -38,26 +38,10 @@ jobs:
         include:
           - label: Linux
             os: ubuntu-latest
-            shell: bash
-            install_cmd: |
-              if ! command -v rg >/dev/null 2>&1; then
-                sudo apt-get update
-                sudo apt-get install -y ripgrep
-              fi
           - label: macOS
             os: macos-latest
-            shell: bash
-            install_cmd: |
-              if ! command -v rg >/dev/null 2>&1; then
-                brew install ripgrep
-              fi
           - label: Windows
             os: windows-latest
-            shell: pwsh
-            install_cmd: |
-              if (-not (Get-Command rg -ErrorAction SilentlyContinue)) {
-                choco install ripgrep -y
-              }
 
     steps:
       - name: Checkout
@@ -69,9 +53,30 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install tool dependencies
-        shell: ${{ matrix.shell }}
-        run: ${{ matrix.install_cmd }}
+      - name: Install tool dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
+
+      - name: Install tool dependencies (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            brew install ripgrep
+          fi
+
+      - name: Install tool dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) {
+            choco install ripgrep -y
+          }
 
       - name: Run tests
         run: cargo test
