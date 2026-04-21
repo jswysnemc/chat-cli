@@ -15,10 +15,10 @@ use crate::error::{
 };
 use crate::mcp::{
     McpWarmupHandle, authenticate_and_cache_mcp, current_mcp_daemon_status,
-    current_mcp_server_statuses, has_cached_mcp_tool, hydrate_cached_mcp_tools,
-    list_mcp_tools_from_ready_daemon, load_mcp_cache, mcp_enabled, run_mcp_daemon,
-    start_mcp_daemon_process, start_mcp_warmup, stop_mcp_daemon, wait_for_mcp_warmup,
-    warmup_timeout_warning,
+    current_mcp_server_statuses, enabled_mcp_servers, has_cached_mcp_tool,
+    hydrate_cached_mcp_tools, list_mcp_tools_from_ready_daemon, load_mcp_cache, mcp_enabled,
+    run_mcp_daemon, start_mcp_daemon_process, start_mcp_warmup, stop_mcp_daemon,
+    wait_for_mcp_warmup, warmup_timeout_warning,
 };
 use crate::media::{MessageImage, read_clipboard_image, read_clipboard_text, read_image_inputs};
 use crate::output::{AskOutput, AssistantMessage, render_ask_output};
@@ -39,8 +39,9 @@ use crate::session::{
 use crate::tool::execute_tool;
 use crate::tool::{
     continue_bash_session, execute_tool_with_context_and_paths, initial_tool_definitions,
-    list_bash_sessions, lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation,
-    tool_call_side_effects, tool_definitions_for_names, tool_search_matches,
+    list_bash_sessions, lookup_tool_spec, parse_tool_call, progressive_loading_enabled,
+    tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
+    tool_search_matches,
 };
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
@@ -999,10 +1000,31 @@ fn build_repl_status_panel(
     let provider_id =
         repl_effective_provider_id(cli, config, state).unwrap_or_else(|| "-".to_string());
     let model_id = repl_effective_model_id(cli, config, state).unwrap_or_else(|| "-".to_string());
+    let model = config.models.get(&model_id);
+    let context_window = resolved_context_window(
+        repl_effective_context_window(cli, state),
+        model.and_then(|entry| entry.context_window),
+        config.defaults.context_window,
+    );
+    let reasoning_effort = resolved_reasoning_effort(
+        repl_effective_reasoning_effort(cli, state),
+        config.defaults.reasoning_effort.as_deref(),
+        model.and_then(|entry| entry.reasoning_effort.as_deref()),
+    );
     let mut sections = vec![
         format!("session: {}", short_id(session_id)),
         format!("provider: {provider_id}"),
         format!("model: {model_id}"),
+        format!(
+            "context_window: {}",
+            context_window
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".to_string())
+        ),
+        format!(
+            "reasoning_effort: {}",
+            reasoning_effort.unwrap_or_else(|| "auto".to_string())
+        ),
         format!("stream: {}", if state.stream { "on" } else { "off" }),
         format!("tools: {}", if state.tools { "on" } else { "off" }),
         format!("context_status: {}", state.context_status.as_str()),
@@ -1010,6 +1032,8 @@ fn build_repl_status_panel(
     sections.push(String::new());
     sections.push("quick actions:".to_string());
     sections.push("/model       choose model".to_string());
+    sections.push("/context     set context window hint".to_string());
+    sections.push("/reasoning   set reasoning effort".to_string());
     sections.push("/sessions    switch session".to_string());
     sections.push("/audit       toggle audit checks".to_string());
     sections.push("/tool-search toggle progressive loading".to_string());
@@ -2700,6 +2724,8 @@ struct ReplState {
     context_status: ContextStatusMode,
     provider_override: Option<String>,
     model_override: Option<String>,
+    context_window_override: Option<u64>,
+    reasoning_effort_override: Option<String>,
     panels: Vec<ReplRuntimePanel>,
     transient_panel: Option<ReplRuntimePanel>,
 }
@@ -2738,6 +2764,8 @@ enum ReplDirective {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplSlashCommand {
     Model,
+    Context,
+    Reasoning,
     Session,
     Audit,
     ToolSearch,
@@ -2753,6 +2781,8 @@ impl ReplSlashCommand {
     fn command(self) -> &'static str {
         match self {
             ReplSlashCommand::Model => "model",
+            ReplSlashCommand::Context => "context",
+            ReplSlashCommand::Reasoning => "reasoning",
             ReplSlashCommand::Session => "sessions",
             ReplSlashCommand::Audit => "audit",
             ReplSlashCommand::ToolSearch => "tool-search",
@@ -2768,6 +2798,8 @@ impl ReplSlashCommand {
     fn usage(self) -> &'static str {
         match self {
             ReplSlashCommand::Model => "/model [list [provider]|reset|<id>|<provider>/<model>]",
+            ReplSlashCommand::Context => "/context [status|reset|<tokens>]",
+            ReplSlashCommand::Reasoning => "/reasoning [status|reset|auto|low|medium|high|<value>]",
             ReplSlashCommand::Session => "/sessions [list|current|switch <id>]",
             ReplSlashCommand::Audit => "/audit [on|off|status]",
             ReplSlashCommand::ToolSearch => "/tool-search [on|off|status]",
@@ -2783,6 +2815,8 @@ impl ReplSlashCommand {
     fn description(self) -> &'static str {
         match self {
             ReplSlashCommand::Model => "choose the model for new turns",
+            ReplSlashCommand::Context => "set the runtime context window hint",
+            ReplSlashCommand::Reasoning => "set the runtime reasoning effort",
             ReplSlashCommand::Session => "list or switch chat sessions",
             ReplSlashCommand::Audit => "toggle audit checks for dangerous tools",
             ReplSlashCommand::ToolSearch => "toggle progressive tool loading",
@@ -2797,6 +2831,8 @@ impl ReplSlashCommand {
 
 const REPL_SLASH_COMMANDS: &[ReplSlashCommand] = &[
     ReplSlashCommand::Model,
+    ReplSlashCommand::Context,
+    ReplSlashCommand::Reasoning,
     ReplSlashCommand::Session,
     ReplSlashCommand::Audit,
     ReplSlashCommand::ToolSearch,
@@ -2841,6 +2877,8 @@ async fn handle_repl(
         ),
         provider_override: None,
         model_override: None,
+        context_window_override: None,
+        reasoning_effort_override: None,
         panels: Vec::new(),
         transient_panel: None,
     };
@@ -3142,6 +3180,8 @@ enum ReplPopupAction {
 enum ReplSlashMode {
     Commands,
     Model,
+    Context,
+    Reasoning,
     Session,
     Audit,
     ToolSearch,
@@ -3153,6 +3193,8 @@ impl ReplSlashMode {
         match self {
             Self::Commands => None,
             Self::Model => Some("model"),
+            Self::Context => Some("context"),
+            Self::Reasoning => Some("reasoning"),
             Self::Session => Some("sessions"),
             Self::Audit => Some("audit"),
             Self::ToolSearch => Some("tool-search"),
@@ -3168,6 +3210,8 @@ impl ReplSlashMode {
         match self {
             Self::Commands => "Filter slash commands. Press Enter to apply.",
             Self::Model => "Filter models. Press Enter to apply.",
+            Self::Context => "Enter a context window. Press Enter to apply.",
+            Self::Reasoning => "Choose or type a reasoning effort. Press Enter to apply.",
             Self::Session => "Filter sessions. Press Enter to switch.",
             Self::Audit => "Choose an audit setting. Press Enter to apply.",
             Self::ToolSearch => "Choose a tool search setting. Press Enter to apply.",
@@ -3848,10 +3892,10 @@ fn popup_window_start(selected: usize, total_items: usize, visible_count: usize)
 
 fn repl_popup_model(
     draft: &ReplEditorDraft,
-    _cli: &Cli,
+    cli: &Cli,
     paths: &AppPaths,
     config: &AppConfig,
-    _state: &ReplState,
+    state: &ReplState,
 ) -> Option<ReplPopupModel> {
     if let Some(mode) = draft.slash_mode {
         let query = draft.buffer.trim();
@@ -3864,6 +3908,12 @@ fn repl_popup_model(
                     action: match command {
                         ReplSlashCommand::Model => {
                             ReplPopupAction::EnterSlashMode(ReplSlashMode::Model)
+                        }
+                        ReplSlashCommand::Context => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Context)
+                        }
+                        ReplSlashCommand::Reasoning => {
+                            ReplPopupAction::EnterSlashMode(ReplSlashMode::Reasoning)
                         }
                         ReplSlashCommand::Session => {
                             ReplPopupAction::EnterSlashMode(ReplSlashMode::Session)
@@ -3882,6 +3932,8 @@ fn repl_popup_model(
                 })
                 .collect::<Vec<_>>(),
             ReplSlashMode::Model => build_repl_model_popup_items(config, query),
+            ReplSlashMode::Context => build_repl_context_popup_items(cli, config, state, query),
+            ReplSlashMode::Reasoning => build_repl_reasoning_popup_items(cli, config, state, query),
             ReplSlashMode::Session => build_repl_session_popup_items(paths, config, query),
             ReplSlashMode::Audit => {
                 build_repl_toggle_popup_items("audit", config.audit.enabled.unwrap_or(false), query)
@@ -3911,6 +3963,12 @@ fn repl_popup_model(
             detail: command.description().to_string(),
             action: match command {
                 ReplSlashCommand::Model => ReplPopupAction::EnterSlashMode(ReplSlashMode::Model),
+                ReplSlashCommand::Context => {
+                    ReplPopupAction::EnterSlashMode(ReplSlashMode::Context)
+                }
+                ReplSlashCommand::Reasoning => {
+                    ReplPopupAction::EnterSlashMode(ReplSlashMode::Reasoning)
+                }
                 ReplSlashCommand::Session => {
                     ReplPopupAction::EnterSlashMode(ReplSlashMode::Session)
                 }
@@ -4016,6 +4074,69 @@ fn build_repl_model_popup_items(config: &AppConfig, query: &str) -> Vec<ReplPopu
         });
     }
     items
+}
+
+fn build_repl_context_popup_items(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &ReplState,
+    query: &str,
+) -> Vec<ReplPopupItem> {
+    let current = resolved_context_window(
+        repl_effective_context_window(cli, state),
+        repl_effective_model_id(cli, config, state)
+            .as_ref()
+            .and_then(|model_id| config.models.get(model_id))
+            .and_then(|model| model.context_window),
+        config.defaults.context_window,
+    )
+    .map(|value| value.to_string())
+    .unwrap_or_else(|| "unset".to_string());
+    [
+        ("status", format!("current {current}")),
+        ("reset", "clear runtime override".to_string()),
+    ]
+    .into_iter()
+    .filter(|(label, _)| matches_popup_query(label, query))
+    .map(|(label, detail)| ReplPopupItem {
+        label: label.to_string(),
+        detail,
+        action: ReplPopupAction::SubmitPrompt(format!("/context {label}")),
+    })
+    .collect()
+}
+
+fn build_repl_reasoning_popup_items(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &ReplState,
+    query: &str,
+) -> Vec<ReplPopupItem> {
+    let current = resolved_reasoning_effort(
+        repl_effective_reasoning_effort(cli, state),
+        config.defaults.reasoning_effort.as_deref(),
+        repl_effective_model_id(cli, config, state)
+            .as_ref()
+            .and_then(|model_id| config.models.get(model_id))
+            .and_then(|model| model.reasoning_effort.as_deref()),
+    )
+    .unwrap_or_else(|| "auto".to_string());
+    [
+        ("status", format!("current {current}")),
+        ("reset", "clear runtime override".to_string()),
+        ("auto", "disable explicit reasoning hint".to_string()),
+        ("low", "use low reasoning effort".to_string()),
+        ("medium", "use medium reasoning effort".to_string()),
+        ("high", "use high reasoning effort".to_string()),
+    ]
+    .into_iter()
+    .filter(|(label, _)| matches_popup_query(label, query))
+    .map(|(label, detail)| ReplPopupItem {
+        label: label.to_string(),
+        detail,
+        action: ReplPopupAction::SubmitPrompt(format!("/reasoning {label}")),
+    })
+    .collect()
 }
 
 fn build_repl_toggle_popup_items(name: &str, current: bool, query: &str) -> Vec<ReplPopupItem> {
@@ -4639,6 +4760,14 @@ fn handle_repl_directive(
                 handle_repl_model_command(cli, config, state, rest)?;
                 return Ok(ReplDirective::Continue);
             }
+            ReplSlashCommand::Context => {
+                handle_repl_context_command(cli, config, state, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
+            ReplSlashCommand::Reasoning => {
+                handle_repl_reasoning_command(cli, config, state, rest)?;
+                return Ok(ReplDirective::Continue);
+            }
             ReplSlashCommand::Session => {
                 handle_repl_session_command(paths, config, session_id, first_turn, temp, rest)?;
                 return Ok(ReplDirective::Continue);
@@ -4720,6 +4849,8 @@ fn parse_repl_slash_command(input: &str) -> Option<(ReplSlashCommand, &str)> {
     let command = match name {
         "" | "commands" => return None,
         "model" => ReplSlashCommand::Model,
+        "context" => ReplSlashCommand::Context,
+        "reasoning" => ReplSlashCommand::Reasoning,
         "sessions" | "session" => ReplSlashCommand::Session,
         "audit" => ReplSlashCommand::Audit,
         "tool-search" | "toolsearch" => ReplSlashCommand::ToolSearch,
@@ -4910,6 +5041,103 @@ fn handle_repl_model_command(
     }
 }
 
+fn handle_repl_context_command(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &mut ReplState,
+    rest: &str,
+) -> AppResult<()> {
+    match rest {
+        "" | "status" => {
+            println!(
+                "context-window: {}",
+                resolved_context_window(
+                    repl_effective_context_window(cli, state),
+                    repl_effective_model_id(cli, config, state)
+                        .as_ref()
+                        .and_then(|model_id| config.models.get(model_id))
+                        .and_then(|model| model.context_window),
+                    config.defaults.context_window,
+                )
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".to_string())
+            );
+            Ok(())
+        }
+        "reset" => {
+            state.context_window_override = None;
+            println!(
+                "context-window reset to {}",
+                resolved_context_window(
+                    repl_effective_context_window(cli, state),
+                    repl_effective_model_id(cli, config, state)
+                        .as_ref()
+                        .and_then(|model_id| config.models.get(model_id))
+                        .and_then(|model| model.context_window),
+                    config.defaults.context_window,
+                )
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unset".to_string())
+            );
+            Ok(())
+        }
+        value => {
+            let parsed = parse_runtime_context_window(value)?;
+            state.context_window_override = Some(parsed);
+            println!("context-window set to {parsed}");
+            Ok(())
+        }
+    }
+}
+
+fn handle_repl_reasoning_command(
+    cli: &Cli,
+    config: &AppConfig,
+    state: &mut ReplState,
+    rest: &str,
+) -> AppResult<()> {
+    match rest {
+        "" | "status" => {
+            println!(
+                "reasoning-effort: {}",
+                resolved_reasoning_effort(
+                    repl_effective_reasoning_effort(cli, state),
+                    config.defaults.reasoning_effort.as_deref(),
+                    repl_effective_model_id(cli, config, state)
+                        .as_ref()
+                        .and_then(|model_id| config.models.get(model_id))
+                        .and_then(|model| model.reasoning_effort.as_deref()),
+                )
+                .unwrap_or_else(|| "auto".to_string())
+            );
+            Ok(())
+        }
+        "reset" => {
+            state.reasoning_effort_override = None;
+            println!(
+                "reasoning-effort reset to {}",
+                resolved_reasoning_effort(
+                    repl_effective_reasoning_effort(cli, state),
+                    config.defaults.reasoning_effort.as_deref(),
+                    repl_effective_model_id(cli, config, state)
+                        .as_ref()
+                        .and_then(|model_id| config.models.get(model_id))
+                        .and_then(|model| model.reasoning_effort.as_deref()),
+                )
+                .unwrap_or_else(|| "auto".to_string())
+            );
+            Ok(())
+        }
+        value => {
+            let normalized = normalize_runtime_reasoning_effort(Some(value))
+                .unwrap_or_else(|| "auto".to_string());
+            state.reasoning_effort_override = Some(normalized.clone());
+            println!("reasoning-effort set to {normalized}");
+            Ok(())
+        }
+    }
+}
+
 fn print_repl_model_choices(
     cli: &Cli,
     config: &AppConfig,
@@ -4960,6 +5188,17 @@ fn repl_effective_provider_id(cli: &Cli, config: &AppConfig, state: &ReplState) 
         .or_else(|| config.defaults.provider.clone())
 }
 
+fn repl_effective_context_window(cli: &Cli, state: &ReplState) -> Option<u64> {
+    state.context_window_override.or(cli.context_window)
+}
+
+fn repl_effective_reasoning_effort<'a>(cli: &'a Cli, state: &'a ReplState) -> Option<&'a str> {
+    state
+        .reasoning_effort_override
+        .as_deref()
+        .or(cli.reasoning_effort.as_deref())
+}
+
 fn repl_effective_model_id(cli: &Cli, config: &AppConfig, state: &ReplState) -> Option<String> {
     let provider_id = repl_effective_provider_id(cli, config, state);
     let selected = state
@@ -4989,6 +5228,8 @@ fn repl_runtime_cli(cli: &Cli, config: &AppConfig, state: &ReplState) -> Cli {
     let mut runtime = cli.clone();
     runtime.provider = repl_effective_provider_id(cli, config, state);
     runtime.model = repl_effective_model_id(cli, config, state);
+    runtime.context_window = repl_effective_context_window(cli, state);
+    runtime.reasoning_effort = repl_effective_reasoning_effort(cli, state).map(str::to_string);
     runtime
 }
 
@@ -5313,7 +5554,7 @@ async fn execute_ask_with_tools(
             };
 
             for raw_call in &response.tool_calls {
-                if config.tools.progressive_loading.unwrap_or(false) {
+                if progressive_loading_enabled(config) {
                     for tool_name in discovered_tool_names_from_search(config, raw_call) {
                         loaded_tool_names.insert(tool_name);
                     }
@@ -5559,6 +5800,86 @@ async fn execute_ask_stream(
     Ok(())
 }
 
+fn build_mcp_server_descriptions(config: &AppConfig) -> Option<String> {
+    let descriptions: Vec<String> = enabled_mcp_servers(config)
+        .into_iter()
+        .filter_map(|(name, server)| {
+            server
+                .description
+                .as_ref()
+                .map(|desc| format!("- **{name}**: {desc}"))
+        })
+        .collect();
+    if descriptions.is_empty() {
+        return None;
+    }
+    Some(format!("## MCP Servers\n\n{}", descriptions.join("\n")))
+}
+
+fn parse_runtime_context_window(value: &str) -> AppResult<u64> {
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| AppError::new(EXIT_ARGS, "context window must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "context window must be greater than 0",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn normalize_runtime_reasoning_effort(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn resolved_context_window(
+    cli_context_window: Option<u64>,
+    model_context_window: Option<u64>,
+    default_context_window: Option<u64>,
+) -> Option<u64> {
+    cli_context_window
+        .or(model_context_window)
+        .or(default_context_window)
+}
+
+fn resolved_reasoning_effort(
+    cli_reasoning_effort: Option<&str>,
+    default_reasoning_effort: Option<&str>,
+    model_reasoning_effort: Option<&str>,
+) -> Option<String> {
+    for candidate in [
+        cli_reasoning_effort,
+        default_reasoning_effort,
+        model_reasoning_effort,
+    ] {
+        if candidate.is_some() {
+            return normalize_runtime_reasoning_effort(candidate);
+        }
+    }
+    None
+}
+
+fn effective_model_config(cli: &Cli, config: &AppConfig, model: &ModelConfig) -> ModelConfig {
+    let mut effective = model.clone();
+    effective.context_window = resolved_context_window(
+        cli.context_window,
+        model.context_window,
+        config.defaults.context_window,
+    );
+    effective.reasoning_effort = resolved_reasoning_effort(
+        cli.reasoning_effort.as_deref(),
+        config.defaults.reasoning_effort.as_deref(),
+        model.reasoning_effort.as_deref(),
+    );
+    effective
+}
+
 fn prepare_ask(
     cli: &Cli,
     paths: &AppPaths,
@@ -5611,6 +5932,7 @@ fn prepare_ask(
             ),
         ));
     }
+    let effective_model = effective_model_config(cli, config, model);
     let mut format = output_override
         .or(cli.output.clone())
         .or_else(|| config.defaults.output.clone())
@@ -5698,6 +6020,15 @@ fn prepare_ask(
             (None, None, _) => None,
         };
 
+        let final_system = if let Some(mcp_desc) = build_mcp_server_descriptions(config) {
+            match final_system {
+                Some(system) => Some(format!("{system}\n\n{mcp_desc}")),
+                None => Some(mcp_desc),
+            }
+        } else {
+            final_system
+        };
+
         if let Some(system) = final_system {
             let system_message = ChatMessage {
                 role: "system".to_string(),
@@ -5748,7 +6079,7 @@ fn prepare_ask(
         name: None,
     });
     if messages.iter().any(|message| !message.images.is_empty()) {
-        if !model_supports_capability(model, "vision") {
+        if !model_supports_capability(&effective_model, "vision") {
             return Err(AppError::new(
                 EXIT_MODEL,
                 format!(
@@ -5767,8 +6098,8 @@ fn prepare_ask(
         }
     }
 
-    let temperature = args.temperature.or(model.temperature);
-    let max_output_tokens = args.max_output_tokens.or(model.max_output_tokens);
+    let temperature = args.temperature.or(effective_model.temperature);
+    let max_output_tokens = args.max_output_tokens.or(effective_model.max_output_tokens);
     let api_key = resolve_api_key(&provider_id, provider, secrets)?;
     let params = parse_params(&args.params)?;
 
@@ -5784,7 +6115,7 @@ fn prepare_ask(
             provider_id,
             provider: provider.clone(),
             model_id,
-            model: model.clone(),
+            model: effective_model,
             api_key,
             messages,
             temperature,
@@ -6100,6 +6431,8 @@ mod tests {
         Cli {
             provider: Some("cpap".to_string()),
             model: Some("team-gpt-5-4".to_string()),
+            context_window: None,
+            reasoning_effort: None,
             mode: "auto".to_string(),
             output: None,
             config_dir: None,
@@ -6277,6 +6610,40 @@ mod tests {
     }
 
     #[test]
+    fn prepare_ask_applies_runtime_model_overrides_with_expected_precedence() {
+        let (paths, _base) = test_paths();
+        let mut cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.defaults.context_window = Some(64000);
+        config.defaults.reasoning_effort = Some("medium".to_string());
+        let model = config.models.get_mut("team-gpt-5-4").unwrap();
+        model.context_window = Some(200000);
+        model.reasoning_effort = Some("low".to_string());
+
+        let prepared =
+            prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
+        assert_eq!(prepared.request.model.context_window, Some(200000));
+        assert_eq!(
+            prepared.request.model.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+
+        cli.context_window = Some(32000);
+        cli.reasoning_effort = Some("auto".to_string());
+        let prepared =
+            prepare_ask(&cli, &paths, &config, &secrets, &ask_args("test"), None).unwrap();
+        assert_eq!(prepared.request.model.context_window, Some(32000));
+        assert_eq!(prepared.request.model.reasoning_effort, None);
+    }
+
+    #[test]
     fn ensure_mcp_daemon_started_skips_when_mcp_disabled() {
         let (paths, _base) = test_paths();
         let config = test_config();
@@ -6404,6 +6771,56 @@ mod tests {
     }
 
     #[test]
+    fn repl_context_command_updates_runtime_override() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState::default();
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/context 48000".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            false,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(directive, ReplDirective::Continue));
+        assert_eq!(state.context_window_override, Some(48000));
+    }
+
+    #[test]
+    fn repl_reasoning_command_updates_runtime_override() {
+        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let mut state = ReplState::default();
+        let mut stdout = io::stdout();
+        let directive = handle_repl_directive(
+            ReplInput {
+                prompt: "/reasoning auto".to_string(),
+                images: Vec::new(),
+            },
+            &mut state,
+            &mut stdout,
+            false,
+            &cli,
+            &paths,
+            &config,
+            &mut session_id,
+            &mut first_turn,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(directive, ReplDirective::Continue));
+        assert_eq!(state.reasoning_effort_override.as_deref(), Some("auto"));
+    }
+
+    #[test]
     fn repl_unknown_slash_command_is_sent_to_model() {
         let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
         let mut state = ReplState {
@@ -6440,6 +6857,8 @@ mod tests {
             .map(|command| command.command())
             .collect::<Vec<_>>();
         assert!(commands.contains(&"model"));
+        assert!(commands.contains(&"context"));
+        assert!(commands.contains(&"reasoning"));
         assert!(commands.contains(&"sessions"));
         assert!(commands.contains(&"audit"));
         assert!(commands.contains(&"tool-search"));
@@ -6461,6 +6880,7 @@ mod tests {
             .map(|command| command.command())
             .collect::<Vec<_>>();
         assert!(commands.contains(&"status"));
+        assert!(commands.contains(&"context"));
         assert!(commands.contains(&"sessions"));
         assert!(commands.contains(&"tool-search"));
     }
@@ -6638,6 +7058,8 @@ mod tests {
             context_status: ContextStatusMode::Off,
             provider_override: Some("deepseek".to_string()),
             model_override: Some("deepseek-reasoner-search".to_string()),
+            context_window_override: Some(96000),
+            reasoning_effort_override: Some("high".to_string()),
             panels: Vec::new(),
             transient_panel: None,
         };
@@ -6645,8 +7067,12 @@ mod tests {
         assert_eq!(panel.kind, ReplRuntimePanelKind::Status);
         assert!(panel.body.contains("provider: deepseek"));
         assert!(panel.body.contains("model: deepseek-reasoner-search"));
+        assert!(panel.body.contains("context_window: 96000"));
+        assert!(panel.body.contains("reasoning_effort: high"));
         assert!(panel.body.contains("tools: off"));
         assert!(panel.body.contains("context_status: off"));
+        assert!(panel.body.contains("/context"));
+        assert!(panel.body.contains("/reasoning"));
         assert!(panel.body.contains("/model"));
     }
 
@@ -7738,6 +8164,76 @@ mod tests {
         assert_eq!(second_roles, vec!["system", "user", "assistant", "user"]);
         assert_eq!(second.request.messages[0].content, "回答时保持简洁");
         assert!(second.session_preamble.is_empty());
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn prepare_ask_injects_mcp_descriptions_into_system_prompt() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "demo".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "echo".to_string(),
+                description: Some("Use this server for demo tasks.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut args = ask_args("hello");
+        args.system = Some("Be helpful.".to_string());
+        args.new_session = true;
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &args, None).unwrap();
+        assert_eq!(prepared.request.messages[0].role, "system");
+        let content = &prepared.request.messages[0].content;
+        assert!(content.contains("Be helpful."));
+        assert!(content.contains("## MCP Servers"));
+        assert!(content.contains("- **demo**: Use this server for demo tasks."));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn prepare_ask_skips_mcp_descriptions_when_no_mcp_servers_have_description() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "demo".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "echo".to_string(),
+                description: None,
+                ..Default::default()
+            },
+        );
+
+        let mut args = ask_args("hello");
+        args.system = Some("Be helpful.".to_string());
+        args.new_session = true;
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &args, None).unwrap();
+        assert_eq!(prepared.request.messages[0].role, "system");
+        let content = &prepared.request.messages[0].content;
+        assert_eq!(content, "Be helpful.");
 
         let _ = fs::remove_dir_all(base_dir);
     }

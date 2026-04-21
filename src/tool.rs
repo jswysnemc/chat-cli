@@ -732,8 +732,20 @@ pub fn continue_bash_session(
     }
 }
 
-fn progressive_loading_enabled(config: &AppConfig) -> bool {
+fn builtin_progressive_loading_enabled(config: &AppConfig) -> bool {
     config.tools.progressive_loading.unwrap_or(false)
+}
+
+fn mcp_progressive_loading_enabled(config: &AppConfig) -> bool {
+    config
+        .tools
+        .mcp_progressive_loading
+        .or(config.tools.progressive_loading)
+        .unwrap_or(false)
+}
+
+pub fn progressive_loading_enabled(config: &AppConfig) -> bool {
+    builtin_progressive_loading_enabled(config) || mcp_progressive_loading_enabled(config)
 }
 
 fn full_tool_definitions(config: &AppConfig) -> Vec<Value> {
@@ -782,28 +794,69 @@ pub fn tool_call_requires_confirmation(call: &ToolCall) -> bool {
 }
 
 pub fn initial_tool_definitions(config: &AppConfig) -> Vec<Value> {
-    if !progressive_loading_enabled(config) {
+    let builtin_prog = builtin_progressive_loading_enabled(config);
+    let mcp_prog = mcp_progressive_loading_enabled(config);
+
+    if !builtin_prog && !mcp_prog {
         return full_tool_definitions(config);
     }
-    vec![define_tool_search_tool_with_config(config)]
+
+    let mut tools = vec![define_tool_search_tool_with_config(config)];
+
+    if !builtin_prog {
+        tools.extend(
+            builtin_tool_handlers()
+                .iter()
+                .filter(|handler| handler.spec.name != "ToolSearch")
+                .map(|handler| (handler.spec.definition)()),
+        );
+    }
+
+    if !mcp_prog {
+        tools.extend(mcp_tool_definitions(config));
+    }
+
+    tools
 }
 
 pub fn tool_definitions_for_names(config: &AppConfig, names: &[String]) -> Vec<Value> {
-    if !progressive_loading_enabled(config) {
+    let builtin_prog = builtin_progressive_loading_enabled(config);
+    let mcp_prog = mcp_progressive_loading_enabled(config);
+
+    if !builtin_prog && !mcp_prog {
         return full_tool_definitions(config);
     }
-    let mut tools = initial_tool_definitions(config);
+
+    let mut tools = vec![define_tool_search_tool_with_config(config)];
+
+    if !builtin_prog {
+        tools.extend(
+            builtin_tool_handlers()
+                .iter()
+                .filter(|handler| handler.spec.name != "ToolSearch")
+                .map(|handler| (handler.spec.definition)()),
+        );
+    }
+
+    if !mcp_prog {
+        tools.extend(mcp_tool_definitions(config));
+    }
+
     for name in names {
         if let Some(handler) = find_tool_handler(name)
             && handler.spec.defer_loading
+            && builtin_prog
         {
             tools.push((handler.spec.definition)());
             continue;
         }
-        if let Some(tool) = mcp_tool_definition_for_name(config, name) {
-            tools.push(tool);
+        if name.starts_with("mcp__") && mcp_prog {
+            if let Some(tool) = mcp_tool_definition_for_name(config, name) {
+                tools.push(tool);
+            }
         }
     }
+
     tools
 }
 
@@ -3243,6 +3296,37 @@ mod tests {
         assert!(names.contains(&"Status"));
         assert!(names.contains(&"TodoWrite"));
         assert!(defs.len() >= 10);
+    }
+
+    #[test]
+    fn initial_tool_definitions_exposes_builtins_when_only_mcp_progressive_loading_enabled() {
+        let mut config = AppConfig::default();
+        config.tools.progressive_loading = Some(false);
+        config.tools.mcp_progressive_loading = Some(true);
+        let defs = initial_tool_definitions(&config);
+        let names = defs
+            .iter()
+            .filter_map(|def| def["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"ToolSearch"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Read"));
+        assert!(!names.contains(&"mcp__test__tool"));
+    }
+
+    #[test]
+    fn initial_tool_definitions_exposes_tool_search_when_only_builtin_progressive_loading_enabled() {
+        let mut config = AppConfig::default();
+        config.tools.progressive_loading = Some(true);
+        config.tools.mcp_progressive_loading = Some(false);
+        let defs = initial_tool_definitions(&config);
+        let names = defs
+            .iter()
+            .filter_map(|def| def["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"ToolSearch"));
+        assert!(!names.contains(&"Bash"));
+        assert!(!names.contains(&"Read"));
     }
 
     #[test]

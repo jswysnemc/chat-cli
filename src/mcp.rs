@@ -33,6 +33,8 @@ pub struct McpServerConfig {
     pub enabled_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 const fn default_enabled() -> bool {
@@ -52,6 +54,7 @@ impl Default for McpServerConfig {
             enabled: true,
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            description: None,
         }
     }
 }
