@@ -15,10 +15,10 @@ use crate::error::{
 };
 use crate::mcp::{
     McpWarmupHandle, authenticate_and_cache_mcp, current_mcp_daemon_status,
-    current_mcp_server_statuses, has_cached_mcp_tool, hydrate_cached_mcp_tools,
-    list_mcp_tools_from_ready_daemon, load_mcp_cache, mcp_enabled, run_mcp_daemon,
-    start_mcp_daemon_process, start_mcp_warmup, stop_mcp_daemon, wait_for_mcp_warmup,
-    warmup_timeout_warning,
+    current_mcp_server_statuses, enabled_mcp_servers, has_cached_mcp_tool,
+    hydrate_cached_mcp_tools, list_mcp_tools_from_ready_daemon, load_mcp_cache, mcp_enabled,
+    run_mcp_daemon, start_mcp_daemon_process, start_mcp_warmup, stop_mcp_daemon,
+    wait_for_mcp_warmup, warmup_timeout_warning,
 };
 use crate::media::{MessageImage, read_clipboard_image, read_clipboard_text, read_image_inputs};
 use crate::output::{AskOutput, AssistantMessage, render_ask_output};
@@ -39,8 +39,9 @@ use crate::session::{
 use crate::tool::execute_tool;
 use crate::tool::{
     continue_bash_session, execute_tool_with_context_and_paths, initial_tool_definitions,
-    list_bash_sessions, lookup_tool_spec, parse_tool_call, tool_call_requires_confirmation,
-    tool_call_side_effects, tool_definitions_for_names, tool_search_matches,
+    list_bash_sessions, lookup_tool_spec, parse_tool_call, progressive_loading_enabled,
+    tool_call_requires_confirmation, tool_call_side_effects, tool_definitions_for_names,
+    tool_search_matches,
 };
 use clap::CommandFactory;
 use crossterm::cursor::{self, MoveTo};
@@ -5313,7 +5314,7 @@ async fn execute_ask_with_tools(
             };
 
             for raw_call in &response.tool_calls {
-                if config.tools.progressive_loading.unwrap_or(false) {
+                if progressive_loading_enabled(config) {
                     for tool_name in discovered_tool_names_from_search(config, raw_call) {
                         loaded_tool_names.insert(tool_name);
                     }
@@ -5559,6 +5560,22 @@ async fn execute_ask_stream(
     Ok(())
 }
 
+fn build_mcp_server_descriptions(config: &AppConfig) -> Option<String> {
+    let descriptions: Vec<String> = enabled_mcp_servers(config)
+        .into_iter()
+        .filter_map(|(name, server)| {
+            server
+                .description
+                .as_ref()
+                .map(|desc| format!("- **{name}**: {desc}"))
+        })
+        .collect();
+    if descriptions.is_empty() {
+        return None;
+    }
+    Some(format!("## MCP Servers\n\n{}", descriptions.join("\n")))
+}
+
 fn prepare_ask(
     cli: &Cli,
     paths: &AppPaths,
@@ -5696,6 +5713,15 @@ fn prepare_ask(
             (Some(cli), None, _) => Some(cli),
             (None, Some(file), _) => Some(file),
             (None, None, _) => None,
+        };
+
+        let final_system = if let Some(mcp_desc) = build_mcp_server_descriptions(config) {
+            match final_system {
+                Some(system) => Some(format!("{system}\n\n{mcp_desc}")),
+                None => Some(mcp_desc),
+            }
+        } else {
+            final_system
         };
 
         if let Some(system) = final_system {
@@ -7738,6 +7764,76 @@ mod tests {
         assert_eq!(second_roles, vec!["system", "user", "assistant", "user"]);
         assert_eq!(second.request.messages[0].content, "回答时保持简洁");
         assert!(second.session_preamble.is_empty());
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn prepare_ask_injects_mcp_descriptions_into_system_prompt() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "demo".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "echo".to_string(),
+                description: Some("Use this server for demo tasks.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut args = ask_args("hello");
+        args.system = Some("Be helpful.".to_string());
+        args.new_session = true;
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &args, None).unwrap();
+        assert_eq!(prepared.request.messages[0].role, "system");
+        let content = &prepared.request.messages[0].content;
+        assert!(content.contains("Be helpful."));
+        assert!(content.contains("## MCP Servers"));
+        assert!(content.contains("- **demo**: Use this server for demo tasks."));
+
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn prepare_ask_skips_mcp_descriptions_when_no_mcp_servers_have_description() {
+        let (paths, base_dir) = test_paths();
+        let cli = test_cli();
+        let mut config = test_config();
+        let mut secrets = SecretsConfig::default();
+        secrets.providers.insert(
+            "cpap".to_string(),
+            ProviderSecret {
+                api_key: Some("test-key".to_string()),
+            },
+        );
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "demo".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "echo".to_string(),
+                description: None,
+                ..Default::default()
+            },
+        );
+
+        let mut args = ask_args("hello");
+        args.system = Some("Be helpful.".to_string());
+        args.new_session = true;
+
+        let prepared = prepare_ask(&cli, &paths, &config, &secrets, &args, None).unwrap();
+        assert_eq!(prepared.request.messages[0].role, "system");
+        let content = &prepared.request.messages[0].content;
+        assert_eq!(content, "Be helpful.");
 
         let _ = fs::remove_dir_all(base_dir);
     }

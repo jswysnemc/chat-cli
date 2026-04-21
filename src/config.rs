@@ -159,6 +159,7 @@ pub struct ToolsConfig {
     pub max_rounds: Option<u32>,
     pub progressive_loading: Option<bool>,
     pub mcp: Option<bool>,
+    pub mcp_progressive_loading: Option<bool>,
 }
 
 impl Default for ToolsConfig {
@@ -167,6 +168,7 @@ impl Default for ToolsConfig {
             max_rounds: Some(20),
             progressive_loading: Some(false),
             mcp: Some(false),
+            mcp_progressive_loading: None,
         }
     }
 }
@@ -446,6 +448,11 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
             .unwrap_or(false)
             .to_string()),
         "tools.mcp" => Ok(config.tools.mcp.unwrap_or(false).to_string()),
+        "tools.mcp_progressive_loading" => Ok(config
+            .tools
+            .mcp_progressive_loading
+            .unwrap_or(false)
+            .to_string()),
         "audit.enabled" => Ok(config.audit.enabled.unwrap_or(false).to_string()),
         "audit.model" => Ok(config.audit.model.clone().unwrap_or_default()),
         "audit.default_prompt_file" => {
@@ -510,6 +517,9 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
         }
         "tools.mcp" => {
             config.tools.mcp = Some(parse_bool(value)?);
+        }
+        "tools.mcp_progressive_loading" => {
+            config.tools.mcp_progressive_loading = Some(parse_bool(value)?);
         }
         "audit.enabled" => {
             config.audit.enabled = Some(parse_bool(value)?);
@@ -767,6 +777,17 @@ mod tests {
         set_config_value(&mut config, "tools.mcp", "true").unwrap();
         assert_eq!(config.tools.mcp, Some(true));
         assert_eq!(render_config_value(&config, "tools.mcp").unwrap(), "true");
+    }
+
+    #[test]
+    fn set_config_value_parses_tools_mcp_progressive_loading_flag() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "tools.mcp_progressive_loading", "true").unwrap();
+        assert_eq!(config.tools.mcp_progressive_loading, Some(true));
+        assert_eq!(
+            render_config_value(&config, "tools.mcp_progressive_loading").unwrap(),
+            "true"
+        );
     }
 
     #[test]
