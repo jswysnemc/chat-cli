@@ -108,6 +108,8 @@ impl Default for AppConfig {
 pub struct DefaultsConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub context_window: Option<u64>,
+    pub reasoning_effort: Option<String>,
     pub mode: Option<String>,
     pub output: Option<OutputFormat>,
     pub auto_create_session: Option<bool>,
@@ -125,6 +127,8 @@ impl Default for DefaultsConfig {
         Self {
             provider: None,
             model: None,
+            context_window: None,
+            reasoning_effort: None,
             mode: Some("auto".to_string()),
             output: Some(OutputFormat::Line),
             auto_create_session: Some(true),
@@ -396,6 +400,16 @@ pub fn render_config_value(config: &AppConfig, key: &str) -> AppResult<String> {
     match key {
         "defaults.provider" => Ok(config.defaults.provider.clone().unwrap_or_default()),
         "defaults.model" => Ok(config.defaults.model.clone().unwrap_or_default()),
+        "defaults.context_window" => Ok(config
+            .defaults
+            .context_window
+            .map(|value| value.to_string())
+            .unwrap_or_default()),
+        "defaults.reasoning_effort" => Ok(config
+            .defaults
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "auto".to_string())),
         "defaults.mode" => Ok(config.defaults.mode.clone().unwrap_or_default()),
         "defaults.output" => Ok(config
             .defaults
@@ -474,6 +488,16 @@ pub fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> AppRe
     match key {
         "defaults.provider" => config.defaults.provider = Some(value.to_string()),
         "defaults.model" => config.defaults.model = Some(value.to_string()),
+        "defaults.context_window" => {
+            config.defaults.context_window = if value.trim().is_empty() {
+                None
+            } else {
+                Some(parse_u64(value, "defaults.context_window")?)
+            };
+        }
+        "defaults.reasoning_effort" => {
+            config.defaults.reasoning_effort = normalize_optional_string(value);
+        }
         "defaults.mode" => config.defaults.mode = Some(value.to_string()),
         "defaults.output" => {
             config.defaults.output = Some(parse_output_format(value)?);
@@ -631,6 +655,11 @@ fn normalize_optional_path(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn normalize_optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn parse_output_format(value: &str) -> AppResult<OutputFormat> {
     match value {
         "line" => Ok(OutputFormat::Line),
@@ -658,6 +687,19 @@ fn parse_bool(value: &str) -> AppResult<bool> {
 fn parse_u32(value: &str, key: &str) -> AppResult<u32> {
     let parsed = value
         .parse::<u32>()
+        .map_err(|_| AppError::new(EXIT_CONFIG, format!("{key} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(AppError::new(
+            EXIT_CONFIG,
+            format!("{key} must be greater than 0"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_u64(value: &str, key: &str) -> AppResult<u64> {
+    let parsed = value
+        .parse::<u64>()
         .map_err(|_| AppError::new(EXIT_CONFIG, format!("{key} must be a positive integer")))?;
     if parsed == 0 {
         return Err(AppError::new(
@@ -755,6 +797,19 @@ mod tests {
         set_config_value(&mut config, "tools.progressive_loading", "false").unwrap();
         assert_eq!(config.tools.max_rounds, Some(12));
         assert_eq!(config.tools.progressive_loading, Some(false));
+    }
+
+    #[test]
+    fn set_config_value_parses_runtime_model_defaults() {
+        let mut config = AppConfig::default();
+        set_config_value(&mut config, "defaults.context_window", "128000").unwrap();
+        set_config_value(&mut config, "defaults.reasoning_effort", "medium").unwrap();
+        assert_eq!(config.defaults.context_window, Some(128000));
+        assert_eq!(config.defaults.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            render_config_value(&config, "defaults.reasoning_effort").unwrap(),
+            "medium"
+        );
     }
 
     #[test]

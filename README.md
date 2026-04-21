@@ -105,6 +105,8 @@ chat ask --tools                 # enable tool calling
 chat ask --context-status always "Inspect this repo"
 chat ask --context-status latest "Only inject status for this turn"
 chat ask --context-status system-once --system "Be concise" "Start a new session"
+chat --context-window 128000 ask "Use a runtime context hint"
+chat --reasoning-effort high ask "Think harder for this turn"
 chat ask -i screenshot.png "Describe this UI"
 chat ask -I "What's in the clipboard image?"
 ```
@@ -119,7 +121,11 @@ chat repl --session <id>         # continue session
 chat repl --system <prompt>      # system prompt
 chat repl --multiline            # enable multiline input
 chat repl --context-status system-once
+chat --context-window 128000 repl
+chat --reasoning-effort medium repl
 ```
+
+Inside REPL, runtime model tuning is also available through slash commands: `/model`, `/context`, `/reasoning`, `/status`.
 
 ### `chat session`
 
@@ -146,7 +152,11 @@ chat config path                 # print config/data/cache paths
 chat config show                 # show full config
 chat config get defaults.model   # read one config value
 chat config get defaults.context_status
+chat config get defaults.context_window
+chat config get defaults.reasoning_effort
 chat config set defaults.context_status system-once
+chat config set defaults.context_window 128000
+chat config set defaults.reasoning_effort high
 chat config set audit.enabled true
 chat config validate             # validate references and defaults
 
@@ -356,6 +366,8 @@ system_prompt_file = "~/.config/chat-cli/system.md" # external system prompt fil
 system_prompt_mode = "append"                   # append | override
 collapse_thinking = false                       # collapse <think> blocks in rendered output
 context_status = "off"                          # off | always | latest | system-once
+# context_window = 128000                       # optional fallback context hint when model config omits it
+# reasoning_effort = "auto"                     # optional runtime reasoning effort; auto disables explicit hint
 
 [session]
 store_format = "jsonl"                          # on-disk session format

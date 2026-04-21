@@ -13,6 +13,12 @@ pub struct Cli {
     #[arg(short = 'm', long, global = true)]
     pub model: Option<String>,
 
+    #[arg(long, global = true)]
+    pub context_window: Option<u64>,
+
+    #[arg(long, global = true)]
+    pub reasoning_effort: Option<String>,
+
     #[arg(long, default_value = "auto", global = true)]
     pub mode: String,
 
@@ -383,6 +389,27 @@ mod tests {
     use super::{Cli, Commands};
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn global_runtime_model_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "chat",
+            "--context-window",
+            "200000",
+            "--reasoning-effort",
+            "high",
+            "ask",
+            "hello",
+        ])
+        .expect("cli should parse global runtime model flags");
+
+        assert_eq!(cli.context_window, Some(200000));
+        assert_eq!(cli.reasoning_effort.as_deref(), Some("high"));
+        match cli.command {
+            Commands::Ask(args) => assert_eq!(args.prompt.as_deref(), Some("hello")),
+            other => panic!("expected ask command, got {other:?}"),
+        }
+    }
 
     #[test]
     fn ask_parses_image_short_flags() {
