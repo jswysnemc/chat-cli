@@ -3275,6 +3275,20 @@ mod tests {
         shell_tool_name()
     }
 
+    #[cfg(windows)]
+    fn missing_directory_probe_command() -> &'static str {
+        "if (Test-Path '/__chat_cli_missing__') { Write-Output \"exists\" } else { Write-Output \"checking pwd\"; (Get-Location).Path }"
+    }
+
+    #[cfg(not(windows))]
+    fn missing_directory_probe_command() -> &'static str {
+        "if [ -d /__chat_cli_missing__/ ]; then echo \"exists\"; else echo \"checking pwd\"; pwd; fi"
+    }
+
+    fn normalize_shell_assertion_text(value: &str) -> String {
+        value.replace('\\', "/").to_ascii_lowercase()
+    }
+
     #[test]
     fn build_ripgrep_args_includes_expected_flags() {
         let args = build_ripgrep_args("foo", "src", Some("*.rs"));
@@ -3797,13 +3811,17 @@ mod tests {
 
     #[test]
     fn bash_tool_finishes_missing_directory_probe_without_waiting() {
-        let output = tool_bash(
-            "ls /__chat_cli_missing__/ 2>/dev/null && echo \"exists\" || echo \"checking pwd\" && pwd",
-        )
-        .unwrap();
+        let output = tool_bash(missing_directory_probe_command()).unwrap();
         assert!(output.contains("checking pwd"));
-        assert!(output.contains(&std::env::current_dir().unwrap().display().to_string()));
-        assert!(!output.contains("interactive bash session is still running"));
+        let expected_dir =
+            normalize_shell_assertion_text(&std::env::current_dir().unwrap().display().to_string());
+        let normalized_output = normalize_shell_assertion_text(&output);
+        assert!(normalized_output.contains(&expected_dir));
+        let waiting_marker = format!(
+            "interactive {} session is still running",
+            shell_session_label()
+        );
+        assert!(!output.contains(&waiting_marker));
     }
 
     #[test]
