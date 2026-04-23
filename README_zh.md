@@ -14,6 +14,78 @@
 - **可配置工具暴露模式**：可选择渐进式只先暴露 `ToolSearch`，也可关闭渐进式后一次性暴露全部工具元信息
 - **配置管理**：基于 TOML 的配置，支持 provider、model、auth 管理
 
+## 项目架构
+
+项目由六个层次组成。数据从 CLI 进入核心层，再分发到 Provider、工具、存储和 I/O 各层。
+
+### 1. CLI 层（`clap`）
+
+以子命令形式实现的入口：
+
+| 命令 | 作用 |
+|------|------|
+| `chat ask` | 单次提问 |
+| `chat repl` | 交互式会话 |
+| `chat session` | 会话管理 |
+| `chat config` | 配置管理 |
+| `chat mcp` | MCP 操作 |
+| `chat doctor` | 环境诊断 |
+| `chat thinking` | 查看最近一次推理内容 |
+
+### 2. 核心层（`app`）
+
+- **命令处理器**：解析参数并分发到对应工作流。
+- **工具调用循环**：编排多轮工具执行；调用内置工具或 MCP 工具，并将结果回传给模型。
+- **审核子 agent**：在危险工具（如 `edit`、`bash`）执行前进行安全审核。
+
+### 3. Provider 层
+
+对接上游 LLM API 的统一接口：
+
+- **OpenAI 兼容接口** — 任意 OpenAI 兼容端点
+- **Anthropic** — 原生 Anthropic API
+- **Ollama** — 本地 Ollama 服务
+
+通信方式使用 HTTP / SSE。
+
+### 4. 工具层
+
+**内置工具**
+
+| 工具 | 功能 |
+|------|------|
+| `Read` / `Edit` / `Bash` | 文件系统与 Shell 操作 |
+| `Grep` | 基于 `rg` 的代码搜索 |
+| `Glob` | 文件模式匹配 |
+| `WebFetch` | HTTP 内容获取 |
+| `Status` | 工作区与环境状态 |
+| `TodoWrite` | 任务列表管理 |
+| `SkillRead` / `SkillsList` | 技能加载 |
+| `ToolSearch` | 渐进式工具发现 |
+
+**MCP 集成**
+
+- MCP Daemon 管理外部 MCP 服务
+- 启用时，MCP 工具会被注入到工具调用循环中
+
+### 5. 存储层
+
+| 文件 / 目录 | 用途 |
+|-------------|------|
+| `config.toml` | 用户配置 |
+| `secrets.toml` | API 密钥与敏感数据 |
+| `sessions/*.jsonl` | 持久化的对话历史 |
+| `state.toml` | 运行时状态 |
+| `prompts/*.md` | 自定义提示词模板 |
+
+### 6. I/O 与渲染层
+
+- **Markdown 渲染器** — 在终端中美化输出回复
+- **流式渲染器** — 实时流式输出 token
+- **输出格式** — `line`、`text`、`json`、`ndjson`
+- **媒体输入** — 图片文件与剪贴板图片
+- **上下文状态注入** — 将工作区上下文追加到提示词中
+
 ## 安装
 
 ```bash
@@ -554,4 +626,6 @@ python scripts/eval_audit_subagent.py --predictions assets/testdata/audit-subage
 
 MIT，见 [`LICENSE`](./LICENSE)。
 
-MIT
+## 友链
+
+- [linux.do](https://linux.do)

@@ -16,6 +16,78 @@ A configurable LLM chat CLI written in Rust, supporting multiple providers, sess
 - **Configurable tool exposure**: Use progressive loading to expose `ToolSearch` first, or disable it to expose the full tool metadata upfront
 - **Configuration management**: TOML-based config with provider, model, and auth management
 
+## Architecture
+
+The project is organized into six layers. Data flows from the CLI into the core, then out to providers, tools, storage, and I/O.
+
+### 1. CLI Layer (`clap`)
+
+Entry points implemented as subcommands:
+
+| Command | Purpose |
+|---------|---------|
+| `chat ask` | Single-shot prompt |
+| `chat repl` | Interactive session |
+| `chat session` | Session management |
+| `chat config` | Configuration management |
+| `chat mcp` | MCP operations |
+| `chat doctor` | Environment diagnostics |
+| `chat thinking` | Display last reasoning content |
+
+### 2. Core Layer (`app`)
+
+- **Command Handlers**: Parse arguments and dispatch to the correct workflow.
+- **Tool Calling Loop**: Orchestrates multi-round tool execution; calls built-in tools or MCP tools and feeds results back to the model.
+- **Audit Subagent**: Reviews dangerous tool operations (e.g., `edit`, `bash`) before execution.
+
+### 3. Provider Layer
+
+Unified interface to upstream LLM APIs:
+
+- **OpenAI Compatible** — any OpenAI-compatible endpoint
+- **Anthropic** — native Anthropic API
+- **Ollama** — local Ollama server
+
+Communication uses HTTP / SSE.
+
+### 4. Tool Layer
+
+**Built-in Tools**
+
+| Tool | Function |
+|------|----------|
+| `Read` / `Edit` / `Bash` | Filesystem and shell operations |
+| `Grep` | Code search via `rg` |
+| `Glob` | File pattern matching |
+| `WebFetch` | HTTP content retrieval |
+| `Status` | Workspace and environment status |
+| `TodoWrite` | Task list management |
+| `SkillRead` / `SkillsList` | Skill loading |
+| `ToolSearch` | Progressive tool discovery |
+
+**MCP Integration**
+
+- MCP Daemon manages external MCP servers
+- MCP Tools are injected into the tool loop when enabled
+
+### 5. Storage Layer
+
+| File / Directory | Purpose |
+|------------------|---------|
+| `config.toml` | User configuration |
+| `secrets.toml` | API keys and sensitive data |
+| `sessions/*.jsonl` | Persisted conversation history |
+| `state.toml` | Runtime state |
+| `prompts/*.md` | Custom prompt templates |
+
+### 6. I/O & Rendering Layer
+
+- **Markdown Renderer** — pretty-print responses in the terminal
+- **Stream Renderer** — real-time token streaming
+- **Output Formats** — `line`, `text`, `json`, `ndjson`
+- **Media Input** — image files and clipboard images
+- **Context Status Injection** — workspace context appended to prompts
+
 ## Installation
 
 ```bash
@@ -551,4 +623,6 @@ When tools are enabled, session files also retain:
 
 MIT. See [`LICENSE`](./LICENSE).
 
-MIT
+## Friends
+
+- [linux.do](https://linux.do)
