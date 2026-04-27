@@ -268,6 +268,8 @@ chat config get defaults.collapse_thinking
 chat config get defaults.context_status
 chat config get defaults.context_window
 chat config get defaults.reasoning_effort
+chat reasoning                    # interactively choose defaults.reasoning_effort
+chat reasoning max                # set defaults.reasoning_effort directly
 chat config set defaults.collapse_thinking true
 chat config set defaults.context_status system-once
 chat config set defaults.context_window 128000
@@ -491,7 +493,7 @@ system_prompt_mode = "append"                   # append | override
 collapse_thinking = false                       # collapse <think> blocks in rendered output
 context_status = "off"                          # off | always | latest | system-once
 # context_window = 128000                       # optional fallback context hint when model config omits it
-# reasoning_effort = "auto"                     # optional runtime reasoning effort; auto disables explicit hint
+# reasoning_effort = "high"                     # optional runtime reasoning effort; auto disables explicit hint
 
 [session]
 store_format = "jsonl"                          # on-disk session format
@@ -551,7 +553,7 @@ Thinking and runtime context controls:
 - `collapse_thinking = false`: keep `<think>...</think>` content visible in normal text rendering
 - `collapse_thinking = true`: hide `<think>...</think>` content in rendered output, while still saving the latest thinking content for `chat thinking`
 - `context_window`: runtime context hint. Effective priority is REPL `/context` or CLI `--context-window`, then `models.<id>.context_window`, then `defaults.context_window`
-- `reasoning_effort`: runtime reasoning hint. Effective priority is REPL `/reasoning` or CLI `--reasoning-effort`, then `defaults.reasoning_effort`, then `models.<id>.reasoning_effort`
+- `reasoning_effort`: runtime reasoning hint. Effective priority is REPL `/reasoning` or CLI `--reasoning-effort`, then `defaults.reasoning_effort`, then `models.<id>.reasoning_effort`. Use `chat reasoning` for the built-in interactive selector or `chat reasoning max` for direct updates
 - `reasoning_effort = "auto"`: do not send an explicit reasoning hint upstream
 
 ### Sanitized `secrets.toml` Example

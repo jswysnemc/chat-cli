@@ -137,7 +137,7 @@ impl Default for DefaultsConfig {
             provider: None,
             model: None,
             context_window: None,
-            reasoning_effort: None,
+            reasoning_effort: Some("high".to_string()),
             mode: Some("auto".to_string()),
             output: Some(OutputFormat::Line),
             auto_create_session: Some(true),

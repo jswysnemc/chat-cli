@@ -268,6 +268,8 @@ chat config get defaults.collapse_thinking
 chat config get defaults.context_status
 chat config get defaults.context_window
 chat config get defaults.reasoning_effort
+chat reasoning                 # 交互式选择 defaults.reasoning_effort
+chat reasoning max             # 直接设置 defaults.reasoning_effort
 chat config set defaults.collapse_thinking true
 chat config set defaults.context_status system-once
 chat config set defaults.context_window 128000
@@ -491,7 +493,7 @@ system_prompt_mode = "append"                   # append | override
 collapse_thinking = false                       # 是否折叠 <think> 输出
 context_status = "off"                          # off | always | latest | system-once
 # context_window = 128000                       # 可选，作为 model 未声明时的默认上下文提示值
-# reasoning_effort = "auto"                     # 可选，运行时推理强度；auto 表示不显式传递提示
+# reasoning_effort = "high"                     # 可选，运行时推理强度；auto 表示不显式传递提示
 
 [session]
 store_format = "jsonl"                          # 会话落盘格式
@@ -551,7 +553,7 @@ capabilities = ["chat", "reasoning"]           # 例如 chat reasoning vision im
 - `collapse_thinking = false`：普通文本渲染时保留 `<think>...</think>` 内容
 - `collapse_thinking = true`：普通渲染时隐藏 `<think>...</think>`，但最近一次思考内容仍会保存在本地，可通过 `chat thinking` 查看
 - `context_window`：运行时上下文提示值。生效优先级是 REPL 的 `/context` 或命令行 `--context-window`，然后 `models.<id>.context_window`，最后 `defaults.context_window`
-- `reasoning_effort`：运行时推理强度提示。生效优先级是 REPL 的 `/reasoning` 或命令行 `--reasoning-effort`，然后 `defaults.reasoning_effort`，最后 `models.<id>.reasoning_effort`
+- `reasoning_effort`：运行时推理强度提示。生效优先级是 REPL 的 `/reasoning` 或命令行 `--reasoning-effort`，然后 `defaults.reasoning_effort`，最后 `models.<id>.reasoning_effort`。使用 `chat reasoning` 打开内置交互选择器，也可以用 `chat reasoning max` 直接修改
 - `reasoning_effort = "auto"`：不向上游显式传递推理强度提示
 
 ### `secrets.toml` 脱敏示例

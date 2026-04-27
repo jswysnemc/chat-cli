@@ -57,6 +57,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Interactively configure the default reasoning effort
+    Reasoning(ReasoningArgs),
     /// Display the last response's thinking content
     Thinking,
     Doctor,
@@ -174,6 +176,11 @@ pub struct ReplArgs {
 
     #[arg(long, value_enum)]
     pub context_status: Option<ContextStatusMode>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReasoningArgs {
+    pub value: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -452,6 +459,23 @@ mod tests {
                 assert_eq!(args.prompt.as_deref(), Some("summarize this"));
             }
             other => panic!("expected ask command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_parses_optional_value() {
+        let cli =
+            Cli::try_parse_from(["chat", "reasoning"]).expect("cli should parse reasoning command");
+        match cli.command {
+            Commands::Reasoning(args) => assert_eq!(args.value, None),
+            other => panic!("expected reasoning command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["chat", "reasoning", "max"])
+            .expect("cli should parse reasoning value");
+        match cli.command {
+            Commands::Reasoning(args) => assert_eq!(args.value.as_deref(), Some("max")),
+            other => panic!("expected reasoning command, got {other:?}"),
         }
     }
 

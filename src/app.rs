@@ -1,7 +1,7 @@
 use crate::cli::{
     AskArgs, AuthCommand, AuthSetArgs, Cli, Commands, ConfigCommand, McpArgs, McpAuthArgs,
-    McpCommand, McpStartArgs, ModelCommand, ModelSetArgs, OutputFormat, ProviderCommand, ReplArgs,
-    SessionCommand,
+    McpCommand, McpStartArgs, ModelCommand, ModelSetArgs, OutputFormat, ProviderCommand,
+    ReasoningArgs, ReplArgs, SessionCommand,
 };
 use crate::config::{
     AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderSecret,
@@ -128,6 +128,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Commands::Config { command } => {
             handle_config(&paths, &mut config, &mut secrets, command).await
         }
+        Commands::Reasoning(args) => handle_reasoning_command(&paths, &mut config, args),
         Commands::Doctor => handle_doctor(&paths, &config, &secrets).await,
         Commands::Thinking => match crate::render::load_thinking() {
             Some(content) => {
@@ -303,6 +304,271 @@ async fn handle_config(
         ConfigCommand::Model { command } => handle_model_command(paths, config, command),
         ConfigCommand::Auth { command } => handle_auth_command(paths, config, secrets, command),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningConfigAction {
+    Set(&'static str),
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReasoningSelectorItem {
+    label: &'static str,
+    detail: &'static str,
+    action: ReasoningConfigAction,
+}
+
+const REASONING_SELECTOR_ITEMS: &[ReasoningSelectorItem] = &[
+    ReasoningSelectorItem {
+        label: "low",
+        detail: "use low reasoning effort",
+        action: ReasoningConfigAction::Set("low"),
+    },
+    ReasoningSelectorItem {
+        label: "medium",
+        detail: "use medium reasoning effort",
+        action: ReasoningConfigAction::Set("medium"),
+    },
+    ReasoningSelectorItem {
+        label: "high",
+        detail: "use high reasoning effort",
+        action: ReasoningConfigAction::Set("high"),
+    },
+    ReasoningSelectorItem {
+        label: "max",
+        detail: "use max reasoning effort",
+        action: ReasoningConfigAction::Set("max"),
+    },
+    ReasoningSelectorItem {
+        label: "auto",
+        detail: "do not send an explicit reasoning hint",
+        action: ReasoningConfigAction::Set("auto"),
+    },
+    ReasoningSelectorItem {
+        label: "reset",
+        detail: "clear defaults.reasoning_effort",
+        action: ReasoningConfigAction::Reset,
+    },
+];
+
+struct ReasoningSelectorTerminalGuard;
+
+impl ReasoningSelectorTerminalGuard {
+    fn enter(stdout: &mut io::Stdout) -> AppResult<Self> {
+        terminal::enable_raw_mode().map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to enable terminal raw mode: {err}"),
+            )
+        })?;
+        execute!(stdout, cursor::Hide).map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to initialize reasoning selector: {err}"),
+            )
+        })?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ReasoningSelectorTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, cursor::Show);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn handle_reasoning_command(
+    paths: &AppPaths,
+    config: &mut AppConfig,
+    args: ReasoningArgs,
+) -> AppResult<()> {
+    let action = if let Some(value) = args.value {
+        parse_reasoning_config_action(&value)?
+    } else {
+        select_reasoning_config_action(config)?
+    };
+    apply_reasoning_config_action(paths, config, action)
+}
+
+fn parse_reasoning_config_action(value: &str) -> AppResult<ReasoningConfigAction> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "reasoning effort must not be empty",
+        ));
+    }
+    if trimmed.eq_ignore_ascii_case("reset") {
+        return Ok(ReasoningConfigAction::Reset);
+    }
+    for item in REASONING_SELECTOR_ITEMS {
+        if item.label.eq_ignore_ascii_case(trimmed) {
+            return Ok(item.action);
+        }
+    }
+    Err(AppError::new(
+        EXIT_ARGS,
+        format!("unsupported reasoning effort `{trimmed}`"),
+    ))
+}
+
+fn apply_reasoning_config_action(
+    paths: &AppPaths,
+    config: &mut AppConfig,
+    action: ReasoningConfigAction,
+) -> AppResult<()> {
+    match action {
+        ReasoningConfigAction::Set(value) => {
+            config.defaults.reasoning_effort = Some(value.to_string());
+            save_config(paths, config)?;
+            println!("reasoning-effort set to {value}");
+        }
+        ReasoningConfigAction::Reset => {
+            config.defaults.reasoning_effort = None;
+            save_config(paths, config)?;
+            println!("reasoning-effort reset");
+        }
+    }
+    Ok(())
+}
+
+fn select_reasoning_config_action(config: &AppConfig) -> AppResult<ReasoningConfigAction> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "chat reasoning requires an interactive terminal; use `chat reasoning <low|medium|high|max|auto|reset>`",
+        ));
+    }
+
+    let mut stdout = io::stdout();
+    let _guard = ReasoningSelectorTerminalGuard::enter(&mut stdout)?;
+    let mut query = String::new();
+    let mut selected = 0usize;
+    loop {
+        let items = filtered_reasoning_selector_items(&query);
+        if selected >= items.len() {
+            selected = 0;
+        }
+        render_reasoning_selector(&mut stdout, config, &query, &items, selected)?;
+        let event = event::read().map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to read reasoning selector input: {err}"),
+            )
+        })?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                clear_reasoning_selector(&mut stdout)?;
+                return Err(AppError::new(EXIT_ARGS, "reasoning selection cancelled"));
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                clear_reasoning_selector(&mut stdout)?;
+                return Err(AppError::new(EXIT_ARGS, "reasoning selection cancelled"));
+            }
+            KeyCode::Enter => {
+                let Some(item) = items.get(selected) else {
+                    continue;
+                };
+                let action = item.action;
+                clear_reasoning_selector(&mut stdout)?;
+                return Ok(action);
+            }
+            KeyCode::Up => {
+                if !items.is_empty() {
+                    selected = if selected == 0 {
+                        items.len() - 1
+                    } else {
+                        selected - 1
+                    };
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if !items.is_empty() {
+                    selected = (selected + 1) % items.len();
+                }
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                query.push(ch);
+                selected = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn filtered_reasoning_selector_items(query: &str) -> Vec<ReasoningSelectorItem> {
+    REASONING_SELECTOR_ITEMS
+        .iter()
+        .copied()
+        .filter(|item| {
+            matches_popup_query(item.label, query) || matches_popup_query(item.detail, query)
+        })
+        .collect()
+}
+
+fn render_reasoning_selector(
+    stdout: &mut io::Stdout,
+    config: &AppConfig,
+    query: &str,
+    items: &[ReasoningSelectorItem],
+    selected: usize,
+) -> AppResult<()> {
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All), cursor::Hide).map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to render reasoning selector: {err}"),
+        )
+    })?;
+    let current = config
+        .defaults
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("unset");
+    let mut output = String::new();
+    output.push_str(&format!("{BOLD}chat reasoning{RESET}\r\n"));
+    output.push_str(&format!(
+        "{DIM}Type to filter. Up/Down select. Enter apply. Esc cancel.{RESET}\r\n"
+    ));
+    output.push_str(&format!("current defaults.reasoning_effort: {current}\r\n"));
+    output.push_str(&format!("query: {query}\r\n\r\n"));
+    if items.is_empty() {
+        output.push_str(&format!("{DIM}no matches{RESET}\r\n"));
+    } else {
+        for (index, item) in items.iter().enumerate() {
+            let marker = if index == selected { ">" } else { " " };
+            output.push_str(&format!("{marker} {:<8} {}\r\n", item.label, item.detail));
+        }
+    }
+    stdout
+        .write_all(output.as_bytes())
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to write selector: {err}")))?;
+    stdout
+        .flush()
+        .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}")))
+}
+
+fn clear_reasoning_selector(stdout: &mut io::Stdout) -> AppResult<()> {
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All), cursor::Show).map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to clear reasoning selector: {err}"),
+        )
+    })
 }
 
 async fn handle_provider_command(
@@ -2844,7 +3110,9 @@ impl ReplSlashCommand {
         match self {
             ReplSlashCommand::Model => "/model [list [provider]|reset|<id>|<provider>/<model>]",
             ReplSlashCommand::Context => "/context [status|reset|<tokens>]",
-            ReplSlashCommand::Reasoning => "/reasoning [status|reset|auto|low|medium|high|<value>]",
+            ReplSlashCommand::Reasoning => {
+                "/reasoning [status|reset|auto|low|medium|high|max|<value>]"
+            }
             ReplSlashCommand::Session => "/sessions [list|current|switch <id>]",
             ReplSlashCommand::Audit => "/audit [on|off|status]",
             ReplSlashCommand::ToolSearch => "/tool-search [on|off|status]",
@@ -4274,6 +4542,7 @@ fn build_repl_reasoning_popup_items(
         ("low", "use low reasoning effort".to_string()),
         ("medium", "use medium reasoning effort".to_string()),
         ("high", "use high reasoning effort".to_string()),
+        ("max", "use max reasoning effort".to_string()),
     ]
     .into_iter()
     .filter(|(label, _)| matches_popup_query(label, query))
@@ -5163,7 +5432,7 @@ fn handle_repl_directive(
     use_tui: bool,
     cli: &Cli,
     paths: &AppPaths,
-    config: &AppConfig,
+    config: &mut AppConfig,
     session_id: &mut String,
     first_turn: &mut bool,
     temp: bool,
@@ -5194,7 +5463,7 @@ fn handle_repl_directive(
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::Reasoning => {
-                handle_repl_reasoning_command(cli, config, state, rest)?;
+                handle_repl_reasoning_command(cli, paths, config, state, rest)?;
                 return Ok(ReplDirective::Continue);
             }
             ReplSlashCommand::Session => {
@@ -5526,7 +5795,8 @@ fn handle_repl_context_command(
 
 fn handle_repl_reasoning_command(
     cli: &Cli,
-    config: &AppConfig,
+    paths: &AppPaths,
+    config: &mut AppConfig,
     state: &mut ReplState,
     rest: &str,
 ) -> AppResult<()> {
@@ -5548,6 +5818,8 @@ fn handle_repl_reasoning_command(
         }
         "reset" => {
             state.reasoning_effort_override = None;
+            config.defaults.reasoning_effort = None;
+            save_config(paths, config)?;
             println!(
                 "reasoning-effort reset to {}",
                 resolved_reasoning_effort(
@@ -5563,10 +5835,11 @@ fn handle_repl_reasoning_command(
             Ok(())
         }
         value => {
-            let normalized = normalize_runtime_reasoning_effort(Some(value))
-                .unwrap_or_else(|| "auto".to_string());
+            let normalized = normalize_reasoning_effort_for_config(value);
+            config.defaults.reasoning_effort = Some(normalized.clone());
+            save_config(paths, config)?;
             state.reasoning_effort_override = Some(normalized.clone());
-            println!("reasoning-effort set to {normalized}");
+            println!("reasoning-effort set to {normalized} and saved");
             Ok(())
         }
     }
@@ -6270,6 +6543,15 @@ fn normalize_runtime_reasoning_effort(value: Option<&str>) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+fn normalize_reasoning_effort_for_config(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        "auto".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn resolved_context_window(
@@ -7212,7 +7494,7 @@ mod tests {
 
     #[test]
     fn repl_model_command_updates_runtime_target() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let (cli, paths, mut config, mut session_id, mut first_turn) = repl_test_context();
         let mut state = ReplState::default();
         let mut stdout = io::stdout();
         let directive = handle_repl_directive(
@@ -7225,7 +7507,7 @@ mod tests {
             false,
             &cli,
             &paths,
-            &config,
+            &mut config,
             &mut session_id,
             &mut first_turn,
             false,
@@ -7241,7 +7523,7 @@ mod tests {
 
     #[test]
     fn repl_context_command_updates_runtime_override() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let (cli, paths, mut config, mut session_id, mut first_turn) = repl_test_context();
         let mut state = ReplState::default();
         let mut stdout = io::stdout();
         let directive = handle_repl_directive(
@@ -7254,7 +7536,7 @@ mod tests {
             false,
             &cli,
             &paths,
-            &config,
+            &mut config,
             &mut session_id,
             &mut first_turn,
             false,
@@ -7265,13 +7547,13 @@ mod tests {
     }
 
     #[test]
-    fn repl_reasoning_command_updates_runtime_override() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+    fn repl_reasoning_command_updates_runtime_override_and_saves_default() {
+        let (cli, paths, mut config, mut session_id, mut first_turn) = repl_test_context();
         let mut state = ReplState::default();
         let mut stdout = io::stdout();
         let directive = handle_repl_directive(
             ReplInput {
-                prompt: "/reasoning auto".to_string(),
+                prompt: "/reasoning max".to_string(),
                 images: Vec::new(),
             },
             &mut state,
@@ -7279,19 +7561,35 @@ mod tests {
             false,
             &cli,
             &paths,
-            &config,
+            &mut config,
             &mut session_id,
             &mut first_turn,
             false,
         )
         .unwrap();
         assert!(matches!(directive, ReplDirective::Continue));
-        assert_eq!(state.reasoning_effort_override.as_deref(), Some("auto"));
+        assert_eq!(state.reasoning_effort_override.as_deref(), Some("max"));
+        assert_eq!(config.defaults.reasoning_effort.as_deref(), Some("max"));
+        let saved = load_config(&paths).unwrap();
+        assert_eq!(saved.defaults.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn reasoning_config_action_parses_supported_values() {
+        assert_eq!(
+            parse_reasoning_config_action("max").unwrap(),
+            ReasoningConfigAction::Set("max")
+        );
+        assert_eq!(
+            parse_reasoning_config_action("reset").unwrap(),
+            ReasoningConfigAction::Reset
+        );
+        assert!(parse_reasoning_config_action("extreme").is_err());
     }
 
     #[test]
     fn repl_unknown_slash_command_is_sent_to_model() {
-        let (cli, paths, config, mut session_id, mut first_turn) = repl_test_context();
+        let (cli, paths, mut config, mut session_id, mut first_turn) = repl_test_context();
         let mut state = ReplState {
             stream: true,
             ..ReplState::default()
@@ -7307,7 +7605,7 @@ mod tests {
             false,
             &cli,
             &paths,
-            &config,
+            &mut config,
             &mut session_id,
             &mut first_turn,
             false,
