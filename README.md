@@ -122,7 +122,8 @@ chat repl
 chat ask "Explain this error"
 
 # Use with pipe input
-git diff | chat ask --stdin "Review this diff"
+git diff | chat ask "Review this diff"
+tool --help | chat ask
 
 # List sessions
 chat session list
@@ -207,7 +208,8 @@ Send a single prompt to the LLM.
 
 ```bash
 chat ask "Your question here"
-chat ask --stdin "Explain this"  # reads from stdin
+chat ask --stdin "Explain this"  # explicitly reads from stdin
+tool --help | chat ask           # piped stdin is read automatically
 chat ask --session <id>          # continue existing session
 chat ask --new-session           # create new session
 chat ask --output json           # JSON output mode

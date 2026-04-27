@@ -426,13 +426,13 @@ fn define_tool_search_tool() -> Value {
         "type": "function",
         "function": {
             "name": "ToolSearch",
-            "description": "Search deferred tools and load their schemas for later turns.",
+            "description": "Search deferred tools and load their schemas for later turns. Supports tool names, capability phrases, multiple terms, fuzzy case-insensitive matching, and query 'all' to load every deferred tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Tool name or capability phrase to search for."
+                        "description": "Tool name, capability phrase, multiple terms, fuzzy query, or 'all' to load every deferred tool."
                     },
                     "max_results": {
                         "type": "integer",
@@ -451,13 +451,13 @@ fn define_tool_search_tool_with_config(config: &AppConfig) -> Value {
         "type": "function",
         "function": {
             "name": "ToolSearch",
-            "description": format!("Search deferred tools and load their schemas for later turns. Available tool names: {available}. Use this first before calling any deferred tool."),
+            "description": format!("Search deferred tools and load their schemas for later turns. Supports tool names, capability phrases, multiple terms, fuzzy case-insensitive matching, and query 'all' to load every deferred tool. Available tool names: {available}. Use this first before calling any deferred tool."),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Tool name or capability phrase to search for."
+                        "description": "Tool name, capability phrase, multiple terms, fuzzy query, or 'all' to load every deferred tool."
                     },
                     "max_results": {
                         "type": "integer",
@@ -940,35 +940,165 @@ pub fn tool_definitions_for_names(config: &AppConfig, names: &[String]) -> Vec<V
     tools
 }
 
-pub fn tool_search_matches(config: &AppConfig, query: &str, max_results: usize) -> Vec<Value> {
+fn is_tool_search_all_query(query: &str) -> bool {
+    matches!(query.trim().to_ascii_lowercase().as_str(), "all" | "*")
+}
+
+fn tool_search_limit(query: &str, max_results: usize) -> usize {
+    if is_tool_search_all_query(query) {
+        usize::MAX
+    } else {
+        max_results.max(1)
+    }
+}
+
+fn tool_search_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+        .filter_map(|term| {
+            let term = term
+                .trim_matches(|ch: char| {
+                    !ch.is_alphanumeric() && ch != '_' && ch != '-' && ch != ':'
+                })
+                .to_ascii_lowercase();
+            (!term.is_empty()).then_some(term)
+        })
+        .collect()
+}
+
+fn fuzzy_subsequence_match(haystack: &str, needle: &str) -> bool {
+    if needle.chars().count() < 3 {
+        return false;
+    }
+    let mut haystack = haystack.chars();
+    needle
+        .chars()
+        .all(|needle_ch| haystack.any(|haystack_ch| haystack_ch == needle_ch))
+}
+
+fn tool_search_field_score(
+    field: &str,
+    term: &str,
+    exact_score: usize,
+    contains_score: usize,
+    fuzzy_score: usize,
+) -> usize {
+    let field = field.to_ascii_lowercase();
+    let mut score = 0usize;
+    if field == term {
+        score += exact_score;
+    }
+    if field.contains(term) {
+        score += contains_score;
+    }
+    if score == 0 && fuzzy_subsequence_match(&field, term) {
+        score += fuzzy_score;
+    }
+    score
+}
+
+fn best_tool_search_field_score<'a>(
+    term: &str,
+    fields: impl IntoIterator<Item = (&'a str, usize, usize, usize)>,
+) -> usize {
+    fields
+        .into_iter()
+        .map(|(field, exact_score, contains_score, fuzzy_score)| {
+            tool_search_field_score(field, term, exact_score, contains_score, fuzzy_score)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn tool_handler_search_score(handler: &ToolHandler, query: &str) -> usize {
     let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    if is_tool_search_all_query(&query) {
+        return 1;
+    }
+
+    let mut score = best_tool_search_field_score(
+        &query,
+        [
+            (handler.spec.name, 100, 50, 20),
+            (handler.spec.description, 0, 10, 3),
+            (handler.spec.search_hint, 0, 10, 3),
+        ]
+        .into_iter()
+        .chain(
+            handler
+                .spec
+                .aliases
+                .iter()
+                .copied()
+                .map(|alias| (alias, 75, 25, 15)),
+        ),
+    );
+
+    for term in tool_search_terms(&query) {
+        score += best_tool_search_field_score(
+            &term,
+            [
+                (handler.spec.name, 100, 50, 20),
+                (handler.spec.description, 0, 10, 3),
+                (handler.spec.search_hint, 0, 10, 3),
+            ]
+            .into_iter()
+            .chain(
+                handler
+                    .spec
+                    .aliases
+                    .iter()
+                    .copied()
+                    .map(|alias| (alias, 75, 25, 15)),
+            ),
+        );
+    }
+
+    score
+}
+
+fn mcp_tool_search_score(tool: &crate::mcp::McpToolSpec, query: &str) -> usize {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    if is_tool_search_all_query(&query) {
+        return 1;
+    }
+
+    let mut score = best_tool_search_field_score(
+        &query,
+        [
+            (tool.full_name.as_str(), 100, 50, 20),
+            (tool.remote_name.as_str(), 100, 50, 20),
+            (tool.description.as_str(), 0, 10, 3),
+        ],
+    );
+
+    for term in tool_search_terms(&query) {
+        score += best_tool_search_field_score(
+            &term,
+            [
+                (tool.full_name.as_str(), 100, 50, 20),
+                (tool.remote_name.as_str(), 100, 50, 20),
+                (tool.description.as_str(), 0, 10, 3),
+            ],
+        );
+    }
+
+    score
+}
+
+pub fn tool_search_matches(config: &AppConfig, query: &str, max_results: usize) -> Vec<Value> {
+    let limit = tool_search_limit(query, max_results);
     let mut matches = builtin_tool_handlers()
         .iter()
         .filter(|handler| handler.spec.defer_loading)
         .map(|handler| {
-            let mut score = 0usize;
-            if handler.spec.name.to_ascii_lowercase() == query {
-                score += 100;
-            }
-            if handler.spec.name.to_ascii_lowercase().contains(&query) {
-                score += 50;
-            }
-            if handler
-                .spec
-                .aliases
-                .iter()
-                .any(|alias| alias.to_ascii_lowercase().contains(&query))
-            {
-                score += 25;
-            }
-            if handler
-                .spec
-                .search_hint
-                .to_ascii_lowercase()
-                .contains(&query)
-            {
-                score += 10;
-            }
+            let score = tool_handler_search_score(handler, query);
             (
                 score,
                 json!({
@@ -990,20 +1120,8 @@ pub fn tool_search_matches(config: &AppConfig, query: &str, max_results: usize) 
         })
         .filter(|(score, _)| *score > 0)
         .collect::<Vec<_>>();
-    matches.extend(search_mcp_tools(config, query.as_str(), max_results).into_iter().map(|tool| {
-        let mut score = 0usize;
-        let full_name = tool.full_name.to_ascii_lowercase();
-        let remote_name = tool.remote_name.to_ascii_lowercase();
-        let description = tool.description.to_ascii_lowercase();
-        if full_name == query || remote_name == query {
-            score += 100;
-        }
-        if full_name.contains(&query) || remote_name.contains(&query) {
-            score += 50;
-        }
-        if description.contains(&query) {
-            score += 10;
-        }
+    matches.extend(search_mcp_tools(config, query, limit).into_iter().map(|tool| {
+        let score = mcp_tool_search_score(&tool, query);
         (
             score,
             json!({
@@ -1025,7 +1143,7 @@ pub fn tool_search_matches(config: &AppConfig, query: &str, max_results: usize) 
     });
     matches
         .into_iter()
-        .take(max_results.max(1))
+        .take(limit)
         .map(|(_, item)| item)
         .collect()
 }
@@ -3541,6 +3659,61 @@ mod tests {
             .filter_map(|spec| spec["name"].as_str())
             .collect::<Vec<_>>();
         assert!(todo_names.contains(&"TodoWrite"));
+    }
+
+    #[test]
+    fn tool_search_matches_multi_term_phrases_and_multiple_tools() {
+        let config = AppConfig::default();
+        let shell_matches = tool_search_matches(&config, "bash execute command", 5);
+        let shell_names = shell_matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(shell_names.contains(&expected_shell_tool_name()));
+
+        let multi_matches = tool_search_matches(&config, "read grep", 5);
+        let multi_names = multi_matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(multi_names.contains(&"Read"));
+        assert!(multi_names.contains(&"Grep"));
+    }
+
+    #[test]
+    fn tool_search_matches_case_insensitive_and_fuzzy_queries() {
+        let config = AppConfig::default();
+        let case_matches = tool_search_matches(&config, "STATUS", 3);
+        let case_names = case_matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(case_names.contains(&"Status"));
+
+        let fuzzy_matches = tool_search_matches(&config, "bsh", 3);
+        let fuzzy_names = fuzzy_matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(fuzzy_names.contains(&expected_shell_tool_name()));
+    }
+
+    #[test]
+    fn tool_search_all_returns_all_deferred_builtin_tools() {
+        let config = AppConfig::default();
+        let deferred_count = builtin_tool_handlers()
+            .iter()
+            .filter(|handler| handler.spec.defer_loading)
+            .count();
+        let matches = tool_search_matches(&config, "all", 1);
+        let names = matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), deferred_count);
+        assert!(!names.contains(&"ToolSearch"));
+        assert!(names.contains(&expected_shell_tool_name()));
     }
 
     #[test]

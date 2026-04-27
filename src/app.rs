@@ -52,15 +52,19 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::queue;
 use crossterm::terminal::{self, Clear, ClearType};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::mem;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const BOLD: &str = "\x1b[1m";
@@ -71,6 +75,13 @@ const MAGENTA: &str = "\x1b[35m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 const YELLOW: &str = "\x1b[33m";
+const REPL_CTRL_C_EXIT_TIMEOUT: Duration = Duration::from_millis(1500);
+const REPL_CTRL_C_EXIT_HINT: &str = "Press Ctrl+C again within 1.5s to exit.";
+
+fn repl_keyboard_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
 
 pub async fn run(cli: Cli) -> AppResult<()> {
     let root = cli.clone();
@@ -868,6 +879,35 @@ fn render_repl_session_history(
     let events = read_events(paths, config, session_id)?;
     let turns = filter_session_turns_for_repl(&session_turns_from_events(&events));
     Ok(render_repl_session_turns_with_width(config, &turns, width))
+}
+
+fn repl_prompt_history_from_events(events: &[SessionEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Message(message)
+                if message.role == "user" && !message.content.trim().is_empty() =>
+            {
+                Some(message.content.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn load_repl_prompt_history(paths: &AppPaths, config: &AppConfig, session_id: &str) -> Vec<String> {
+    read_events(paths, config, session_id)
+        .map(|events| repl_prompt_history_from_events(&events))
+        .unwrap_or_default()
+}
+
+fn sync_repl_prompt_history(
+    paths: &AppPaths,
+    config: &AppConfig,
+    session_id: &str,
+    state: &mut ReplState,
+) {
+    state.prompt_history = load_repl_prompt_history(paths, config, session_id);
 }
 
 fn render_repl_transcript(
@@ -2727,6 +2767,7 @@ struct ReplState {
     model_override: Option<String>,
     context_window_override: Option<u64>,
     reasoning_effort_override: Option<String>,
+    prompt_history: Vec<String>,
     panels: Vec<ReplRuntimePanel>,
     transient_panel: Option<ReplRuntimePanel>,
 }
@@ -2754,6 +2795,9 @@ struct ReplEditorDraft {
     popup_selected: usize,
     popup_signature: Option<String>,
     slash_mode: Option<ReplSlashMode>,
+    history_index: Option<usize>,
+    history_pending: String,
+    last_ctrl_c_at: Option<Instant>,
 }
 
 enum ReplDirective {
@@ -2892,6 +2936,7 @@ async fn handle_repl(
         model_override: None,
         context_window_override: None,
         reasoning_effort_override: None,
+        prompt_history: Vec::new(),
         panels: Vec::new(),
         transient_panel: None,
     };
@@ -2907,6 +2952,7 @@ async fn handle_repl(
         if ensure_repl_session_id(paths, config, &mut session_id, session_temp)? {
             session_temp = is_temp_session(&session_id) || args.temp;
         }
+        sync_repl_prompt_history(paths, config, &session_id, &mut repl_state);
         if ui_mode == Some(ReplUiMode::Fullscreen) {
             sync_repl_todo_panel(paths, config, &session_id, &mut repl_state);
         }
@@ -2965,6 +3011,7 @@ async fn handle_repl(
                 let ask_args = AskArgs {
                     prompt: Some(input.prompt),
                     stdin: false,
+                    clipboard: false,
                     system: if first_turn {
                         args.system.clone()
                     } else {
@@ -3257,18 +3304,27 @@ const REPL_MAX_VISIBLE_POPUP_LINES: usize = 8;
 
 impl ReplTerminalGuard {
     fn enter(stdout: &mut io::Stdout, mode: ReplUiMode) -> AppResult<Self> {
-        terminal::enable_raw_mode()
-            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to enable raw mode: {err}")))?;
         let supports_keyboard_enhancement =
             matches!(terminal::supports_keyboard_enhancement(), Ok(true));
+        let mouse_capture_enabled = mode == ReplUiMode::Fullscreen;
+        let guard = Self {
+            supports_keyboard_enhancement,
+            mouse_capture_enabled,
+        };
+        guard.resume(stdout)?;
+        Ok(guard)
+    }
+
+    fn resume(&self, stdout: &mut io::Stdout) -> AppResult<()> {
+        terminal::enable_raw_mode()
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to enable raw mode: {err}")))?;
         execute!(stdout, EnableBracketedPaste).map_err(|err| {
             AppError::new(
                 EXIT_ARGS,
                 format!("failed to initialize REPL terminal mode: {err}"),
             )
         })?;
-        let mouse_capture_enabled = mode == ReplUiMode::Fullscreen;
-        if mouse_capture_enabled {
+        if self.mouse_capture_enabled {
             execute!(stdout, EnableMouseCapture).map_err(|err| {
                 AppError::new(
                     EXIT_ARGS,
@@ -3276,39 +3332,54 @@ impl ReplTerminalGuard {
                 )
             })?;
         }
-        if supports_keyboard_enhancement {
-            execute!(
-                stdout,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
-            )
-            .map_err(|err| {
+        if self.supports_keyboard_enhancement {
+            execute!(stdout, PushKeyboardEnhancementFlags(repl_keyboard_flags())).map_err(
+                |err| {
+                    AppError::new(
+                        EXIT_ARGS,
+                        format!("failed to enable keyboard enhancement flags: {err}"),
+                    )
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn suspend(&self, stdout: &mut io::Stdout) -> AppResult<()> {
+        if self.supports_keyboard_enhancement {
+            execute!(stdout, PopKeyboardEnhancementFlags).map_err(|err| {
                 AppError::new(
                     EXIT_ARGS,
-                    format!("failed to enable keyboard enhancement flags: {err}"),
+                    format!("failed to restore keyboard enhancement flags: {err}"),
                 )
             })?;
         }
-        Ok(Self {
-            supports_keyboard_enhancement,
-            mouse_capture_enabled,
-        })
+        if self.mouse_capture_enabled {
+            execute!(stdout, DisableMouseCapture).map_err(|err| {
+                AppError::new(
+                    EXIT_ARGS,
+                    format!("failed to disable REPL mouse capture: {err}"),
+                )
+            })?;
+        }
+        execute!(stdout, DisableBracketedPaste, cursor::Show).map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!("failed to restore REPL terminal mode: {err}"),
+            )
+        })?;
+        stdout
+            .flush()
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to flush stdout: {err}")))?;
+        terminal::disable_raw_mode()
+            .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to disable raw mode: {err}")))
     }
 }
 
 impl Drop for ReplTerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        if self.supports_keyboard_enhancement {
-            let _ = queue!(stdout, PopKeyboardEnhancementFlags);
-        }
-        if self.mouse_capture_enabled {
-            let _ = execute!(stdout, DisableMouseCapture);
-        }
-        let _ = execute!(stdout, DisableBracketedPaste, cursor::Show);
-        let _ = terminal::disable_raw_mode();
+        let _ = self.suspend(&mut stdout);
     }
 }
 
@@ -3321,7 +3392,7 @@ fn read_repl_tui_input(
     state: &mut ReplState,
     mode: ReplUiMode,
 ) -> AppResult<ReplInput> {
-    let _guard = ReplTerminalGuard::enter(stdout, mode)?;
+    let guard = ReplTerminalGuard::enter(stdout, mode)?;
     let (cols, screen_rows) = terminal::size()
         .map_err(|err| AppError::new(EXIT_ARGS, format!("failed to read terminal size: {err}")))?;
     let mut draft = ReplEditorDraft {
@@ -3366,15 +3437,19 @@ fn read_repl_tui_input(
             AppError::new(EXIT_ARGS, format!("failed to read terminal event: {err}"))
         })?;
         match event {
-            Event::Resize(_, _) => {}
+            Event::Resize(_, _) => {
+                clear_repl_ctrl_c_pending(&mut draft);
+            }
             Event::Paste(text) => {
                 clear_repl_transient_panel(state);
                 draft.esc_pending = false;
+                clear_repl_ctrl_c_pending(&mut draft);
                 handle_pasted_text(&mut draft, text);
             }
             Event::Mouse(mouse) => {
                 clear_repl_transient_panel(state);
                 draft.esc_pending = false;
+                clear_repl_ctrl_c_pending(&mut draft);
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         draft.transcript_scroll =
@@ -3390,6 +3465,11 @@ fn read_repl_tui_input(
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 clear_repl_transient_panel(state);
                 let modifiers = key.modifiers;
+                let ctrl_c_pressed = matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                    && modifiers.contains(KeyModifiers::CONTROL);
+                if !ctrl_c_pressed {
+                    clear_repl_ctrl_c_pending(&mut draft);
+                }
                 match key.code {
                     KeyCode::Char('/')
                         if modifiers.is_empty()
@@ -3401,13 +3481,33 @@ fn read_repl_tui_input(
                         draft.esc_pending = false;
                         enter_repl_slash_mode(&mut draft, ReplSlashMode::Commands);
                     }
+                    KeyCode::Up if modifiers.is_empty() && draft.history_index.is_some() => {
+                        draft.esc_pending = false;
+                        let _ =
+                            navigate_repl_prompt_history(&mut draft, &state.prompt_history, true);
+                    }
                     KeyCode::Up if modifiers.is_empty() && popup_model.is_some() => {
                         draft.esc_pending = false;
                         move_repl_popup_selection(&mut draft, popup_model.as_ref(), -1);
                     }
+                    KeyCode::Up if modifiers.is_empty() => {
+                        draft.esc_pending = false;
+                        let _ =
+                            navigate_repl_prompt_history(&mut draft, &state.prompt_history, true);
+                    }
+                    KeyCode::Down if modifiers.is_empty() && draft.history_index.is_some() => {
+                        draft.esc_pending = false;
+                        let _ =
+                            navigate_repl_prompt_history(&mut draft, &state.prompt_history, false);
+                    }
                     KeyCode::Down if modifiers.is_empty() && popup_model.is_some() => {
                         draft.esc_pending = false;
                         move_repl_popup_selection(&mut draft, popup_model.as_ref(), 1);
+                    }
+                    KeyCode::Down if modifiers.is_empty() => {
+                        draft.esc_pending = false;
+                        let _ =
+                            navigate_repl_prompt_history(&mut draft, &state.prompt_history, false);
                     }
                     KeyCode::Tab if modifiers.is_empty() && popup_model.is_some() => {
                         draft.esc_pending = false;
@@ -3464,7 +3564,7 @@ fn read_repl_tui_input(
                             && draft.collapsed_pastes.is_empty()
                         {
                             draft.status = Some(
-                                "Input is empty. Press Ctrl+V to attach a clipboard image."
+                                "Input is empty. Press Ctrl+G to edit text or Ctrl+V to attach a clipboard image."
                                     .to_string(),
                             );
                             continue;
@@ -3515,11 +3615,31 @@ fn read_repl_tui_input(
                     KeyCode::Char('c') | KeyCode::Char('C')
                         if modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        clear_repl_surface(stdout)?;
-                        return Ok(ReplInput {
-                            prompt: "/exit".to_string(),
-                            images: Vec::new(),
-                        });
+                        if handle_repl_ctrl_c_press(&mut draft, Instant::now()) {
+                            clear_repl_surface(stdout)?;
+                            return Ok(ReplInput {
+                                prompt: "/exit".to_string(),
+                                images: Vec::new(),
+                            });
+                        }
+                        continue;
+                    }
+                    KeyCode::Char('g') | KeyCode::Char('G')
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        draft.esc_pending = false;
+                        if draft.slash_mode.is_some() {
+                            draft.status =
+                                Some("Exit slash mode before opening the editor.".to_string());
+                            continue;
+                        }
+                        match edit_repl_buffer_with_external_editor(stdout, &guard, &mut draft) {
+                            Ok(()) => {
+                                draft.status =
+                                    Some("Buffer updated from external editor.".to_string());
+                            }
+                            Err(err) => draft.status = Some(err.message),
+                        }
                     }
                     KeyCode::Char('v') | KeyCode::Char('V')
                         if modifiers.contains(KeyModifiers::CONTROL)
@@ -3817,7 +3937,7 @@ fn repl_composer_view(draft: &ReplEditorDraft, cols: u16, max_lines: u16) -> Rep
         let placeholder = draft
             .slash_mode
             .map(ReplSlashMode::placeholder)
-            .unwrap_or("Type a message. Press /commands for help.");
+            .unwrap_or("Type a message. Press Ctrl+G for the editor or /commands for help.");
         lines.push(format!("{prompt_prefix}{DIM}{placeholder}{RESET}"));
         (fixed_lines, prefix_width)
     } else {
@@ -4267,6 +4387,196 @@ fn clear_repl_surface(stdout: &mut io::Stdout) -> AppResult<()> {
     Ok(())
 }
 
+fn edit_repl_buffer_with_external_editor(
+    stdout: &mut io::Stdout,
+    guard: &ReplTerminalGuard,
+    draft: &mut ReplEditorDraft,
+) -> AppResult<()> {
+    let edited = edit_text_with_external_editor(stdout, guard, &materialize_repl_prompt(draft))?;
+    replace_repl_buffer_from_editor(draft, edited);
+    Ok(())
+}
+
+fn edit_text_with_external_editor(
+    stdout: &mut io::Stdout,
+    guard: &ReplTerminalGuard,
+    initial_text: &str,
+) -> AppResult<String> {
+    let editor = resolve_external_editor_command();
+    let editor_parts = parse_external_editor_command(&editor)?;
+    let temp_file = ReplEditorTempFile::new(initial_text)?;
+
+    clear_repl_surface(stdout)?;
+    guard.suspend(stdout)?;
+
+    let command_result = run_external_editor_command(&editor_parts, temp_file.path());
+    let resume_result = guard.resume(stdout);
+    let clear_result = clear_repl_surface(stdout);
+
+    resume_result?;
+    clear_result?;
+    command_result?;
+
+    temp_file.read()
+}
+
+fn resolve_external_editor_command() -> String {
+    let editor = env::var("EDITOR").ok();
+    resolve_external_editor_command_from_env(editor.as_deref())
+}
+
+fn resolve_external_editor_command_from_env(editor: Option<&str>) -> String {
+    editor
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("vim")
+        .to_string()
+}
+
+fn parse_external_editor_command(command: &str) -> AppResult<Vec<String>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(Quote::Single) => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some(Quote::Double) => match ch {
+                '"' => quote = None,
+                '\\' => {
+                    if matches!(chars.peek(), Some('"') | Some('\\')) {
+                        current.push(chars.next().unwrap_or('\\'));
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                _ => current.push(ch),
+            },
+            None => match ch {
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '\\' => {
+                    if matches!(chars.peek(), Some(next) if next.is_whitespace() || matches!(next, '\'' | '"' | '\\'))
+                    {
+                        current.push(chars.next().unwrap_or('\\'));
+                    } else {
+                        current.push('\\');
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        parts.push(mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "failed to parse EDITOR value: unterminated quote",
+        ));
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    if parts.is_empty() {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            "failed to parse EDITOR value: empty command",
+        ));
+    }
+
+    Ok(parts)
+}
+
+fn run_external_editor_command(editor_parts: &[String], path: &Path) -> AppResult<()> {
+    let mut command = Command::new(&editor_parts[0]);
+    command.args(&editor_parts[1..]);
+    command.arg(path);
+    command.stdin(Stdio::inherit());
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+    let status = command.status().map_err(|err| {
+        AppError::new(
+            EXIT_ARGS,
+            format!("failed to launch editor `{}`: {err}", editor_parts[0]),
+        )
+    })?;
+    if !status.success() {
+        return Err(AppError::new(
+            EXIT_ARGS,
+            format!("editor `{}` exited with status {status}", editor_parts[0]),
+        ));
+    }
+    Ok(())
+}
+
+fn replace_repl_buffer_from_editor(draft: &mut ReplEditorDraft, text: String) {
+    reset_repl_history_navigation(draft);
+    set_repl_buffer_text(draft, text);
+    draft.esc_pending = false;
+}
+
+struct ReplEditorTempFile {
+    path: PathBuf,
+}
+
+impl ReplEditorTempFile {
+    fn new(initial_text: &str) -> AppResult<Self> {
+        let path = env::temp_dir().join(format!("chat-cli-repl-{}.md", ulid::Ulid::new()));
+        fs::write(&path, initial_text).map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!(
+                    "failed to prepare editor buffer `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read(&self) -> AppResult<String> {
+        fs::read_to_string(&self.path).map_err(|err| {
+            AppError::new(
+                EXIT_ARGS,
+                format!(
+                    "failed to read editor buffer `{}`: {err}",
+                    self.path.display()
+                ),
+            )
+        })
+    }
+}
+
+impl Drop for ReplEditorTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn draw_repl_composer(
     stdout: &mut io::Stdout,
     cols: u16,
@@ -4581,6 +4891,7 @@ fn transcript_scroll_page_down(
 
 fn handle_pasted_text(draft: &mut ReplEditorDraft, text: String) {
     if should_collapse_pasted_text(&text) {
+        reset_repl_history_navigation(draft);
         let line_count = text.lines().count().max(1);
         draft
             .collapsed_pastes
@@ -4608,22 +4919,110 @@ fn materialize_repl_prompt(draft: &ReplEditorDraft) -> String {
     prompt
 }
 
+fn clear_repl_ctrl_c_pending(draft: &mut ReplEditorDraft) {
+    draft.last_ctrl_c_at = None;
+    if draft.status.as_deref() == Some(REPL_CTRL_C_EXIT_HINT) {
+        draft.status = None;
+    }
+}
+
+fn handle_repl_ctrl_c_press(draft: &mut ReplEditorDraft, now: Instant) -> bool {
+    if draft
+        .last_ctrl_c_at
+        .and_then(|last| now.checked_duration_since(last))
+        .is_some_and(|elapsed| elapsed <= REPL_CTRL_C_EXIT_TIMEOUT)
+    {
+        clear_repl_ctrl_c_pending(draft);
+        return true;
+    }
+    draft.last_ctrl_c_at = Some(now);
+    draft.status = Some(REPL_CTRL_C_EXIT_HINT.to_string());
+    false
+}
+
+fn reset_repl_history_navigation(draft: &mut ReplEditorDraft) {
+    draft.history_index = None;
+    draft.history_pending.clear();
+}
+
+fn repl_history_navigation_can_start(draft: &ReplEditorDraft) -> bool {
+    draft.slash_mode.is_none()
+        && draft.images.is_empty()
+        && draft.collapsed_pastes.is_empty()
+        && draft.buffer.trim().is_empty()
+}
+
+fn set_repl_buffer_text(draft: &mut ReplEditorDraft, text: String) {
+    draft.buffer = text;
+    draft.cursor = draft.buffer.len();
+    draft.collapsed_pastes.clear();
+    draft.popup_selected = 0;
+    draft.popup_signature = None;
+}
+
+fn navigate_repl_prompt_history(
+    draft: &mut ReplEditorDraft,
+    history: &[String],
+    older: bool,
+) -> bool {
+    if history.is_empty() {
+        return false;
+    }
+    if draft.history_index.is_none() && !repl_history_navigation_can_start(draft) {
+        return false;
+    }
+
+    if older {
+        let next_index = match draft.history_index {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => {
+                draft.history_pending = materialize_repl_prompt(draft);
+                history.len() - 1
+            }
+        };
+        set_repl_buffer_text(draft, history[next_index].clone());
+        draft.history_index = Some(next_index);
+        draft.status = None;
+        return true;
+    }
+
+    let Some(index) = draft.history_index else {
+        return false;
+    };
+    if index + 1 < history.len() {
+        let next_index = index + 1;
+        set_repl_buffer_text(draft, history[next_index].clone());
+        draft.history_index = Some(next_index);
+    } else {
+        let pending = mem::take(&mut draft.history_pending);
+        set_repl_buffer_text(draft, pending);
+        draft.history_index = None;
+    }
+    draft.status = None;
+    true
+}
+
 fn clear_repl_text_input(draft: &mut ReplEditorDraft) {
     draft.buffer.clear();
     draft.cursor = 0;
     draft.collapsed_pastes.clear();
     draft.esc_pending = false;
+    clear_repl_ctrl_c_pending(draft);
     draft.popup_selected = 0;
     draft.popup_signature = None;
     draft.slash_mode = None;
+    reset_repl_history_navigation(draft);
 }
 
 fn enter_repl_slash_mode(draft: &mut ReplEditorDraft, mode: ReplSlashMode) {
     draft.slash_mode = Some(mode);
     draft.buffer.clear();
     draft.cursor = 0;
+    clear_repl_ctrl_c_pending(draft);
     draft.popup_selected = 0;
     draft.popup_signature = None;
+    reset_repl_history_navigation(draft);
 }
 
 fn manual_repl_slash_prompt(draft: &ReplEditorDraft) -> Option<String> {
@@ -4653,11 +5052,13 @@ fn manual_repl_slash_prompt(draft: &ReplEditorDraft) -> Option<String> {
 }
 
 fn insert_text_at_cursor(draft: &mut ReplEditorDraft, text: &str) {
+    reset_repl_history_navigation(draft);
     draft.buffer.insert_str(draft.cursor, text);
     draft.cursor += text.len();
 }
 
 fn insert_char_at_cursor(draft: &mut ReplEditorDraft, ch: char) {
+    reset_repl_history_navigation(draft);
     draft.buffer.insert(draft.cursor, ch);
     draft.cursor += ch.len_utf8();
 }
@@ -4666,6 +5067,7 @@ fn delete_prev_char_at_cursor(draft: &mut ReplEditorDraft) -> bool {
     if draft.cursor == 0 {
         return false;
     }
+    reset_repl_history_navigation(draft);
     let prev = previous_char_boundary(&draft.buffer, draft.cursor);
     draft.buffer.replace_range(prev..draft.cursor, "");
     draft.cursor = prev;
@@ -4676,6 +5078,7 @@ fn delete_char_at_cursor(draft: &mut ReplEditorDraft) -> bool {
     if draft.cursor >= draft.buffer.len() {
         return false;
     }
+    reset_repl_history_navigation(draft);
     let next = next_char_boundary(&draft.buffer, draft.cursor);
     draft.buffer.replace_range(draft.cursor..next, "");
     true
@@ -6275,14 +6678,48 @@ fn write_stream_json(stdout: &mut io::Stdout, value: &Value) -> AppResult<()> {
 }
 
 fn build_input(args: &AskArgs) -> AppResult<BuiltInput> {
+    build_input_with_readers(
+        args,
+        read_clipboard_text,
+        read_stdin_all,
+        !io::stdin().is_terminal(),
+    )
+}
+
+fn build_input_with_clipboard_reader<F>(
+    args: &AskArgs,
+    clipboard_reader: F,
+) -> AppResult<BuiltInput>
+where
+    F: FnMut() -> AppResult<String>,
+{
+    build_input_with_readers(args, clipboard_reader, read_stdin_all, false)
+}
+
+fn build_input_with_readers<F, G>(
+    args: &AskArgs,
+    mut clipboard_reader: F,
+    mut stdin_reader: G,
+    stdin_is_piped: bool,
+) -> AppResult<BuiltInput>
+where
+    F: FnMut() -> AppResult<String>,
+    G: FnMut() -> AppResult<String>,
+{
     let mut parts = Vec::new();
     if let Some(prompt) = &args.prompt {
         parts.push(prompt.clone());
     }
-    if args.stdin {
-        let stdin = read_stdin_all()?;
+    if args.stdin || stdin_is_piped {
+        let stdin = stdin_reader()?;
         if !stdin.trim().is_empty() {
             parts.push(stdin);
+        }
+    }
+    if args.clipboard {
+        let clipboard = clipboard_reader()?;
+        if !clipboard.trim().is_empty() {
+            parts.push(format!("Clipboard:\n{clipboard}"));
         }
     }
     for attachment in &args.attachments {
@@ -6303,7 +6740,7 @@ fn build_input(args: &AskArgs) -> AppResult<BuiltInput> {
     if parts.is_empty() && images.is_empty() {
         return Err(AppError::new(
             EXIT_ARGS,
-            "chat ask requires PROMPT, --stdin, --attach, --image, or --clipboard-image",
+            "chat ask requires PROMPT, --stdin, --clipboard, --attach, --image, or --clipboard-image",
         ));
     }
     Ok(BuiltInput {
@@ -6530,6 +6967,7 @@ mod tests {
         AskArgs {
             prompt: Some(prompt.to_string()),
             stdin: false,
+            clipboard: false,
             system: None,
             attachments: Vec::new(),
             images: Vec::new(),
@@ -7091,6 +7529,7 @@ mod tests {
             model_override: Some("deepseek-reasoner-search".to_string()),
             context_window_override: Some(96000),
             reasoning_effort_override: Some("high".to_string()),
+            prompt_history: Vec::new(),
             panels: Vec::new(),
             transient_panel: None,
         };
@@ -7485,6 +7924,244 @@ mod tests {
     }
 
     #[test]
+    fn build_input_appends_clipboard_text_when_requested() {
+        let mut args = ask_args("summarize this");
+        args.clipboard = true;
+
+        let built =
+            build_input_with_clipboard_reader(&args, || Ok("clipboard notes".to_string())).unwrap();
+
+        assert_eq!(
+            built.prompt,
+            "summarize this\n\nClipboard:\nclipboard notes"
+        );
+    }
+
+    #[test]
+    fn build_input_accepts_clipboard_as_only_text_input() {
+        let mut args = ask_args("unused");
+        args.prompt = None;
+        args.clipboard = true;
+
+        let built =
+            build_input_with_clipboard_reader(&args, || Ok("clipboard only".to_string())).unwrap();
+
+        assert_eq!(built.prompt, "Clipboard:\nclipboard only");
+    }
+
+    #[test]
+    fn build_input_reads_piped_stdin_without_flag() {
+        let mut args = ask_args("unused");
+        args.prompt = None;
+
+        let built = build_input_with_readers(
+            &args,
+            || Ok(String::new()),
+            || Ok("tool help output".to_string()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(built.prompt, "tool help output");
+    }
+
+    #[test]
+    fn build_input_appends_piped_stdin_to_prompt_without_flag() {
+        let args = ask_args("explain this");
+
+        let built = build_input_with_readers(
+            &args,
+            || Ok(String::new()),
+            || Ok("usage: demo --help".to_string()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(built.prompt, "explain this\n\nusage: demo --help");
+    }
+
+    #[test]
+    fn repl_prompt_history_collects_non_empty_user_messages() {
+        let events = vec![
+            SessionEvent::Message(SessionMessage {
+                role: "system".to_string(),
+                content: "system".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "first".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "assistant".to_string(),
+                content: "answer".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "   ".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+            SessionEvent::Message(SessionMessage {
+                role: "user".to_string(),
+                content: "second".to_string(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                created_at: now_rfc3339(),
+            }),
+        ];
+
+        assert_eq!(
+            repl_prompt_history_from_events(&events),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn navigate_repl_prompt_history_cycles_and_restores_pending_input() {
+        let history = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        let mut draft = ReplEditorDraft::default();
+
+        assert!(navigate_repl_prompt_history(&mut draft, &history, true));
+        assert_eq!(draft.buffer, "third");
+        assert_eq!(draft.history_index, Some(2));
+
+        assert!(navigate_repl_prompt_history(&mut draft, &history, true));
+        assert_eq!(draft.buffer, "second");
+        assert_eq!(draft.history_index, Some(1));
+
+        assert!(navigate_repl_prompt_history(&mut draft, &history, false));
+        assert_eq!(draft.buffer, "third");
+        assert_eq!(draft.history_index, Some(2));
+
+        assert!(navigate_repl_prompt_history(&mut draft, &history, false));
+        assert_eq!(draft.buffer, "");
+        assert_eq!(draft.history_index, None);
+    }
+
+    #[test]
+    fn navigate_repl_prompt_history_requires_empty_input_to_start() {
+        let history = vec!["first".to_string()];
+        let mut draft = ReplEditorDraft {
+            buffer: "current draft".to_string(),
+            cursor: "current draft".len(),
+            ..ReplEditorDraft::default()
+        };
+
+        assert!(!navigate_repl_prompt_history(&mut draft, &history, true));
+        assert_eq!(draft.buffer, "current draft");
+        assert_eq!(draft.history_index, None);
+    }
+
+    #[test]
+    fn handle_repl_ctrl_c_press_requires_second_press_within_timeout() {
+        let start = Instant::now();
+        let mut draft = ReplEditorDraft::default();
+
+        assert!(!handle_repl_ctrl_c_press(&mut draft, start));
+        assert_eq!(draft.status.as_deref(), Some(REPL_CTRL_C_EXIT_HINT));
+        assert!(draft.last_ctrl_c_at.is_some());
+
+        assert!(handle_repl_ctrl_c_press(
+            &mut draft,
+            start + std::time::Duration::from_millis(500),
+        ));
+        assert!(draft.last_ctrl_c_at.is_none());
+        assert_ne!(draft.status.as_deref(), Some(REPL_CTRL_C_EXIT_HINT));
+    }
+
+    #[test]
+    fn handle_repl_ctrl_c_press_expires_after_timeout() {
+        let start = Instant::now();
+        let mut draft = ReplEditorDraft::default();
+
+        assert!(!handle_repl_ctrl_c_press(&mut draft, start));
+        assert!(!handle_repl_ctrl_c_press(
+            &mut draft,
+            start + REPL_CTRL_C_EXIT_TIMEOUT + std::time::Duration::from_millis(1),
+        ));
+        assert_eq!(draft.status.as_deref(), Some(REPL_CTRL_C_EXIT_HINT));
+        assert!(draft.last_ctrl_c_at.is_some());
+    }
+
+    #[test]
+    fn resolve_external_editor_command_prefers_editor_env() {
+        assert_eq!(
+            resolve_external_editor_command_from_env(Some("nvim -f")),
+            "nvim -f"
+        );
+        assert_eq!(resolve_external_editor_command_from_env(Some("   ")), "vim");
+        assert_eq!(resolve_external_editor_command_from_env(None), "vim");
+    }
+
+    #[test]
+    fn parse_external_editor_command_supports_quoted_paths() {
+        let parsed =
+            parse_external_editor_command("\"C:\\Program Files\\Neovim\\bin\\nvim.exe\" --clean")
+                .unwrap();
+
+        assert_eq!(
+            parsed,
+            vec![
+                "C:\\Program Files\\Neovim\\bin\\nvim.exe".to_string(),
+                "--clean".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_repl_buffer_from_editor_flattens_collapsed_pastes() {
+        let mut draft = ReplEditorDraft {
+            buffer: "hello".to_string(),
+            collapsed_pastes: vec![CollapsedPaste {
+                text: "world".to_string(),
+                line_count: 1,
+            }],
+            cursor: 5,
+            esc_pending: true,
+            popup_selected: 3,
+            popup_signature: Some("signature".to_string()),
+            history_index: Some(1),
+            history_pending: "draft".to_string(),
+            ..ReplEditorDraft::default()
+        };
+
+        replace_repl_buffer_from_editor(&mut draft, "edited buffer".to_string());
+
+        assert_eq!(draft.buffer, "edited buffer");
+        assert_eq!(draft.cursor, "edited buffer".len());
+        assert!(draft.collapsed_pastes.is_empty());
+        assert!(!draft.esc_pending);
+        assert_eq!(draft.popup_selected, 0);
+        assert!(draft.popup_signature.is_none());
+        assert!(draft.history_index.is_none());
+        assert!(draft.history_pending.is_empty());
+    }
+
+    #[test]
     fn clear_repl_text_input_keeps_images_but_drops_text_payloads() {
         let mut draft = ReplEditorDraft {
             buffer: "hello".to_string(),
@@ -7500,6 +8177,8 @@ mod tests {
             cursor: 5,
             transcript_scroll: 0,
             esc_pending: true,
+            history_index: Some(0),
+            history_pending: "draft".to_string(),
             ..ReplEditorDraft::default()
         };
         clear_repl_text_input(&mut draft);
@@ -7508,6 +8187,8 @@ mod tests {
         assert_eq!(draft.collapsed_pastes.len(), 0);
         assert_eq!(draft.images.len(), 1);
         assert!(!draft.esc_pending);
+        assert!(draft.history_index.is_none());
+        assert!(draft.history_pending.is_empty());
     }
 
     #[test]

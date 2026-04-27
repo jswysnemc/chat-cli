@@ -82,6 +82,9 @@ pub struct AskArgs {
     #[arg(long)]
     pub stdin: bool,
 
+    #[arg(short = 'c', long = "clipboard")]
+    pub clipboard: bool,
+
     #[arg(short = 's', long)]
     pub system: Option<String>,
 
@@ -433,6 +436,20 @@ mod tests {
                 );
                 assert!(args.clipboard_image);
                 assert_eq!(args.prompt.as_deref(), Some("describe"));
+            }
+            other => panic!("expected ask command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_parses_clipboard_flags() {
+        let cli = Cli::try_parse_from(["chat", "ask", "-c", "summarize this"])
+            .expect("cli should parse clipboard flags");
+
+        match cli.command {
+            Commands::Ask(args) => {
+                assert!(args.clipboard);
+                assert_eq!(args.prompt.as_deref(), Some("summarize this"));
             }
             other => panic!("expected ask command, got {other:?}"),
         }

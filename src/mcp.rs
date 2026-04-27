@@ -863,24 +863,114 @@ pub fn mcp_tool_definition_for_name(config: &AppConfig, name: &str) -> Option<Va
     find_cached_mcp_tool(config, name).map(|tool| define_mcp_tool(&tool))
 }
 
-pub fn search_mcp_tools(config: &AppConfig, query: &str, max_results: usize) -> Vec<McpToolSpec> {
+fn is_mcp_tool_search_all_query(query: &str) -> bool {
+    matches!(query.trim().to_ascii_lowercase().as_str(), "all" | "*")
+}
+
+fn mcp_tool_search_limit(query: &str, max_results: usize) -> usize {
+    if is_mcp_tool_search_all_query(query) {
+        usize::MAX
+    } else {
+        max_results.max(1)
+    }
+}
+
+fn mcp_tool_search_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+        .filter_map(|term| {
+            let term = term
+                .trim_matches(|ch: char| {
+                    !ch.is_alphanumeric() && ch != '_' && ch != '-' && ch != ':'
+                })
+                .to_ascii_lowercase();
+            (!term.is_empty()).then_some(term)
+        })
+        .collect()
+}
+
+fn fuzzy_subsequence_match(haystack: &str, needle: &str) -> bool {
+    if needle.chars().count() < 3 {
+        return false;
+    }
+    let mut haystack = haystack.chars();
+    needle
+        .chars()
+        .all(|needle_ch| haystack.any(|haystack_ch| haystack_ch == needle_ch))
+}
+
+fn mcp_tool_field_score(
+    field: &str,
+    term: &str,
+    exact_score: usize,
+    contains_score: usize,
+    fuzzy_score: usize,
+) -> usize {
+    let field = field.to_ascii_lowercase();
+    let mut score = 0usize;
+    if field == term {
+        score += exact_score;
+    }
+    if field.contains(term) {
+        score += contains_score;
+    }
+    if score == 0 && fuzzy_subsequence_match(&field, term) {
+        score += fuzzy_score;
+    }
+    score
+}
+
+fn best_mcp_tool_field_score<'a>(
+    term: &str,
+    fields: impl IntoIterator<Item = (&'a str, usize, usize, usize)>,
+) -> usize {
+    fields
+        .into_iter()
+        .map(|(field, exact_score, contains_score, fuzzy_score)| {
+            mcp_tool_field_score(field, term, exact_score, contains_score, fuzzy_score)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn mcp_tool_search_score(tool: &McpToolSpec, query: &str) -> usize {
     let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    if is_mcp_tool_search_all_query(&query) {
+        return 1;
+    }
+
+    let mut score = best_mcp_tool_field_score(
+        &query,
+        [
+            (tool.full_name.as_str(), 100, 50, 20),
+            (tool.remote_name.as_str(), 100, 50, 20),
+            (tool.description.as_str(), 0, 10, 3),
+        ],
+    );
+
+    for term in mcp_tool_search_terms(&query) {
+        score += best_mcp_tool_field_score(
+            &term,
+            [
+                (tool.full_name.as_str(), 100, 50, 20),
+                (tool.remote_name.as_str(), 100, 50, 20),
+                (tool.description.as_str(), 0, 10, 3),
+            ],
+        );
+    }
+
+    score
+}
+
+pub fn search_mcp_tools(config: &AppConfig, query: &str, max_results: usize) -> Vec<McpToolSpec> {
+    let limit = mcp_tool_search_limit(query, max_results);
     let mut matches = cached_mcp_tools_for_config(config)
         .into_iter()
         .map(|tool| {
-            let mut score = 0usize;
-            let full_name = tool.full_name.to_ascii_lowercase();
-            let remote_name = tool.remote_name.to_ascii_lowercase();
-            let description = tool.description.to_ascii_lowercase();
-            if full_name == query || remote_name == query {
-                score += 100;
-            }
-            if full_name.contains(&query) || remote_name.contains(&query) {
-                score += 50;
-            }
-            if description.contains(&query) {
-                score += 10;
-            }
+            let score = mcp_tool_search_score(&tool, query);
             (score, tool)
         })
         .filter(|(score, _)| *score > 0)
@@ -892,7 +982,7 @@ pub fn search_mcp_tools(config: &AppConfig, query: &str, max_results: usize) -> 
     });
     matches
         .into_iter()
-        .take(max_results.max(1))
+        .take(limit)
         .map(|(_, tool)| tool)
         .collect()
 }
@@ -1471,6 +1561,56 @@ mod tests {
     fn search_mcp_tools_returns_empty_without_servers() {
         let config = AppConfig::default();
         assert!(search_mcp_tools(&config, "calendar", 5).is_empty());
+    }
+
+    #[test]
+    fn search_mcp_tools_supports_multi_term_fuzzy_case_insensitive_and_all() {
+        let server_name = format!("toolsearch{}", ulid::Ulid::new());
+        let mut config = AppConfig::default();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            server_name.clone(),
+            McpServerConfig {
+                command: "demo".to_string(),
+                ..McpServerConfig::default()
+            },
+        );
+        let tools = vec![
+            McpToolSpec {
+                full_name: format!("mcp__{server_name}__execute_command"),
+                server: server_name.clone(),
+                remote_name: "execute_command".to_string(),
+                description: "Execute shell command".to_string(),
+                input_schema: json!({"type":"object"}),
+                read_only: false,
+            },
+            McpToolSpec {
+                full_name: format!("mcp__{server_name}__codebase-retrieval"),
+                server: server_name.clone(),
+                remote_name: "codebase-retrieval".to_string(),
+                description: "Semantic code search".to_string(),
+                input_schema: json!({"type":"object"}),
+                read_only: true,
+            },
+        ];
+        set_cached_mcp_tools(&config, tools);
+
+        let phrase_matches = search_mcp_tools(&config, "execute command", 5);
+        assert_eq!(phrase_matches[0].remote_name, "execute_command");
+
+        let multi_matches = search_mcp_tools(&config, "EXECUTE codebase", 5);
+        let multi_names = multi_matches
+            .iter()
+            .map(|tool| tool.remote_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(multi_names.contains(&"execute_command"));
+        assert!(multi_names.contains(&"codebase-retrieval"));
+
+        let fuzzy_matches = search_mcp_tools(&config, "cdbs", 5);
+        assert_eq!(fuzzy_matches[0].remote_name, "codebase-retrieval");
+
+        let all_matches = search_mcp_tools(&config, "all", 1);
+        assert_eq!(all_matches.len(), 2);
     }
 
     #[test]
