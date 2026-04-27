@@ -966,6 +966,94 @@ fn tool_search_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
+fn normalize_tool_search_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn explicit_builtin_tool_name_for_term(term: &str) -> Option<&'static str> {
+    let normalized_term = normalize_tool_search_name(term);
+    if normalized_term.is_empty() {
+        return None;
+    }
+    builtin_tool_handlers()
+        .iter()
+        .filter(|handler| handler.spec.defer_loading)
+        .find(|handler| {
+            normalize_tool_search_name(handler.spec.name) == normalized_term
+                || handler
+                    .spec
+                    .aliases
+                    .iter()
+                    .any(|alias| normalize_tool_search_name(alias) == normalized_term)
+        })
+        .map(|handler| handler.spec.name)
+}
+
+fn explicit_mcp_tool_name_for_term(config: &AppConfig, term: &str) -> Option<String> {
+    let normalized_term = normalize_tool_search_name(term);
+    if normalized_term.is_empty() {
+        return None;
+    }
+    search_mcp_tools(config, "all", usize::MAX)
+        .into_iter()
+        .find(|tool| {
+            normalize_tool_search_name(&tool.full_name) == normalized_term
+                || normalize_tool_search_name(&tool.remote_name) == normalized_term
+        })
+        .map(|tool| tool.full_name)
+}
+
+fn explicit_tool_names_for_query(config: &AppConfig, query: &str) -> Option<Vec<String>> {
+    let terms = tool_search_terms(query);
+    if terms.is_empty() || terms.len() == 1 {
+        return None;
+    }
+
+    let mut names = Vec::new();
+    for term in terms {
+        let name = explicit_builtin_tool_name_for_term(&term)
+            .map(str::to_string)
+            .or_else(|| explicit_mcp_tool_name_for_term(config, &term))?;
+        if !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+
+    Some(names)
+}
+
+fn tool_search_json_for_builtin(config: &AppConfig, handler: &ToolHandler) -> Value {
+    json!({
+        "name": handler.spec.name,
+        "description": handler.spec.description,
+        "aliases": handler.spec.aliases,
+        "side_effects": match handler.spec.side_effects {
+            ToolSideEffects::ReadOnly => "read_only",
+            ToolSideEffects::Mutating => "mutating",
+            ToolSideEffects::External => "external",
+        },
+        "schema": if handler.spec.name == "ToolSearch" {
+            define_tool_search_tool_with_config(config)
+        } else {
+            (handler.spec.definition)()
+        },
+    })
+}
+
+fn tool_search_json_for_mcp(config: &AppConfig, tool: &crate::mcp::McpToolSpec) -> Value {
+    json!({
+        "name": tool.full_name,
+        "description": tool.description,
+        "aliases": [],
+        "side_effects": if tool.read_only { "read_only" } else { "external" },
+        "schema": mcp_tool_definition_for_name(config, &tool.full_name).unwrap_or_else(|| json!({})),
+    })
+}
+
 fn fuzzy_subsequence_match(haystack: &str, needle: &str) -> bool {
     if needle.chars().count() < 3 {
         return false;
@@ -1094,45 +1182,44 @@ fn mcp_tool_search_score(tool: &crate::mcp::McpToolSpec, query: &str) -> usize {
 
 pub fn tool_search_matches(config: &AppConfig, query: &str, max_results: usize) -> Vec<Value> {
     let limit = tool_search_limit(query, max_results);
+    if let Some(names) = explicit_tool_names_for_query(config, query) {
+        return names
+            .into_iter()
+            .take(limit)
+            .filter_map(|name| {
+                if let Some(handler) = find_tool_handler(&name)
+                    && handler.spec.defer_loading
+                {
+                    return Some(tool_search_json_for_builtin(config, &handler));
+                }
+                if name.starts_with("mcp__") {
+                    return search_mcp_tools(config, "all", usize::MAX)
+                        .into_iter()
+                        .find(|tool| tool.full_name == name)
+                        .map(|tool| tool_search_json_for_mcp(config, &tool));
+                }
+                None
+            })
+            .collect();
+    }
+
     let mut matches = builtin_tool_handlers()
         .iter()
         .filter(|handler| handler.spec.defer_loading)
         .map(|handler| {
             let score = tool_handler_search_score(handler, query);
-            (
-                score,
-                json!({
-                    "name": handler.spec.name,
-                    "description": handler.spec.description,
-                    "aliases": handler.spec.aliases,
-                    "side_effects": match handler.spec.side_effects {
-                        ToolSideEffects::ReadOnly => "read_only",
-                        ToolSideEffects::Mutating => "mutating",
-                        ToolSideEffects::External => "external",
-                    },
-                    "schema": if handler.spec.name == "ToolSearch" {
-                        define_tool_search_tool_with_config(config)
-                    } else {
-                        (handler.spec.definition)()
-                    },
-                }),
-            )
+            (score, tool_search_json_for_builtin(config, handler))
         })
         .filter(|(score, _)| *score > 0)
         .collect::<Vec<_>>();
-    matches.extend(search_mcp_tools(config, query, limit).into_iter().map(|tool| {
-        let score = mcp_tool_search_score(&tool, query);
-        (
-            score,
-            json!({
-                "name": tool.full_name,
-                "description": tool.description,
-                "aliases": [],
-                "side_effects": if tool.read_only { "read_only" } else { "external" },
-                "schema": mcp_tool_definition_for_name(config, &tool.full_name).unwrap_or_else(|| json!({})),
+    matches.extend(
+        search_mcp_tools(config, query, limit)
+            .into_iter()
+            .map(|tool| {
+                let score = mcp_tool_search_score(&tool, query);
+                (score, tool_search_json_for_mcp(config, &tool))
             }),
-        )
-    }));
+    );
     matches.sort_by(|(left_score, left), (right_score, right)| {
         right_score.cmp(left_score).then_with(|| {
             left["name"]
@@ -3678,6 +3765,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(multi_names.contains(&"Read"));
         assert!(multi_names.contains(&"Grep"));
+    }
+
+    #[test]
+    fn tool_search_exact_multi_tool_names_do_not_return_fuzzy_extras() {
+        let config = AppConfig::default();
+        let matches = tool_search_matches(&config, "Read Edit", 5);
+        let names = matches
+            .iter()
+            .filter_map(|spec| spec["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Read", "Edit"]);
     }
 
     #[test]
