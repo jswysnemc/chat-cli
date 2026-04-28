@@ -97,6 +97,12 @@ cargo install --path .
 
 Prebuilt release archives are published for `linux-x86_64`, `macos-x86_64`, `macos-arm64`, and `windows-x86_64`.
 
+Arch Linux users can install the binary package from AUR:
+
+```bash
+paru -S chat-cli-bin
+```
+
 ## Platform Notes
 
 Recommended local dependencies:

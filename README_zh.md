@@ -95,6 +95,12 @@ cargo install --path .
 
 GitHub Release 会发布 `linux-x86_64`、`macos-x86_64`、`macos-arm64`、`windows-x86_64` 的预编译产物。
 
+Arch Linux 用户可以通过 AUR 安装二进制包：
+
+```bash
+paru -S chat-cli-bin
+```
+
 ## 平台说明
 
 建议准备的本地依赖：
