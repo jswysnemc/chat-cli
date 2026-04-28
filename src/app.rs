@@ -2464,6 +2464,372 @@ fn discovered_tool_names_from_search(config: &AppConfig, raw_call: &Value) -> Ve
         .collect()
 }
 
+fn normalize_text_tool_calls(config: &AppConfig, response: &mut ChatResponse) -> bool {
+    if !response.tool_calls.is_empty() {
+        return false;
+    }
+    let (content, tool_calls) = extract_text_tool_calls(config, &response.content);
+    if tool_calls.is_empty() {
+        return false;
+    }
+    response.content = content.trim().to_string();
+    response.tool_calls = tool_calls;
+    true
+}
+
+fn extract_text_tool_calls(config: &AppConfig, content: &str) -> (String, Vec<Value>) {
+    let (content, mut tool_calls) = extract_tool_use_blocks(config, content);
+    let mut cleaned = String::new();
+    for line in content.lines() {
+        let Some(tag_start) = line.find("<tool_call>") else {
+            cleaned.push_str(line);
+            cleaned.push('\n');
+            continue;
+        };
+        let before = &line[..tag_start];
+        if !before.trim().is_empty() {
+            cleaned.push_str(before.trim_end());
+            cleaned.push('\n');
+        }
+        let body = line[tag_start + "<tool_call>".len()..].trim();
+        if let Some(call) = parse_text_tool_call(config, body, tool_calls.len()) {
+            tool_calls.push(call);
+        } else {
+            cleaned.push_str(line);
+            cleaned.push('\n');
+        }
+    }
+    (cleaned.trim_end_matches('\n').to_string(), tool_calls)
+}
+
+fn extract_tool_use_blocks(config: &AppConfig, content: &str) -> (String, Vec<Value>) {
+    let mut remaining = content;
+    let mut cleaned = String::new();
+    let mut tool_calls = Vec::new();
+    while let Some(start) = remaining.find("<tool_use>") {
+        cleaned.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<tool_use>".len()..];
+        let Some(end) = after_start.find("</tool_use>") else {
+            cleaned.push_str(&remaining[start..]);
+            return (cleaned, tool_calls);
+        };
+        let block = &after_start[..end];
+        if let Some(call) = parse_tool_use_block(config, block, tool_calls.len()) {
+            tool_calls.push(call);
+        } else {
+            cleaned.push_str("<tool_use>");
+            cleaned.push_str(block);
+            cleaned.push_str("</tool_use>");
+        }
+        remaining = &after_start[end + "</tool_use>".len()..];
+    }
+    cleaned.push_str(remaining);
+    (cleaned, tool_calls)
+}
+
+fn parse_tool_use_block(config: &AppConfig, block: &str, index: usize) -> Option<Value> {
+    let server = extract_xml_tag(block, "server_name")?;
+    let tool = extract_xml_tag(block, "tool_name")?;
+    let input = extract_xml_tag(block, "input").unwrap_or_else(|| "{}".to_string());
+    let arguments = serde_json::from_str(input.trim()).unwrap_or_else(|_| json!({}));
+    let name = resolve_text_tool_name(config, &format!("{server} {tool}"));
+    let arguments = serde_json::to_string(&arguments).ok()?;
+    Some(json!({
+        "id": format!("call_text_{}", index + 1),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        }
+    }))
+}
+
+fn extract_xml_tag(input: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let after_start = input.split_once(&start_tag)?.1;
+    let value = after_start.split_once(&end_tag)?.0;
+    Some(value.trim().to_string())
+}
+
+fn parse_text_tool_call(config: &AppConfig, body: &str, index: usize) -> Option<Value> {
+    let body = body
+        .split_once("</tool_call>")
+        .map(|(body, _)| body)
+        .unwrap_or(body)
+        .trim();
+    if body.is_empty() {
+        return None;
+    }
+    let (name, arguments) = if body.contains("<arg_value>") {
+        parse_arg_value_text_tool_call(body)?
+    } else if body.starts_with('{') {
+        parse_json_text_tool_call(body)?
+    } else {
+        parse_function_text_tool_call(body)?
+    };
+    let name = resolve_text_tool_name(config, &name);
+    let arguments = serde_json::to_string(&arguments).ok()?;
+    Some(json!({
+        "id": format!("call_text_{}", index + 1),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        }
+    }))
+}
+
+fn parse_json_text_tool_call(body: &str) -> Option<(String, Value)> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let name = value["name"]
+        .as_str()
+        .or_else(|| value["function"]["name"].as_str())?
+        .to_string();
+    let arguments = value
+        .get("arguments")
+        .or_else(|| value["function"].get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let arguments = if let Some(text) = arguments.as_str() {
+        serde_json::from_str(text).unwrap_or_else(|_| json!({}))
+    } else {
+        arguments
+    };
+    Some((name, arguments))
+}
+
+fn parse_arg_value_text_tool_call(body: &str) -> Option<(String, Value)> {
+    let parts = body.split("<arg_value>").collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    let server = parts[0].trim();
+    let remote = parts[1].trim();
+    let arguments = parts[2]
+        .split_once("</arg_value>")
+        .map(|(value, _)| value)
+        .unwrap_or(parts[2])
+        .trim();
+    let arguments = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    Some((format!("{server} {remote}"), arguments))
+}
+
+fn parse_function_text_tool_call(body: &str) -> Option<(String, Value)> {
+    let (name, arguments, arguments_are_json) = if let Some(open) = body.find('(') {
+        let close = body.rfind(')').unwrap_or(body.len());
+        (&body[..open], &body[open + 1..close], false)
+    } else if let Some(json_start) = body.find('{') {
+        (&body[..json_start], &body[json_start..], true)
+    } else if let Some((name, value)) = body.split_once(':') {
+        let arguments = parse_text_tool_string_argument(value);
+        return Some((name.trim().to_string(), arguments));
+    } else {
+        (body, "", false)
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = if arguments_are_json || arguments.trim().starts_with('{') {
+        serde_json::from_str(arguments.trim()).unwrap_or_else(|_| json!({}))
+    } else {
+        parse_key_value_arguments(arguments)
+    };
+    Some((name, arguments))
+}
+
+fn parse_text_tool_string_argument(value: &str) -> Value {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+        .to_string();
+    json!({ "query": value })
+}
+
+fn parse_key_value_arguments(input: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    let chars = input.trim().chars().collect::<Vec<_>>();
+    let mut position = 0usize;
+    while position < chars.len() {
+        while position < chars.len() && (chars[position].is_whitespace() || chars[position] == ',')
+        {
+            position += 1;
+        }
+        let key_start = position;
+        while position < chars.len()
+            && (chars[position].is_ascii_alphanumeric() || chars[position] == '_')
+        {
+            position += 1;
+        }
+        if key_start == position {
+            break;
+        }
+        let key = chars[key_start..position].iter().collect::<String>();
+        while position < chars.len() && chars[position].is_whitespace() {
+            position += 1;
+        }
+        if position >= chars.len() || chars[position] != '=' {
+            break;
+        }
+        position += 1;
+        while position < chars.len() && chars[position].is_whitespace() {
+            position += 1;
+        }
+        let value = if position < chars.len() && chars[position] == '"' {
+            position += 1;
+            let mut value = String::new();
+            while position < chars.len() {
+                match chars[position] {
+                    '\\' if position + 1 < chars.len() => {
+                        position += 1;
+                        value.push(chars[position]);
+                    }
+                    '"' => {
+                        position += 1;
+                        break;
+                    }
+                    ch => value.push(ch),
+                }
+                position += 1;
+            }
+            Value::String(value)
+        } else {
+            let value_start = position;
+            while position < chars.len() && chars[position] != ',' {
+                position += 1;
+            }
+            let value = chars[value_start..position]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
+            serde_json::from_str(&value).unwrap_or(Value::String(value))
+        };
+        map.insert(key, value);
+    }
+    Value::Object(map)
+}
+
+fn resolve_text_tool_name(config: &AppConfig, name: &str) -> String {
+    let known_tools = tool_search_matches(config, "all", usize::MAX)
+        .into_iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    for candidate in text_tool_name_candidates(name) {
+        if let Some(known) = known_tools
+            .iter()
+            .find(|known| tool_name_equivalent(known, &candidate))
+        {
+            return known.clone();
+        }
+    }
+    if let Some(found) = tool_search_matches(
+        config,
+        &name.replace("__", " ").replace([':', '_', '-'], " "),
+        1,
+    )
+    .into_iter()
+    .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+    .next()
+    {
+        return found;
+    }
+    name.trim().to_string()
+}
+
+fn text_tool_name_candidates(name: &str) -> Vec<String> {
+    let trimmed = name.trim();
+    let mut candidates = vec![trimmed.to_string()];
+    if let Some((server, remote)) = trimmed.split_once(':') {
+        let server_variants = unique_strings([
+            server.to_string(),
+            server.replace('_', "-"),
+            server.replace('-', "_"),
+        ]);
+        let remote_variants = unique_strings([
+            remote.to_string(),
+            remote.replace('-', "_"),
+            remote.replace('_', "-"),
+            swap_two_part_name(remote, '_'),
+            swap_two_part_name(remote, '-'),
+        ]);
+        for server in server_variants {
+            for remote in &remote_variants {
+                candidates.push(format!("mcp__{server}__{remote}"));
+            }
+        }
+    }
+    if let Some((server, remote)) = trimmed.split_once("__") {
+        let server_variants = unique_strings([
+            server.to_string(),
+            server.replace('_', "-"),
+            server.replace('-', "_"),
+        ]);
+        let remote_variants = unique_strings([
+            remote.to_string(),
+            remote.replace('-', "_"),
+            remote.replace('_', "-"),
+            swap_two_part_name(remote, '_'),
+            swap_two_part_name(remote, '-'),
+        ]);
+        for server in server_variants {
+            for remote in &remote_variants {
+                candidates.push(format!("mcp__{server}__{remote}"));
+            }
+        }
+    }
+    if let Some((server, remote)) = trimmed.split_once(' ') {
+        let server_variants = unique_strings([
+            server.to_string(),
+            server.replace('_', "-"),
+            server.replace('-', "_"),
+        ]);
+        let remote_variants = unique_strings([
+            remote.to_string(),
+            remote.replace('-', "_"),
+            remote.replace('_', "-"),
+            swap_two_part_name(remote, '_'),
+            swap_two_part_name(remote, '-'),
+        ]);
+        for server in server_variants {
+            for remote in &remote_variants {
+                candidates.push(format!("mcp__{server}__{remote}"));
+            }
+        }
+    }
+    unique_strings(candidates)
+}
+
+fn swap_two_part_name(value: &str, separator: char) -> String {
+    let parts = value.split(separator).collect::<Vec<_>>();
+    if parts.len() == 2 {
+        format!("{}{}{}", parts[1], separator, parts[0])
+    } else {
+        value.to_string()
+    }
+}
+
+fn unique_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            result.push(value);
+        }
+    }
+    result
+}
+
+fn tool_name_equivalent(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+        || left
+            .replace('-', "_")
+            .eq_ignore_ascii_case(&right.replace('-', "_"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AuditPromptKind {
     Default,
@@ -2728,6 +3094,9 @@ fn resolve_audit_target(
 }
 
 fn tool_requires_agent_review(config: &AppConfig, call: &crate::tool::ToolCall) -> bool {
+    if call.id.trim().is_empty() || call.name.trim().is_empty() {
+        return false;
+    }
     config.audit.enabled.unwrap_or(false)
         && matches!(
             tool_call_side_effects(call),
@@ -6134,7 +6503,7 @@ async fn execute_ask_with_tools(
                 status = Some(StreamStatus::start(StreamPhase::Waiting));
             }
 
-            let response = if use_stream {
+            let mut response = if use_stream {
                 stream_chat(prepared.request.clone(), |chunk| {
                     if !chunk.delta.is_empty() {
                         let rendered = renderer.push(&chunk.delta);
@@ -6151,6 +6520,7 @@ async fn execute_ask_with_tools(
             } else {
                 send_chat(prepared.request.clone()).await?
             };
+            let parsed_text_tool_calls = normalize_text_tool_calls(config, &mut response);
 
             if response.tool_calls.is_empty() {
                 if use_stream {
@@ -6177,13 +6547,28 @@ async fn execute_ask_with_tools(
 
             // Model wants to call tools — flush renderer and newline
             if use_stream {
-                let remaining = renderer.flush();
-                for phase in renderer.drain_phase_transitions() {
-                    update_stream_status(&status, phase)?;
-                }
-                write_stream_output(&mut stdout, &status, &remaining)?;
-                if !remaining.is_empty() && !remaining.ends_with('\n') {
-                    write_stream_output(&mut stdout, &status, "\n")?;
+                if parsed_text_tool_calls && response.content.trim().is_empty() {
+                    let _ = renderer.flush();
+                    let _ = renderer.drain_phase_transitions();
+                } else if parsed_text_tool_calls {
+                    let _ = renderer.flush();
+                    let _ = renderer.drain_phase_transitions();
+                    let rendered = render_markdown(&response.content, collapse);
+                    if !rendered.is_empty() {
+                        write_stream_output(&mut stdout, &status, &rendered)?;
+                        if !rendered.ends_with('\n') {
+                            write_stream_output(&mut stdout, &status, "\n")?;
+                        }
+                    }
+                } else {
+                    let remaining = renderer.flush();
+                    for phase in renderer.drain_phase_transitions() {
+                        update_stream_status(&status, phase)?;
+                    }
+                    write_stream_output(&mut stdout, &status, &remaining)?;
+                    if !remaining.is_empty() && !remaining.ends_with('\n') {
+                        write_stream_output(&mut stdout, &status, "\n")?;
+                    }
                 }
                 stop_stream_status(&mut status)?;
             } else if args.stream && !response.content.is_empty() {
@@ -8019,6 +8404,289 @@ mod tests {
     }
 
     #[test]
+    fn normalize_text_tool_calls_converts_mcp_colon_syntax() {
+        let mut config = test_config();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "grok-search".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "grok-search".to_string(),
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        crate::mcp::set_cached_mcp_tools(
+            &config,
+            vec![crate::mcp::McpToolSpec {
+                full_name: "mcp__grok-search__web_search".to_string(),
+                server: "grok-search".to_string(),
+                remote_name: "web_search".to_string(),
+                description: "Search the web".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }),
+                read_only: false,
+            }],
+        );
+        let mut response = ChatResponse {
+            provider_id: "fireworks".to_string(),
+            model_id: "fireworks-glm-5p1".to_string(),
+            content: "<tool_call>grok-search:search_web(query=\"GPT Plus price\")".to_string(),
+            finish_reason: "end_turn".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+
+        assert!(normalize_text_tool_calls(&config, &mut response));
+        assert!(response.content.is_empty());
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(
+            response.tool_calls[0]["function"]["name"].as_str(),
+            Some("mcp__grok-search__web_search")
+        );
+        assert_eq!(
+            response.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"GPT Plus price\"}")
+        );
+    }
+
+    #[test]
+    fn normalize_text_tool_calls_preserves_content_before_marker() {
+        let config = test_config();
+        let mut response = ChatResponse {
+            provider_id: "fireworks".to_string(),
+            model_id: "fireworks-glm-5p1".to_string(),
+            content: "checking\n<tool_call>{\"name\":\"ToolSearch\",\"arguments\":{\"query\":\"web\"}}</tool_call>".to_string(),
+            finish_reason: "end_turn".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+
+        assert!(normalize_text_tool_calls(&config, &mut response));
+        assert_eq!(response.content, "checking");
+        assert_eq!(
+            response.tool_calls[0]["function"]["name"].as_str(),
+            Some("ToolSearch")
+        );
+        assert_eq!(
+            response.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"web\"}")
+        );
+    }
+
+    #[test]
+    fn normalize_text_tool_calls_converts_double_underscore_json_syntax() {
+        let mut config = test_config();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "grok-search".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "grok-search".to_string(),
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        crate::mcp::set_cached_mcp_tools(
+            &config,
+            vec![crate::mcp::McpToolSpec {
+                full_name: "mcp__grok-search__web_search".to_string(),
+                server: "grok-search".to_string(),
+                remote_name: "web_search".to_string(),
+                description: "Search the web".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }),
+                read_only: false,
+            }],
+        );
+        let mut response = ChatResponse {
+            provider_id: "fireworks".to_string(),
+            model_id: "fireworks-glm-5p1".to_string(),
+            content:
+                "<tool_call>grok-search__search({\"query\": \"GPT Plus price\"}).EventHandler LLP"
+                    .to_string(),
+            finish_reason: "end_turn".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+
+        assert!(normalize_text_tool_calls(&config, &mut response));
+        assert!(response.content.is_empty());
+        assert_eq!(
+            response.tool_calls[0]["function"]["name"].as_str(),
+            Some("mcp__grok-search__web_search")
+        );
+        assert_eq!(
+            response.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"GPT Plus price\"}")
+        );
+    }
+
+    #[test]
+    fn normalize_text_tool_calls_converts_space_json_syntax() {
+        let mut config = test_config();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "grok-search".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "grok-search".to_string(),
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        crate::mcp::set_cached_mcp_tools(
+            &config,
+            vec![crate::mcp::McpToolSpec {
+                full_name: "mcp__grok-search__web_search".to_string(),
+                server: "grok-search".to_string(),
+                remote_name: "web_search".to_string(),
+                description: "Search the web and answer questions".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }),
+                read_only: false,
+            }],
+        );
+        let mut response = ChatResponse {
+            provider_id: "fireworks".to_string(),
+            model_id: "fireworks-glm-5p1".to_string(),
+            content: "<tool_call>grok-search searchAndAnswer {\"query\": \"GPT Plus price\"}"
+                .to_string(),
+            finish_reason: "end_turn".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+
+        assert!(normalize_text_tool_calls(&config, &mut response));
+        assert_eq!(
+            response.tool_calls[0]["function"]["name"].as_str(),
+            Some("mcp__grok-search__web_search")
+        );
+        assert_eq!(
+            response.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"GPT Plus price\"}")
+        );
+    }
+
+    #[test]
+    fn normalize_text_tool_calls_converts_arg_value_syntax() {
+        let mut config = test_config();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "grok-search".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "grok-search".to_string(),
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        crate::mcp::set_cached_mcp_tools(
+            &config,
+            vec![crate::mcp::McpToolSpec {
+                full_name: "mcp__grok-search__web_search".to_string(),
+                server: "grok-search".to_string(),
+                remote_name: "web_search".to_string(),
+                description: "Search the web and answer questions".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }),
+                read_only: false,
+            }],
+        );
+        let mut response = ChatResponse {
+            provider_id: "fireworks".to_string(),
+            model_id: "fireworks-glm-5p1".to_string(),
+            content: "<tool_call>grok-search<arg_value>search<arg_value>{\"query\":\"GPT Plus price\"}</arg_value></tool_call>".to_string(),
+            finish_reason: "end_turn".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+
+        assert!(normalize_text_tool_calls(&config, &mut response));
+        assert_eq!(
+            response.tool_calls[0]["function"]["name"].as_str(),
+            Some("mcp__grok-search__web_search")
+        );
+        assert_eq!(
+            response.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"GPT Plus price\"}")
+        );
+    }
+
+    #[test]
+    fn normalize_text_tool_calls_converts_tool_use_xml_syntax() {
+        let mut config = test_config();
+        config.tools.mcp = Some(true);
+        config.mcp.insert(
+            "grok-search".to_string(),
+            crate::mcp::McpServerConfig {
+                command: "grok-search".to_string(),
+                ..crate::mcp::McpServerConfig::default()
+            },
+        );
+        crate::mcp::set_cached_mcp_tools(
+            &config,
+            vec![crate::mcp::McpToolSpec {
+                full_name: "mcp__grok-search__web_search".to_string(),
+                server: "grok-search".to_string(),
+                remote_name: "web_search".to_string(),
+                description: "Search the web and answer questions".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }),
+                read_only: false,
+            }],
+        );
+        let mut response = ChatResponse {
+            provider_id: "fireworks".to_string(),
+            model_id: "fireworks-glm-5p1".to_string(),
+            content: "我来搜索。<tool_use>\n<server_name>grok-search</server_name>\n<tool_name>search</tool_name>\n<input>{\"query\":\"GPT Plus price\"}</input>\n</tool_use>".to_string(),
+            finish_reason: "end_turn".to_string(),
+            usage: Usage::default(),
+            latency_ms: 1,
+            raw: json!({}),
+            tool_calls: Vec::new(),
+        };
+
+        assert!(normalize_text_tool_calls(&config, &mut response));
+        assert_eq!(response.content, "我来搜索。");
+        assert_eq!(
+            response.tool_calls[0]["function"]["name"].as_str(),
+            Some("mcp__grok-search__web_search")
+        );
+        assert_eq!(
+            response.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"GPT Plus price\"}")
+        );
+    }
+
+    #[test]
     fn render_tool_call_list_uses_fixed_continuation_for_long_tool_names() {
         let raw_calls = vec![json!({
             "id": "call_mcp",
@@ -8865,6 +9533,32 @@ mod tests {
         let report = batch.reports.get("call_1").unwrap();
         assert_eq!(report.verdict, "block");
         assert_eq!(report.message, "危险操作");
+    }
+
+    #[test]
+    fn audit_review_ignores_empty_placeholder_tool_calls() {
+        let mut config = test_config();
+        config.audit.enabled = Some(true);
+        let call = crate::tool::ToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: json!({}),
+        };
+
+        assert!(!tool_requires_agent_review(&config, &call));
+    }
+
+    #[test]
+    fn audit_review_ignores_tool_search_calls() {
+        let mut config = test_config();
+        config.audit.enabled = Some(true);
+        let call = crate::tool::ToolCall {
+            id: "call_1".to_string(),
+            name: "ToolSearch".to_string(),
+            arguments: json!({"query": "grok-search web_search"}),
+        };
+
+        assert!(!tool_requires_agent_review(&config, &call));
     }
 
     #[test]

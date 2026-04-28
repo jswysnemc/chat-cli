@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 0;
+const DEFAULT_ANTHROPIC_THINKING_BUDGET_TOKENS: u32 = 1024;
+const DEFAULT_FIREWORKS_ANTHROPIC_MAX_TOKENS_WITH_THINKING: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -383,12 +385,18 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
             format!("failed to parse provider response: {err}"),
         )
     })?;
-    let content = extract_anthropic_content(&raw).ok_or_else(|| {
-        AppError::new(
+    let tool_calls = extract_anthropic_tool_calls(&raw);
+    let content = combine_reasoning_and_content(
+        extract_anthropic_thinking_content(&raw),
+        extract_anthropic_content(&raw),
+    )
+    .unwrap_or_default();
+    if content.is_empty() && tool_calls.is_empty() {
+        return Err(AppError::new(
             EXIT_NETWORK,
             "provider response did not contain assistant content",
-        )
-    })?;
+        ));
+    }
     let finish_reason = raw["stop_reason"]
         .as_str()
         .unwrap_or("end_turn")
@@ -409,7 +417,7 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
         usage,
         latency_ms: elapsed_ms(started),
         raw,
-        tool_calls: Vec::new(),
+        tool_calls,
     })
 }
 
@@ -442,6 +450,9 @@ where
     let mut finish_reason = "end_turn".to_string();
     let mut usage = Usage::default();
     let mut raw_events = Vec::new();
+    let mut in_reasoning = false;
+    let mut tool_calls_acc: Vec<Value> = Vec::new();
+    let mut tool_call_positions: BTreeMap<usize, usize> = BTreeMap::new();
 
     let mut byte_stream = response.bytes_stream();
     while let Some(chunk_result) = byte_stream.next().await {
@@ -452,7 +463,13 @@ where
             )
         })?;
         for payload in parser.push_bytes(&chunk)? {
-            if let Some(event) = parse_anthropic_stream_payload(&payload)? {
+            if let Some(mut event) = parse_anthropic_stream_payload(&payload)? {
+                event.delta = decorate_anthropic_stream_delta(
+                    &mut in_reasoning,
+                    &extract_anthropic_thinking_delta(&event.raw),
+                    &event.delta,
+                    event.finish_reason.as_deref(),
+                );
                 accumulate_stream_event(
                     &mut content,
                     &mut finish_reason,
@@ -460,19 +477,35 @@ where
                     &mut raw_events,
                     &event,
                 );
+                accumulate_anthropic_tool_calls(
+                    &mut tool_calls_acc,
+                    &mut tool_call_positions,
+                    &event.tool_calls_delta,
+                );
                 on_chunk(event)?;
             }
         }
     }
 
     for payload in parser.finish()? {
-        if let Some(event) = parse_anthropic_stream_payload(&payload)? {
+        if let Some(mut event) = parse_anthropic_stream_payload(&payload)? {
+            event.delta = decorate_anthropic_stream_delta(
+                &mut in_reasoning,
+                &extract_anthropic_thinking_delta(&event.raw),
+                &event.delta,
+                event.finish_reason.as_deref(),
+            );
             accumulate_stream_event(
                 &mut content,
                 &mut finish_reason,
                 &mut usage,
                 &mut raw_events,
                 &event,
+            );
+            accumulate_anthropic_tool_calls(
+                &mut tool_calls_acc,
+                &mut tool_call_positions,
+                &event.tool_calls_delta,
             );
             on_chunk(event)?;
         }
@@ -486,7 +519,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
-        tool_calls: Vec::new(),
+        tool_calls: tool_calls_acc,
     })
 }
 
@@ -869,16 +902,100 @@ fn build_anthropic_body(request: &ChatRequest, stream: bool) -> Value {
         body.insert("system".to_string(), Value::String(system));
     }
     body.insert("messages".to_string(), Value::Array(messages));
+    if !request.tools.is_empty() {
+        body.insert(
+            "tools".to_string(),
+            Value::Array(build_anthropic_tools(&request.tools)),
+        );
+    }
     if stream {
         body.insert("stream".to_string(), Value::Bool(true));
     }
     if let Some(temperature) = request.temperature {
         body.insert("temperature".to_string(), json!(temperature));
     }
+    if let Some(reasoning_effort) = resolved_anthropic_reasoning_effort(request) {
+        insert_anthropic_reasoning_params(&mut body, request, &reasoning_effort);
+    }
     for (key, value) in &request.params {
         body.insert(key.clone(), value.clone());
     }
     Value::Object(body)
+}
+
+fn resolved_anthropic_reasoning_effort(request: &ChatRequest) -> Option<String> {
+    if request.params.contains_key("thinking") || request.params.contains_key("output_config") {
+        return None;
+    }
+    if !anthropic_effort_supported(request) {
+        return None;
+    }
+    request
+        .model
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn insert_anthropic_reasoning_params(
+    body: &mut Map<String, Value>,
+    request: &ChatRequest,
+    reasoning_effort: &str,
+) {
+    if anthropic_adaptive_thinking_supported(&request.model.remote_name) {
+        body.entry("thinking".to_string()).or_insert_with(|| {
+            json!({
+                "type": "adaptive",
+                "display": "summarized",
+            })
+        });
+    } else if fireworks_anthropic_compatibility(&request.provider, &request.model.remote_name) {
+        let max_tokens = request
+            .max_output_tokens
+            .unwrap_or(DEFAULT_FIREWORKS_ANTHROPIC_MAX_TOKENS_WITH_THINKING);
+        if request.max_output_tokens.is_none() {
+            body.insert("max_tokens".to_string(), json!(max_tokens));
+        }
+        if max_tokens <= DEFAULT_ANTHROPIC_THINKING_BUDGET_TOKENS {
+            return;
+        }
+        let budget = max_tokens
+            .saturating_sub(1)
+            .min(DEFAULT_ANTHROPIC_THINKING_BUDGET_TOKENS.max(max_tokens / 2));
+        body.entry("thinking".to_string()).or_insert_with(|| {
+            json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            })
+        });
+    }
+    body.entry("output_config".to_string())
+        .or_insert_with(|| json!({ "effort": reasoning_effort }));
+}
+
+fn anthropic_effort_supported(request: &ChatRequest) -> bool {
+    let normalized = request.model.remote_name.to_ascii_lowercase();
+    anthropic_adaptive_thinking_supported(&normalized)
+        || normalized.contains("claude-opus-4-5")
+        || fireworks_anthropic_compatibility(&request.provider, &normalized)
+}
+
+fn fireworks_anthropic_compatibility(provider: &ProviderConfig, remote_name: &str) -> bool {
+    provider
+        .base_url
+        .as_deref()
+        .is_some_and(|base_url| base_url.contains("fireworks.ai"))
+        || remote_name.contains("accounts/fireworks/")
+}
+
+fn anthropic_adaptive_thinking_supported(remote_name: &str) -> bool {
+    let remote_name = remote_name.to_ascii_lowercase();
+    remote_name.contains("claude-mythos")
+        || remote_name.contains("claude-opus-4-7")
+        || remote_name.contains("claude-opus-4-6")
+        || remote_name.contains("claude-sonnet-4-6")
 }
 
 fn build_ollama_body(request: &ChatRequest, stream: bool) -> Value {
@@ -909,6 +1026,29 @@ fn build_ollama_body(request: &ChatRequest, stream: bool) -> Value {
     Value::Object(body)
 }
 
+fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let function = &tool["function"];
+            let name = function["name"].as_str()?;
+            let mut item = Map::new();
+            item.insert("name".to_string(), json!(name));
+            if let Some(description) = function["description"].as_str() {
+                item.insert("description".to_string(), json!(description));
+            }
+            item.insert(
+                "input_schema".to_string(),
+                function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object"})),
+            );
+            Some(Value::Object(item))
+        })
+        .collect()
+}
+
 fn patched_messages(request: &ChatRequest) -> Vec<ChatMessage> {
     let mut messages = request.messages.clone();
     if request.model.patches.system_to_user.unwrap_or(false) {
@@ -927,17 +1067,16 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
     for message in messages {
         if message.role == "system" {
             system_parts.push(message.content.clone());
+        } else if message.role == "tool" {
+            result.push(json!({
+                "role": "user",
+                "content": build_anthropic_tool_result_content(message),
+            }));
         } else {
             result.push(json!({
                 "role": message.role,
                 "content": build_anthropic_message_content_value(message),
             }));
-            if message.role == "tool" && !message.images.is_empty() {
-                result.push(json!({
-                    "role": "user",
-                    "content": build_anthropic_tool_image_followup_content(message),
-                }));
-            }
         }
     }
     let system = if system_parts.is_empty() {
@@ -946,25 +1085,6 @@ fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
         Some(system_parts.join("\n\n"))
     };
     (system, result)
-}
-
-fn build_anthropic_tool_image_followup_content(message: &ChatMessage) -> Value {
-    let mut parts = Vec::new();
-    parts.push(json!({
-        "type": "text",
-        "text": tool_image_followup_text(message),
-    }));
-    for image in &message.images {
-        parts.push(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": image.media_type,
-                "data": image.data,
-            }
-        }));
-    }
-    Value::Array(parts)
 }
 
 fn tool_image_followup_text(message: &ChatMessage) -> String {
@@ -984,8 +1104,22 @@ fn tool_image_followup_text(message: &ChatMessage) -> String {
 }
 
 fn build_anthropic_message_content_value(message: &ChatMessage) -> Value {
-    if message.role == "tool" {
-        return json!(message.content);
+    if message.role == "assistant"
+        && let Some(tool_calls) = &message.tool_calls
+    {
+        let mut parts = Vec::new();
+        if !message.content.is_empty() {
+            parts.push(json!({
+                "type": "text",
+                "text": message.content,
+            }));
+        }
+        for tool_call in tool_calls {
+            if let Some(part) = openai_tool_call_to_anthropic_tool_use(tool_call) {
+                parts.push(part);
+            }
+        }
+        return Value::Array(parts);
     }
     if message.images.is_empty() {
         return json!(message.content);
@@ -1009,6 +1143,52 @@ fn build_anthropic_message_content_value(message: &ChatMessage) -> Value {
         }));
     }
     Value::Array(parts)
+}
+
+fn build_anthropic_tool_result_content(message: &ChatMessage) -> Value {
+    let content = if message.images.is_empty() {
+        json!(message.content)
+    } else {
+        let mut parts = Vec::new();
+        if !message.content.is_empty() {
+            parts.push(json!({
+                "type": "text",
+                "text": message.content,
+            }));
+        }
+        for image in &message.images {
+            parts.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.media_type,
+                    "data": image.data,
+                }
+            }));
+        }
+        Value::Array(parts)
+    };
+    Value::Array(vec![json!({
+        "type": "tool_result",
+        "tool_use_id": message.tool_call_id.as_deref().unwrap_or_default(),
+        "content": content,
+    })])
+}
+
+fn openai_tool_call_to_anthropic_tool_use(tool_call: &Value) -> Option<Value> {
+    Some(json!({
+        "type": "tool_use",
+        "id": tool_call["id"].as_str()?,
+        "name": tool_call["function"]["name"].as_str()?,
+        "input": parse_tool_arguments_value(tool_call["function"]["arguments"].as_str().unwrap_or("{}")),
+    }))
+}
+
+fn parse_tool_arguments_value(arguments: &str) -> Value {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value @ Value::Object(_)) => value,
+        _ => json!({}),
+    }
 }
 
 fn build_openai_headers(provider: &ProviderConfig, api_key: &str) -> AppResult<HeaderMap> {
@@ -1139,6 +1319,7 @@ fn extract_openai_content(raw: &Value) -> Option<String> {
 fn extract_openai_reasoning_content(raw: &Value) -> Option<String> {
     extract_openai_text_value(&raw["choices"][0]["message"]["reasoning_content"])
         .or_else(|| extract_openai_text_value(&raw["choices"][0]["message"]["reasoning"]))
+        .or_else(|| extract_openai_thinking_text_value(&raw["choices"][0]["message"]["content"]))
 }
 
 fn extract_anthropic_content(raw: &Value) -> Option<String> {
@@ -1158,6 +1339,46 @@ fn extract_anthropic_content(raw: &Value) -> Option<String> {
     }
 }
 
+fn extract_anthropic_thinking_content(raw: &Value) -> Option<String> {
+    let parts = raw["content"].as_array()?;
+    let mut merged = String::new();
+    for part in parts {
+        if part["type"].as_str() == Some("thinking")
+            && let Some(thinking) = part["thinking"].as_str()
+        {
+            merged.push_str(thinking);
+        }
+    }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+fn extract_anthropic_tool_calls(raw: &Value) -> Vec<Value> {
+    let Some(parts) = raw["content"].as_array() else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .filter(|part| part["type"].as_str() == Some("tool_use"))
+        .filter_map(anthropic_tool_use_to_openai_tool_call)
+        .collect()
+}
+
+fn anthropic_tool_use_to_openai_tool_call(part: &Value) -> Option<Value> {
+    let input = part.get("input").cloned().unwrap_or_else(|| json!({}));
+    Some(json!({
+        "id": part["id"].as_str()?,
+        "type": "function",
+        "function": {
+            "name": part["name"].as_str()?,
+            "arguments": serde_json::to_string(&input).ok()?,
+        }
+    }))
+}
+
 fn extract_ollama_content(raw: &Value) -> Option<String> {
     raw["message"]["content"]
         .as_str()
@@ -1174,6 +1395,18 @@ fn extract_openai_reasoning_delta(raw: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn extract_anthropic_thinking_delta(raw: &Value) -> String {
+    if raw["type"].as_str() != Some("content_block_delta")
+        || raw["delta"]["type"].as_str() != Some("thinking_delta")
+    {
+        return String::new();
+    }
+    raw["delta"]["thinking"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn extract_openai_text_value(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
         return Some(text.to_string());
@@ -1184,6 +1417,23 @@ fn extract_openai_text_value(value: &Value) -> Option<String> {
         if let Some(text) = part["text"].as_str() {
             merged.push_str(text);
         } else if let Some(text) = part["content"].as_str() {
+            merged.push_str(text);
+        }
+    }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+fn extract_openai_thinking_text_value(value: &Value) -> Option<String> {
+    let parts = value.as_array()?;
+    let mut merged = String::new();
+    for part in parts {
+        if part["type"].as_str() == Some("thinking")
+            && let Some(text) = part["thinking"].as_str()
+        {
             merged.push_str(text);
         }
     }
@@ -1239,6 +1489,28 @@ fn decorate_openai_stream_delta(
 
 fn is_openai_control_content_delta(delta: &str) -> bool {
     matches!(delta.trim(), "FINISHED")
+}
+
+fn decorate_anthropic_stream_delta(
+    in_reasoning: &mut bool,
+    reasoning_delta: &str,
+    answer_delta: &str,
+    finish_reason: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    if !reasoning_delta.is_empty() {
+        if !*in_reasoning {
+            output.push_str("<think>\n");
+            *in_reasoning = true;
+        }
+        output.push_str(reasoning_delta);
+    }
+    if *in_reasoning && (!answer_delta.is_empty() || finish_reason.is_some()) {
+        output.push_str("</think>\n\n");
+        *in_reasoning = false;
+    }
+    output.push_str(answer_delta);
+    output
 }
 
 fn extract_ollama_usage(raw: &Value) -> Option<Usage> {
@@ -1320,6 +1592,36 @@ fn accumulate_tool_calls(acc: &mut Vec<Value>, deltas: &[Value]) {
     }
 }
 
+fn accumulate_anthropic_tool_calls(
+    acc: &mut Vec<Value>,
+    positions: &mut BTreeMap<usize, usize>,
+    deltas: &[Value],
+) {
+    for delta in deltas {
+        let source_index = delta["index"].as_u64().unwrap_or(0) as usize;
+        let position = *positions.entry(source_index).or_insert_with(|| {
+            acc.push(
+                json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}),
+            );
+            acc.len() - 1
+        });
+        let Some(target) = acc.get_mut(position) else {
+            continue;
+        };
+        if let Some(id) = delta["id"].as_str() {
+            target["id"] = json!(id);
+        }
+        if let Some(name) = delta["function"]["name"].as_str() {
+            let existing = target["function"]["name"].as_str().unwrap_or("");
+            target["function"]["name"] = json!(format!("{}{}", existing, name));
+        }
+        if let Some(args) = delta["function"]["arguments"].as_str() {
+            let existing = target["function"]["arguments"].as_str().unwrap_or("");
+            target["function"]["arguments"] = json!(format!("{}{}", existing, args));
+        }
+    }
+}
+
 fn parse_openai_stream_payload(payload: &str) -> AppResult<Option<ChatStreamChunk>> {
     if payload.trim().is_empty() {
         return Ok(None);
@@ -1359,7 +1661,7 @@ fn parse_anthropic_stream_payload(payload: &str) -> AppResult<Option<ChatStreamC
         )
     })?;
     match raw["type"].as_str().unwrap_or_default() {
-        "ping" | "content_block_start" | "content_block_stop" | "message_stop" => Ok(None),
+        "ping" | "content_block_stop" | "message_stop" => Ok(None),
         "error" => {
             let message = raw["error"]["message"]
                 .as_str()
@@ -1370,6 +1672,41 @@ fn parse_anthropic_stream_payload(payload: &str) -> AppResult<Option<ChatStreamC
                 _ => EXIT_NETWORK,
             };
             Err(AppError::new(code, message))
+        }
+        "content_block_start" => {
+            let tool_calls_delta = if raw["content_block"]["type"].as_str() == Some("tool_use") {
+                let arguments = raw["content_block"]
+                    .get("input")
+                    .and_then(|input| {
+                        if input.as_object().is_some_and(|object| object.is_empty()) {
+                            None
+                        } else {
+                            serde_json::to_string(input).ok()
+                        }
+                    })
+                    .unwrap_or_default();
+                vec![json!({
+                    "index": raw["index"].as_u64().unwrap_or(0),
+                    "id": raw["content_block"]["id"].as_str().unwrap_or_default(),
+                    "type": "function",
+                    "function": {
+                        "name": raw["content_block"]["name"].as_str().unwrap_or_default(),
+                        "arguments": arguments,
+                    }
+                })]
+            } else {
+                Vec::new()
+            };
+            if tool_calls_delta.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ChatStreamChunk {
+                delta: String::new(),
+                finish_reason: None,
+                usage: None,
+                tool_calls_delta,
+                raw,
+            }))
         }
         "message_start" => {
             let usage = Usage {
@@ -1397,11 +1734,21 @@ fn parse_anthropic_stream_payload(payload: &str) -> AppResult<Option<ChatStreamC
             } else {
                 String::new()
             };
+            let tool_calls_delta = if raw["delta"]["type"].as_str() == Some("input_json_delta") {
+                vec![json!({
+                    "index": raw["index"].as_u64().unwrap_or(0),
+                    "function": {
+                        "arguments": raw["delta"]["partial_json"].as_str().unwrap_or_default(),
+                    }
+                })]
+            } else {
+                Vec::new()
+            };
             Ok(Some(ChatStreamChunk {
                 delta,
                 finish_reason: None,
                 usage: None,
-                tool_calls_delta: Vec::new(),
+                tool_calls_delta,
                 raw,
             }))
         }
@@ -1680,6 +2027,26 @@ mod tests {
         assert!(combined.contains("<think>"));
         assert!(combined.contains("先做加法。"));
         assert!(combined.ends_with("2"));
+    }
+
+    #[test]
+    fn extract_openai_reasoning_content_from_anthropic_style_parts() {
+        let raw = json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "thinking", "thinking": "需要搜索。"},
+                        {"type": "text", "text": "答案"}
+                    ]
+                }
+            }]
+        });
+        let combined = combine_reasoning_and_content(
+            extract_openai_reasoning_content(&raw),
+            extract_openai_content(&raw),
+        )
+        .unwrap();
+        assert_eq!(combined, "<think>\n需要搜索。\n</think>\n\n答案");
     }
 
     #[test]
@@ -1964,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn build_anthropic_body_moves_tool_images_into_followup_user_message() {
+    fn build_anthropic_body_serializes_tool_result_with_images() {
         let request = ChatRequest {
             provider_id: "anthropic".to_string(),
             provider: ProviderConfig {
@@ -2004,21 +2371,330 @@ mod tests {
 
         let body = build_anthropic_body(&request, false);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"].as_str(), Some("tool"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"].as_str(), Some("user"));
+        let tool_result = &messages[0]["content"][0];
+        assert_eq!(tool_result["type"].as_str(), Some("tool_result"));
+        assert_eq!(tool_result["tool_use_id"].as_str(), Some("call_1"));
+        let content = tool_result["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
         assert_eq!(
-            messages[0]["content"].as_str(),
+            content[0]["text"].as_str(),
             Some("image file: /tmp/test.png")
         );
-        assert_eq!(messages[1]["role"].as_str(), Some("user"));
-        let content = messages[1]["content"].as_array().unwrap();
-        assert_eq!(content[0]["type"].as_str(), Some("text"));
         assert_eq!(content[1]["type"].as_str(), Some("image"));
         assert_eq!(
             content[1]["source"]["media_type"].as_str(),
             Some("image/png")
         );
         assert_eq!(content[1]["source"]["data"].as_str(), Some("YWJj"));
+    }
+
+    #[test]
+    fn build_anthropic_body_serializes_tools_and_assistant_tool_use() {
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "checking".to_string(),
+                images: Vec::new(),
+                tool_calls: Some(vec![json!({
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "ToolSearch",
+                        "arguments": "{\"query\":\"web\"}"
+                    }
+                })]),
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "ToolSearch",
+                    "description": "Search tools",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"]
+                    }
+                }
+            })],
+        };
+
+        let body = build_anthropic_body(&request, false);
+        assert_eq!(body["tools"][0]["name"].as_str(), Some("ToolSearch"));
+        assert_eq!(
+            body["tools"][0]["input_schema"]["properties"]["query"]["type"].as_str(),
+            Some("string")
+        );
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
+        assert_eq!(content[1]["type"].as_str(), Some("tool_use"));
+        assert_eq!(content[1]["id"].as_str(), Some("call_1"));
+        assert_eq!(content[1]["name"].as_str(), Some("ToolSearch"));
+        assert_eq!(content[1]["input"]["query"].as_str(), Some("web"));
+    }
+
+    #[test]
+    fn build_anthropic_body_uses_reasoning_effort_from_config() {
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-sonnet-4-6".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude-sonnet-4-6".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("medium".to_string()),
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: Some(2048),
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+        assert_eq!(body["thinking"]["display"].as_str(), Some("summarized"));
+        assert_eq!(body["output_config"]["effort"].as_str(), Some("medium"));
+    }
+
+    #[test]
+    fn build_anthropic_body_respects_explicit_thinking_params() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "thinking".to_string(),
+            json!({"type": "enabled", "budget_tokens": 2048}),
+        );
+        params.insert("output_config".to_string(), json!({"effort": "low"}));
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-sonnet-4-6".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude-sonnet-4-6".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("high".to_string()),
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params,
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        assert_eq!(body["thinking"]["type"].as_str(), Some("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(2048));
+        assert_eq!(body["output_config"]["effort"].as_str(), Some("low"));
+    }
+
+    #[test]
+    fn build_anthropic_body_uses_fireworks_reasoning_effort_from_config() {
+        let request = ChatRequest {
+            provider_id: "fireworks".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                base_url: Some("https://api.fireworks.ai/inference/v1".to_string()),
+                ..ProviderConfig::default()
+            },
+            model_id: "fireworks-glm-5p1".to_string(),
+            model: ModelConfig {
+                provider: "fireworks".to_string(),
+                remote_name: "accounts/fireworks/models/glm-5p1".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("high".to_string()),
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        assert_eq!(body["max_tokens"].as_u64(), Some(4096));
+        assert_eq!(body["thinking"]["type"].as_str(), Some("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(2048));
+        assert_eq!(body["output_config"]["effort"].as_str(), Some("high"));
+    }
+
+    #[test]
+    fn build_anthropic_body_does_not_add_effort_when_single_explicit_param_exists() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "thinking".to_string(),
+            json!({"type": "enabled", "budget_tokens": 2048}),
+        );
+        let request = ChatRequest {
+            provider_id: "fireworks".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                base_url: Some("https://api.fireworks.ai/inference/v1".to_string()),
+                ..ProviderConfig::default()
+            },
+            model_id: "fireworks-glm-5p1".to_string(),
+            model: ModelConfig {
+                provider: "fireworks".to_string(),
+                remote_name: "accounts/fireworks/models/glm-5p1".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("high".to_string()),
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params,
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(2048));
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_anthropic_body_does_not_infer_effort_for_unsupported_models() {
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude-3-5-sonnet".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude-3-5-sonnet-latest".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: Some("high".to_string()),
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn extract_anthropic_content_wraps_thinking_blocks() {
+        let raw = json!({
+            "content": [
+                {"type": "thinking", "thinking": "先分析。"},
+                {"type": "text", "text": "答案"}
+            ]
+        });
+
+        let combined = combine_reasoning_and_content(
+            extract_anthropic_thinking_content(&raw),
+            extract_anthropic_content(&raw),
+        )
+        .unwrap();
+        assert_eq!(combined, "<think>\n先分析。\n</think>\n\n答案");
     }
 
     #[test]
@@ -2127,6 +2803,126 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(event.delta, "hello");
+    }
+
+    #[test]
+    fn extract_anthropic_tool_calls_from_message() {
+        let raw = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "ToolSearch",
+                "input": {"query": "web"}
+            }]
+        });
+
+        let calls = extract_anthropic_tool_calls(&raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"].as_str(), Some("toolu_1"));
+        assert_eq!(calls[0]["function"]["name"].as_str(), Some("ToolSearch"));
+        assert_eq!(
+            calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"web\"}")
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_stream_tool_use_start_and_delta() {
+        let start = parse_anthropic_stream_payload(
+            "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ToolSearch\",\"input\":{}}}",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(start.tool_calls_delta.len(), 1);
+        assert_eq!(start.tool_calls_delta[0]["index"].as_u64(), Some(1));
+        assert_eq!(
+            start.tool_calls_delta[0]["function"]["name"].as_str(),
+            Some("ToolSearch")
+        );
+
+        let delta = parse_anthropic_stream_payload(
+            "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"web\\\"}\"}}",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            delta.tool_calls_delta[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"web\"}")
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_stream_tool_use_start_serializes_full_input() {
+        let start = parse_anthropic_stream_payload(
+            "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"ToolSearch\",\"input\":{\"query\":\"web\"}}}",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            start.tool_calls_delta[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"web\"}")
+        );
+    }
+
+    #[test]
+    fn accumulate_anthropic_tool_calls_compacts_content_block_indices() {
+        let mut calls = Vec::new();
+        let mut positions = BTreeMap::new();
+        accumulate_anthropic_tool_calls(
+            &mut calls,
+            &mut positions,
+            &[json!({
+                "index": 1,
+                "id": "toolu_1",
+                "type": "function",
+                "function": {
+                    "name": "ToolSearch",
+                    "arguments": ""
+                }
+            })],
+        );
+        accumulate_anthropic_tool_calls(
+            &mut calls,
+            &mut positions,
+            &[json!({
+                "index": 1,
+                "function": {
+                    "arguments": "{\"query\":\"web\"}"
+                }
+            })],
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"].as_str(), Some("toolu_1"));
+        assert_eq!(calls[0]["function"]["name"].as_str(), Some("ToolSearch"));
+        assert_eq!(
+            calls[0]["function"]["arguments"].as_str(),
+            Some("{\"query\":\"web\"}")
+        );
+    }
+
+    #[test]
+    fn decorate_anthropic_stream_delta_wraps_thinking_before_answer() {
+        let mut in_reasoning = false;
+        let first = decorate_anthropic_stream_delta(&mut in_reasoning, "先分析", "", None);
+        assert_eq!(first, "<think>\n先分析");
+        assert!(in_reasoning);
+
+        let second = decorate_anthropic_stream_delta(&mut in_reasoning, "", "结论", None);
+        assert_eq!(second, "</think>\n\n结论");
+        assert!(!in_reasoning);
+    }
+
+    #[test]
+    fn parse_anthropic_stream_thinking_delta() {
+        let event = parse_anthropic_stream_payload(
+            "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(event.delta, "");
+        assert_eq!(extract_anthropic_thinking_delta(&event.raw), "plan");
     }
 
     #[test]
