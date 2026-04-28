@@ -227,7 +227,7 @@ jobs:
           git -C aur-package config user.name "github-actions[bot]"
           git -C aur-package config user.email "github-actions[bot]@users.noreply.github.com"
           scripts/update-aur-bin.sh "${{ needs.prepare.outputs.tag }}" aur-package
-          if git -C aur-package diff --quiet; then
+          if [ -z "$(git -C aur-package status --porcelain)" ]; then
             echo "AUR package is already up to date"
             exit 0
           fi
