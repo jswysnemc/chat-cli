@@ -15,6 +15,8 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 0;
 const DEFAULT_ANTHROPIC_THINKING_BUDGET_TOKENS: u32 = 1024;
 const DEFAULT_FIREWORKS_ANTHROPIC_MAX_TOKENS_WITH_THINKING: u32 = 4096;
+const INTERNAL_ANTHROPIC_CONTENT_KEY: &str = "__chat_cli_anthropic_content";
+const INTERNAL_OPENAI_REASONING_CONTENT_KEY: &str = "__chat_cli_openai_reasoning_content";
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -236,10 +238,14 @@ async fn send_openai_compatible(request: ChatRequest) -> AppResult<ChatResponse>
         .as_str()
         .unwrap_or("stop")
         .to_string();
-    let tool_calls = raw["choices"][0]["message"]["tool_calls"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let reasoning_content = extract_openai_reasoning_content(&raw);
+    let tool_calls = attach_openai_reasoning_metadata(
+        raw["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        reasoning_content,
+    );
     let usage = Usage {
         input_tokens: raw["usage"]["prompt_tokens"].as_u64(),
         output_tokens: raw["usage"]["completion_tokens"].as_u64(),
@@ -292,6 +298,7 @@ where
 
     let mut tool_calls_acc: Vec<Value> = Vec::new();
     let mut in_reasoning = false;
+    let mut reasoning_content = String::new();
 
     let mut byte_stream = response.bytes_stream();
     while let Some(chunk_result) = byte_stream.next().await {
@@ -303,9 +310,11 @@ where
         })?;
         for payload in parser.push_bytes(&chunk)? {
             if let Some(mut event) = parse_openai_stream_payload(&payload)? {
+                let reasoning_delta = extract_openai_reasoning_delta(&event.raw);
+                reasoning_content.push_str(&reasoning_delta);
                 event.delta = decorate_openai_stream_delta(
                     &mut in_reasoning,
-                    &extract_openai_reasoning_delta(&event.raw),
+                    &reasoning_delta,
                     &event.delta,
                     event.finish_reason.as_deref(),
                 );
@@ -324,9 +333,11 @@ where
 
     for payload in parser.finish()? {
         if let Some(mut event) = parse_openai_stream_payload(&payload)? {
+            let reasoning_delta = extract_openai_reasoning_delta(&event.raw);
+            reasoning_content.push_str(&reasoning_delta);
             event.delta = decorate_openai_stream_delta(
                 &mut in_reasoning,
-                &extract_openai_reasoning_delta(&event.raw),
+                &reasoning_delta,
                 &event.delta,
                 event.finish_reason.as_deref(),
             );
@@ -350,7 +361,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
-        tool_calls: tool_calls_acc,
+        tool_calls: attach_openai_reasoning_metadata(tool_calls_acc, Some(reasoning_content)),
     })
 }
 
@@ -385,7 +396,10 @@ async fn send_anthropic(request: ChatRequest) -> AppResult<ChatResponse> {
             format!("failed to parse provider response: {err}"),
         )
     })?;
-    let tool_calls = extract_anthropic_tool_calls(&raw);
+    let tool_calls = attach_anthropic_content_metadata(
+        extract_anthropic_tool_calls(&raw),
+        raw["content"].as_array().cloned().unwrap_or_default(),
+    );
     let content = combine_reasoning_and_content(
         extract_anthropic_thinking_content(&raw),
         extract_anthropic_content(&raw),
@@ -511,6 +525,7 @@ where
         }
     }
 
+    let anthropic_content = build_anthropic_content_blocks_from_stream_events(&raw_events);
     Ok(ChatResponse {
         provider_id: request.provider_id,
         model_id: request.model_id,
@@ -519,7 +534,7 @@ where
         usage,
         latency_ms: elapsed_ms(started),
         raw: Value::Array(raw_events),
-        tool_calls: tool_calls_acc,
+        tool_calls: attach_anthropic_content_metadata(tool_calls_acc, anthropic_content),
     })
 }
 
@@ -800,12 +815,24 @@ fn build_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
         }
         if message.role == "assistant" {
             if let Some(tc) = &message.tool_calls {
-                m.insert("tool_calls".to_string(), Value::Array(tc.clone()));
+                let reasoning_content = openai_reasoning_metadata(tc);
+                if let Some(reasoning) = &reasoning_content {
+                    m.insert("reasoning_content".to_string(), json!(reasoning));
+                }
+                m.insert(
+                    "tool_calls".to_string(),
+                    Value::Array(strip_internal_tool_call_metadata(tc)),
+                );
                 // content can be null when assistant has tool_calls
-                if message.content.is_empty() {
+                let content = if reasoning_content.is_some() {
+                    strip_combined_reasoning_prefix(&message.content)
+                } else {
+                    message.content.clone()
+                };
+                if content.is_empty() {
                     m.insert("content".to_string(), Value::Null);
                 } else {
-                    m.insert("content".to_string(), json!(message.content));
+                    m.insert("content".to_string(), json!(content));
                 }
             } else {
                 m.insert(
@@ -1064,19 +1091,30 @@ fn patched_messages(request: &ChatRequest) -> Vec<ChatMessage> {
 fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
     let mut system_parts = Vec::new();
     let mut result = Vec::new();
-    for message in messages {
+    let mut index = 0usize;
+    while index < messages.len() {
+        let message = &messages[index];
         if message.role == "system" {
             system_parts.push(message.content.clone());
+            index += 1;
         } else if message.role == "tool" {
+            let mut content = Vec::new();
+            while index < messages.len() && messages[index].role == "tool" {
+                if let Value::Array(parts) = build_anthropic_tool_result_content(&messages[index]) {
+                    content.extend(parts);
+                }
+                index += 1;
+            }
             result.push(json!({
                 "role": "user",
-                "content": build_anthropic_tool_result_content(message),
+                "content": content,
             }));
         } else {
             result.push(json!({
                 "role": message.role,
                 "content": build_anthropic_message_content_value(message),
             }));
+            index += 1;
         }
     }
     let system = if system_parts.is_empty() {
@@ -1107,6 +1145,9 @@ fn build_anthropic_message_content_value(message: &ChatMessage) -> Value {
     if message.role == "assistant"
         && let Some(tool_calls) = &message.tool_calls
     {
+        if let Some(content) = anthropic_content_metadata(tool_calls) {
+            return Value::Array(content);
+        }
         let mut parts = Vec::new();
         if !message.content.is_empty() {
             parts.push(json!({
@@ -1182,6 +1223,58 @@ fn openai_tool_call_to_anthropic_tool_use(tool_call: &Value) -> Option<Value> {
         "name": tool_call["function"]["name"].as_str()?,
         "input": parse_tool_arguments_value(tool_call["function"]["arguments"].as_str().unwrap_or("{}")),
     }))
+}
+
+fn anthropic_content_metadata(tool_calls: &[Value]) -> Option<Vec<Value>> {
+    tool_calls
+        .iter()
+        .find_map(|tool_call| {
+            tool_call
+                .get(INTERNAL_ANTHROPIC_CONTENT_KEY)?
+                .as_array()
+                .cloned()
+        })
+        .filter(|content| !content.is_empty())
+}
+
+fn openai_reasoning_metadata(tool_calls: &[Value]) -> Option<String> {
+    tool_calls
+        .iter()
+        .find_map(|tool_call| {
+            tool_call
+                .get(INTERNAL_OPENAI_REASONING_CONTENT_KEY)?
+                .as_str()
+                .map(ToString::to_string)
+        })
+        .filter(|content| !content.trim().is_empty())
+}
+
+fn strip_internal_tool_call_metadata(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .cloned()
+        .map(|mut tool_call| {
+            if let Some(object) = tool_call.as_object_mut() {
+                object.remove(INTERNAL_ANTHROPIC_CONTENT_KEY);
+                object.remove(INTERNAL_OPENAI_REASONING_CONTENT_KEY);
+            }
+            tool_call
+        })
+        .collect()
+}
+
+fn strip_combined_reasoning_prefix(content: &str) -> String {
+    let Some(rest) = content.strip_prefix("<think>\n") else {
+        return content.to_string();
+    };
+    let Some((_, answer)) = rest.split_once("\n</think>") else {
+        return content.to_string();
+    };
+    answer
+        .strip_prefix("\n\n")
+        .or_else(|| answer.strip_prefix('\n'))
+        .unwrap_or(answer)
+        .to_string()
 }
 
 fn parse_tool_arguments_value(arguments: &str) -> Value {
@@ -1367,6 +1460,42 @@ fn extract_anthropic_tool_calls(raw: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn attach_openai_reasoning_metadata(
+    mut tool_calls: Vec<Value>,
+    reasoning_content: Option<String>,
+) -> Vec<Value> {
+    let Some(reasoning_content) = reasoning_content.filter(|value| !value.trim().is_empty()) else {
+        return tool_calls;
+    };
+    if let Some(first) = tool_calls.first_mut()
+        && let Some(object) = first.as_object_mut()
+    {
+        object.insert(
+            INTERNAL_OPENAI_REASONING_CONTENT_KEY.to_string(),
+            Value::String(reasoning_content),
+        );
+    }
+    tool_calls
+}
+
+fn attach_anthropic_content_metadata(
+    mut tool_calls: Vec<Value>,
+    content: Vec<Value>,
+) -> Vec<Value> {
+    if tool_calls.is_empty() || content.is_empty() {
+        return tool_calls;
+    }
+    if let Some(first) = tool_calls.first_mut()
+        && let Some(object) = first.as_object_mut()
+    {
+        object.insert(
+            INTERNAL_ANTHROPIC_CONTENT_KEY.to_string(),
+            Value::Array(content),
+        );
+    }
+    tool_calls
+}
+
 fn anthropic_tool_use_to_openai_tool_call(part: &Value) -> Option<Value> {
     let input = part.get("input").cloned().unwrap_or_else(|| json!({}));
     Some(json!({
@@ -1377,6 +1506,86 @@ fn anthropic_tool_use_to_openai_tool_call(part: &Value) -> Option<Value> {
             "arguments": serde_json::to_string(&input).ok()?,
         }
     }))
+}
+
+fn build_anthropic_content_blocks_from_stream_events(events: &[Value]) -> Vec<Value> {
+    let mut blocks = BTreeMap::<usize, Value>::new();
+    let mut input_json = BTreeMap::<usize, String>::new();
+    for event in events {
+        let Some(index) = event["index"].as_u64().map(|value| value as usize) else {
+            continue;
+        };
+        match event["type"].as_str().unwrap_or_default() {
+            "content_block_start" => {
+                if let Some(block) = event.get("content_block") {
+                    blocks.insert(index, block.clone());
+                    if block["type"].as_str() == Some("tool_use")
+                        && let Some(input) = block.get("input")
+                        && !input.as_object().is_some_and(|object| object.is_empty())
+                        && let Ok(arguments) = serde_json::to_string(input)
+                    {
+                        input_json.insert(index, arguments);
+                    }
+                }
+            }
+            "content_block_delta" => match event["delta"]["type"].as_str().unwrap_or_default() {
+                "text_delta" => append_string_field(
+                    blocks
+                        .entry(index)
+                        .or_insert_with(|| json!({"type": "text", "text": ""})),
+                    "text",
+                    event["delta"]["text"].as_str().unwrap_or_default(),
+                ),
+                "thinking_delta" => append_string_field(
+                    blocks
+                        .entry(index)
+                        .or_insert_with(|| json!({"type": "thinking", "thinking": ""})),
+                    "thinking",
+                    event["delta"]["thinking"].as_str().unwrap_or_default(),
+                ),
+                "signature_delta" => append_string_field(
+                    blocks
+                        .entry(index)
+                        .or_insert_with(|| json!({"type": "thinking", "thinking": ""})),
+                    "signature",
+                    event["delta"]["signature"].as_str().unwrap_or_default(),
+                ),
+                "input_json_delta" => {
+                    input_json
+                        .entry(index)
+                        .or_default()
+                        .push_str(event["delta"]["partial_json"].as_str().unwrap_or_default());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    for (index, arguments) in input_json {
+        if let Some(block) = blocks.get_mut(&index)
+            && block["type"].as_str() == Some("tool_use")
+            && let Ok(input) = serde_json::from_str::<Value>(&arguments)
+        {
+            block["input"] = input;
+        }
+    }
+    blocks
+        .into_values()
+        .filter(|block| {
+            matches!(
+                block["type"].as_str(),
+                Some("thinking" | "text" | "tool_use")
+            )
+        })
+        .collect()
+}
+
+fn append_string_field(value: &mut Value, field: &str, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    let existing = value[field].as_str().unwrap_or_default();
+    value[field] = json!(format!("{existing}{delta}"));
 }
 
 fn extract_ollama_content(raw: &Value) -> Option<String> {
@@ -2050,6 +2259,117 @@ mod tests {
     }
 
     #[test]
+    fn build_openai_body_replays_reasoning_content_for_tool_use() {
+        let tool_calls = attach_openai_reasoning_metadata(
+            vec![json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "ToolSearch",
+                    "arguments": "{\"query\":\"web\"}"
+                }
+            })],
+            Some("需要搜索。".to_string()),
+        );
+        let request = ChatRequest {
+            provider_id: "deepseekapi".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "deepseek-v4-pro".to_string(),
+            model: ModelConfig {
+                provider: "deepseekapi".to_string(),
+                remote_name: "deepseek-v4-pro".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "<think>\n需要搜索。\n</think>".to_string(),
+                images: Vec::new(),
+                tool_calls: Some(tool_calls),
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        let message = &body["messages"][0];
+        assert_eq!(message["reasoning_content"].as_str(), Some("需要搜索。"));
+        assert!(message["content"].is_null());
+        assert!(
+            message["tool_calls"][0]
+                .get(INTERNAL_OPENAI_REASONING_CONTENT_KEY)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn build_openai_body_strips_reasoning_prefix_when_replaying_reasoning_content() {
+        let tool_calls = attach_openai_reasoning_metadata(
+            vec![json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "ToolSearch",
+                    "arguments": "{\"query\":\"web\"}"
+                }
+            })],
+            Some("需要搜索。".to_string()),
+        );
+        let request = ChatRequest {
+            provider_id: "deepseekapi".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "deepseek-v4-pro".to_string(),
+            model: ModelConfig {
+                provider: "deepseekapi".to_string(),
+                remote_name: "deepseek-v4-pro".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "<think>\n需要搜索。\n</think>\n\n继续执行。".to_string(),
+                images: Vec::new(),
+                tool_calls: Some(tool_calls),
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        let message = &body["messages"][0];
+        assert_eq!(message["reasoning_content"].as_str(), Some("需要搜索。"));
+        assert_eq!(message["content"].as_str(), Some("继续执行。"));
+    }
+
+    #[test]
     fn decorate_openai_stream_delta_wraps_reasoning_before_answer() {
         let mut in_reasoning = false;
         let first = decorate_openai_stream_delta(&mut in_reasoning, "先分析", "", None);
@@ -2391,6 +2711,62 @@ mod tests {
     }
 
     #[test]
+    fn build_anthropic_body_groups_consecutive_tool_results() {
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: "first".to_string(),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    name: Some("Read".to_string()),
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: "second".to_string(),
+                    images: Vec::new(),
+                    tool_calls: None,
+                    tool_call_id: Some("call_2".to_string()),
+                    name: Some("Grep".to_string()),
+                },
+            ],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"].as_str(), Some("user"));
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["tool_use_id"].as_str(), Some("call_1"));
+        assert_eq!(content[1]["tool_use_id"].as_str(), Some("call_2"));
+    }
+
+    #[test]
     fn build_anthropic_body_serializes_tools_and_assistant_tool_use() {
         let request = ChatRequest {
             provider_id: "anthropic".to_string(),
@@ -2456,6 +2832,125 @@ mod tests {
         assert_eq!(content[1]["id"].as_str(), Some("call_1"));
         assert_eq!(content[1]["name"].as_str(), Some("ToolSearch"));
         assert_eq!(content[1]["input"]["query"].as_str(), Some("web"));
+    }
+
+    #[test]
+    fn build_anthropic_body_replays_original_thinking_blocks_for_tool_use() {
+        let tool_calls = attach_anthropic_content_metadata(
+            vec![json!({
+                "id": "toolu_1",
+                "type": "function",
+                "function": {
+                    "name": "ToolSearch",
+                    "arguments": "{\"query\":\"web\"}"
+                }
+            })],
+            vec![
+                json!({"type": "thinking", "thinking": "需要搜索。", "signature": "sig"}),
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "ToolSearch",
+                    "input": {"query": "web"}
+                }),
+            ],
+        );
+        let request = ChatRequest {
+            provider_id: "anthropic".to_string(),
+            provider: ProviderConfig {
+                kind: "anthropic".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "claude".to_string(),
+            model: ModelConfig {
+                provider: "anthropic".to_string(),
+                remote_name: "claude".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "<think>\n需要搜索。\n</think>".to_string(),
+                images: Vec::new(),
+                tool_calls: Some(tool_calls),
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_anthropic_body(&request, false);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"].as_str(), Some("thinking"));
+        assert_eq!(content[0]["thinking"].as_str(), Some("需要搜索。"));
+        assert_eq!(content[0]["signature"].as_str(), Some("sig"));
+        assert_eq!(content[1]["type"].as_str(), Some("tool_use"));
+        assert_eq!(content[1]["input"]["query"].as_str(), Some("web"));
+    }
+
+    #[test]
+    fn build_openai_body_strips_anthropic_content_metadata() {
+        let request = ChatRequest {
+            provider_id: "openai".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "model".to_string(),
+            model: ModelConfig {
+                provider: "openai".to_string(),
+                remote_name: "model".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+                images: Vec::new(),
+                tool_calls: Some(attach_anthropic_content_metadata(
+                    vec![json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "ToolSearch",
+                            "arguments": "{\"query\":\"web\"}"
+                        }
+                    })],
+                    vec![json!({"type": "thinking", "thinking": "plan"})],
+                )),
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        assert!(
+            body["messages"][0]["tool_calls"][0]
+                .get(INTERNAL_ANTHROPIC_CONTENT_KEY)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2900,6 +3395,50 @@ mod tests {
             calls[0]["function"]["arguments"].as_str(),
             Some("{\"query\":\"web\"}")
         );
+    }
+
+    #[test]
+    fn build_anthropic_content_blocks_from_stream_events_preserves_thinking_and_tool_use() {
+        let events = vec![
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "需要"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "搜索"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig"}
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "ToolSearch",
+                    "input": {}
+                }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"web\"}"}
+            }),
+        ];
+
+        let blocks = build_anthropic_content_blocks_from_stream_events(&events);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"].as_str(), Some("thinking"));
+        assert_eq!(blocks[0]["thinking"].as_str(), Some("需要搜索"));
+        assert_eq!(blocks[0]["signature"].as_str(), Some("sig"));
+        assert_eq!(blocks[1]["type"].as_str(), Some("tool_use"));
+        assert_eq!(blocks[1]["input"]["query"].as_str(), Some("web"));
     }
 
     #[test]
