@@ -835,10 +835,21 @@ fn build_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
                     m.insert("content".to_string(), json!(content));
                 }
             } else {
-                m.insert(
-                    "content".to_string(),
-                    build_openai_message_content_value(message),
-                );
+                if let Some((reasoning, content)) =
+                    split_combined_reasoning_content(&message.content)
+                {
+                    m.insert("reasoning_content".to_string(), json!(reasoning));
+                    if content.is_empty() {
+                        m.insert("content".to_string(), Value::Null);
+                    } else {
+                        m.insert("content".to_string(), json!(content));
+                    }
+                } else {
+                    m.insert(
+                        "content".to_string(),
+                        build_openai_message_content_value(message),
+                    );
+                }
             }
             built.push(Value::Object(m));
             continue;
@@ -1264,17 +1275,33 @@ fn strip_internal_tool_call_metadata(tool_calls: &[Value]) -> Vec<Value> {
 }
 
 fn strip_combined_reasoning_prefix(content: &str) -> String {
+    if let Some((_, answer)) = split_combined_reasoning_content(content) {
+        return answer;
+    }
+    content.to_string()
+}
+
+fn split_combined_reasoning_content(content: &str) -> Option<(String, String)> {
     let Some(rest) = content.strip_prefix("<think>\n") else {
-        return content.to_string();
+        return None;
     };
-    let Some((_, answer)) = rest.split_once("\n</think>") else {
-        return content.to_string();
+    let (reasoning, answer) = if let Some((reasoning, answer)) = rest.split_once("\n</think>") {
+        (reasoning, answer)
+    } else if let Some((reasoning, answer)) = rest.split_once("</think>") {
+        (reasoning, answer)
+    } else {
+        return None;
     };
-    answer
+    let reasoning = reasoning.trim_end_matches('\n').to_string();
+    if reasoning.trim().is_empty() {
+        return None;
+    }
+    let answer = answer
         .strip_prefix("\n\n")
         .or_else(|| answer.strip_prefix('\n'))
         .unwrap_or(answer)
-        .to_string()
+        .to_string();
+    Some((reasoning, answer))
 }
 
 fn parse_tool_arguments_value(arguments: &str) -> Value {
@@ -2367,6 +2394,93 @@ mod tests {
         let message = &body["messages"][0];
         assert_eq!(message["reasoning_content"].as_str(), Some("需要搜索。"));
         assert_eq!(message["content"].as_str(), Some("继续执行。"));
+    }
+
+    #[test]
+    fn build_openai_body_replays_reasoning_content_for_plain_assistant_history() {
+        let request = ChatRequest {
+            provider_id: "deepseekapi".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "deepseek-v4-pro".to_string(),
+            model: ModelConfig {
+                provider: "deepseekapi".to_string(),
+                remote_name: "deepseek-v4-pro".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "<think>\n读取完成。</think>\n\n内容是 #0D233A。".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        let message = &body["messages"][0];
+        assert_eq!(message["reasoning_content"].as_str(), Some("读取完成。"));
+        assert_eq!(message["content"].as_str(), Some("内容是 #0D233A。"));
+    }
+
+    #[test]
+    fn build_openai_body_replays_reasoning_only_plain_assistant_history() {
+        let request = ChatRequest {
+            provider_id: "deepseekapi".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "deepseek-v4-pro".to_string(),
+            model: ModelConfig {
+                provider: "deepseekapi".to_string(),
+                remote_name: "deepseek-v4-pro".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "<think>\n需要读取文件。\n</think>".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        let message = &body["messages"][0];
+        assert_eq!(
+            message["reasoning_content"].as_str(),
+            Some("需要读取文件。")
+        );
+        assert!(message["content"].is_null());
     }
 
     #[test]
