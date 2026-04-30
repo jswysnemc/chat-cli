@@ -396,6 +396,7 @@ A provider defines how to reach the upstream API.
 - `org`, `project`: OpenAI-compatible headers mapped to `OpenAI-Organization` and `OpenAI-Project`
 - `default_model`: provider-level fallback model id
 - `timeout`: total request timeout in seconds; `0` means disabled
+- `patch_replay_reasoning_content`: compatibility patch for DeepSeek-style OpenAI-compatible reasoning history replay
 
 Base URL behavior:
 
@@ -413,6 +414,7 @@ A model entry is a local alias plus runtime metadata.
 - `capabilities`: feature declarations such as `chat`, `reasoning`, `vision`
 - `reasoning_effort`: optional reasoning hint for compatible models
 - `patch_system_to_user`: compatibility patch for some OpenAI-compatible backends
+- `patch_replay_reasoning_content`: optional model-level override for DeepSeek-style reasoning history replay
 
 Selection priority at runtime:
 
@@ -530,6 +532,9 @@ api_key_env = "DEEPSEEK_API_KEY"                # env var name, not the secret v
 default_model = "deepseek-reasoner-search"      # fallback local model id
 # timeout = 0                                   # optional total request timeout in seconds; defaults to 0 (disabled)
 
+[providers.deepseek.patches]
+replay_reasoning_content = true                 # pass saved <think> history back as reasoning_content
+
 [models.deepseek-reasoner-search]
 provider = "deepseek"                           # provider id from [providers.*]
 remote_name = "deepseek-reasoner-search"        # upstream model name sent to the API
@@ -541,6 +546,7 @@ capabilities = ["chat", "reasoning"]           # e.g. chat reasoning vision imag
 # reasoning_effort = "medium"                   # optional reasoning level
 # [models.deepseek-reasoner-search.patches]
 # system_to_user = true                         # optional compatibility patch
+# replay_reasoning_content = true               # optional model-level override
 
 # secrets.toml
 # [providers.deepseek]

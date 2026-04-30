@@ -321,6 +321,9 @@ pub struct ProviderSetArgs {
 
     #[arg(long)]
     pub timeout: Option<u64>,
+
+    #[arg(long)]
+    pub patch_replay_reasoning_content: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -371,6 +374,9 @@ pub struct ModelSetArgs {
 
     #[arg(long)]
     pub patch_system_to_user: bool,
+
+    #[arg(long)]
+    pub patch_replay_reasoning_content: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]

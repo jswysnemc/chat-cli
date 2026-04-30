@@ -4,9 +4,9 @@ use crate::cli::{
     ReasoningArgs, ReplArgs, SessionCommand,
 };
 use crate::config::{
-    AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderSecret,
-    SecretsConfig, apply_runtime_config_defaults, ensure_dirs, init_config_files, load_config,
-    load_secrets, parse_headers, read_system_prompt, render_config_value, save_config,
+    AppConfig, AppPaths, ModelConfig, ModelPatchConfig, ProviderConfig, ProviderPatchConfig,
+    ProviderSecret, SecretsConfig, apply_runtime_config_defaults, ensure_dirs, init_config_files,
+    load_config, load_secrets, parse_headers, read_system_prompt, render_config_value, save_config,
     save_secrets, set_config_value, validate_config,
 };
 use crate::context::{ContextStatusMode, prepend_context_status};
@@ -579,6 +579,7 @@ async fn handle_provider_command(
 ) -> AppResult<()> {
     match command {
         ProviderCommand::Set(args) => {
+            let patch_replay_reasoning_content = args.patch_replay_reasoning_content;
             let provider = ProviderConfig {
                 kind: args.kind,
                 base_url: args.base_url,
@@ -588,6 +589,9 @@ async fn handle_provider_command(
                 project: args.project,
                 default_model: args.default_model,
                 timeout: args.timeout,
+                patches: ProviderPatchConfig {
+                    replay_reasoning_content: patch_replay_reasoning_content.then_some(true),
+                },
             };
             config.providers.insert(args.id.clone(), provider);
             save_config(paths, config)?;
@@ -670,6 +674,7 @@ fn handle_model_command(
             temperature,
             reasoning_effort,
             patch_system_to_user,
+            patch_replay_reasoning_content,
         }) => {
             if !config.providers.contains_key(&provider) {
                 return Err(AppError::new(
@@ -690,6 +695,8 @@ fn handle_model_command(
                     reasoning_effort,
                     patches: ModelPatchConfig {
                         system_to_user: patch_system_to_user.then_some(true),
+                        replay_reasoning_content: patch_replay_reasoning_content.then_some(true),
+                        ..ModelPatchConfig::default()
                     },
                 },
             );
@@ -7594,6 +7601,9 @@ mod tests {
             ProviderConfig {
                 kind: "openai_compatible".to_string(),
                 default_model: Some("deepseek-reasoner-search".to_string()),
+                patches: ProviderPatchConfig {
+                    replay_reasoning_content: Some(true),
+                },
                 ..ProviderConfig::default()
             },
         );
@@ -7610,6 +7620,7 @@ mod tests {
                 reasoning_effort: None,
                 patches: ModelPatchConfig {
                     system_to_user: Some(true),
+                    ..ModelPatchConfig::default()
                 },
             },
         );

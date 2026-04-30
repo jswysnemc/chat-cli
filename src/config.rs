@@ -222,6 +222,17 @@ impl Default for SkillsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderPatchConfig {
+    pub replay_reasoning_content: Option<bool>,
+}
+
+impl ProviderPatchConfig {
+    fn is_empty(&self) -> bool {
+        self.replay_reasoning_content.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     pub kind: String,
     pub base_url: Option<String>,
@@ -232,16 +243,19 @@ pub struct ProviderConfig {
     pub project: Option<String>,
     pub default_model: Option<String>,
     pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "ProviderPatchConfig::is_empty")]
+    pub patches: ProviderPatchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelPatchConfig {
     pub system_to_user: Option<bool>,
+    pub replay_reasoning_content: Option<bool>,
 }
 
 impl ModelPatchConfig {
     fn is_empty(&self) -> bool {
-        self.system_to_user.is_none()
+        self.system_to_user.is_none() && self.replay_reasoning_content.is_none()
     }
 }
 

@@ -767,7 +767,10 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
     );
     body.insert(
         "messages".to_string(),
-        Value::Array(build_openai_messages(&messages)),
+        Value::Array(build_openai_messages(
+            &messages,
+            replay_reasoning_content_patch(request),
+        )),
     );
     body.insert("stream".to_string(), Value::Bool(stream));
     if stream {
@@ -794,7 +797,7 @@ fn build_openai_body(request: &ChatRequest, stream: bool) -> Value {
     Value::Object(body)
 }
 
-fn build_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
+fn build_openai_messages(messages: &[ChatMessage], replay_reasoning_content: bool) -> Vec<Value> {
     let mut built = Vec::new();
     for message in messages {
         let mut m = Map::new();
@@ -815,7 +818,9 @@ fn build_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
         }
         if message.role == "assistant" {
             if let Some(tc) = &message.tool_calls {
-                let reasoning_content = openai_reasoning_metadata(tc);
+                let reasoning_content = replay_reasoning_content
+                    .then(|| openai_reasoning_metadata(tc))
+                    .flatten();
                 if let Some(reasoning) = &reasoning_content {
                     m.insert("reasoning_content".to_string(), json!(reasoning));
                 }
@@ -835,8 +840,9 @@ fn build_openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
                     m.insert("content".to_string(), json!(content));
                 }
             } else {
-                if let Some((reasoning, content)) =
-                    split_combined_reasoning_content(&message.content)
+                if replay_reasoning_content
+                    && let Some((reasoning, content)) =
+                        split_combined_reasoning_content(&message.content)
                 {
                     m.insert("reasoning_content".to_string(), json!(reasoning));
                     if content.is_empty() {
@@ -1097,6 +1103,15 @@ fn patched_messages(request: &ChatRequest) -> Vec<ChatMessage> {
         }
     }
     messages
+}
+
+fn replay_reasoning_content_patch(request: &ChatRequest) -> bool {
+    request
+        .model
+        .patches
+        .replay_reasoning_content
+        .or(request.provider.patches.replay_reasoning_content)
+        .unwrap_or(false)
 }
 
 fn split_system_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
@@ -2211,7 +2226,7 @@ fn map_http_error(status: u16, text: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ModelPatchConfig;
+    use crate::config::{ModelPatchConfig, ProviderPatchConfig};
 
     #[test]
     fn sse_parser_handles_chunk_boundaries() {
@@ -2302,6 +2317,9 @@ mod tests {
             provider_id: "deepseekapi".to_string(),
             provider: ProviderConfig {
                 kind: "openai_compatible".to_string(),
+                patches: ProviderPatchConfig {
+                    replay_reasoning_content: Some(true),
+                },
                 ..ProviderConfig::default()
             },
             model_id: "deepseek-v4-pro".to_string(),
@@ -2360,6 +2378,9 @@ mod tests {
             provider_id: "deepseekapi".to_string(),
             provider: ProviderConfig {
                 kind: "openai_compatible".to_string(),
+                patches: ProviderPatchConfig {
+                    replay_reasoning_content: Some(true),
+                },
                 ..ProviderConfig::default()
             },
             model_id: "deepseek-v4-pro".to_string(),
@@ -2402,6 +2423,9 @@ mod tests {
             provider_id: "deepseekapi".to_string(),
             provider: ProviderConfig {
                 kind: "openai_compatible".to_string(),
+                patches: ProviderPatchConfig {
+                    replay_reasoning_content: Some(true),
+                },
                 ..ProviderConfig::default()
             },
             model_id: "deepseek-v4-pro".to_string(),
@@ -2439,11 +2463,59 @@ mod tests {
     }
 
     #[test]
+    fn build_openai_body_keeps_combined_reasoning_content_without_replay_patch() {
+        let request = ChatRequest {
+            provider_id: "openai-compatible".to_string(),
+            provider: ProviderConfig {
+                kind: "openai_compatible".to_string(),
+                ..ProviderConfig::default()
+            },
+            model_id: "generic-reasoning-model".to_string(),
+            model: ModelConfig {
+                provider: "openai-compatible".to_string(),
+                remote_name: "generic-reasoning-model".to_string(),
+                display_name: None,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                temperature: None,
+                reasoning_effort: None,
+                patches: ModelPatchConfig::default(),
+            },
+            api_key: String::new(),
+            messages: vec![ChatMessage {
+                role: "assistant".to_string(),
+                content: "<think>\n读取完成。</think>\n\n内容是 #0D233A。".to_string(),
+                images: Vec::new(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature: None,
+            max_output_tokens: None,
+            params: BTreeMap::new(),
+            timeout_secs: None,
+            tools: Vec::new(),
+        };
+
+        let body = build_openai_body(&request, false);
+        let message = &body["messages"][0];
+        assert!(message.get("reasoning_content").is_none());
+        assert_eq!(
+            message["content"].as_str(),
+            Some("<think>\n读取完成。</think>\n\n内容是 #0D233A。")
+        );
+    }
+
+    #[test]
     fn build_openai_body_replays_reasoning_only_plain_assistant_history() {
         let request = ChatRequest {
             provider_id: "deepseekapi".to_string(),
             provider: ProviderConfig {
                 kind: "openai_compatible".to_string(),
+                patches: ProviderPatchConfig {
+                    replay_reasoning_content: Some(true),
+                },
                 ..ProviderConfig::default()
             },
             model_id: "deepseek-v4-pro".to_string(),
@@ -3369,6 +3441,7 @@ mod tests {
                 reasoning_effort: None,
                 patches: ModelPatchConfig {
                     system_to_user: Some(true),
+                    ..ModelPatchConfig::default()
                 },
             },
             api_key: String::new(),
