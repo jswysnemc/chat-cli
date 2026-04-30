@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.8 - 2026-05-01
+
+- Fixed DeepSeek continuation requests by replaying saved reasoning text as `reasoning_content`.
+- Added a provider/model patch gate for DeepSeek-style reasoning replay so other OpenAI-compatible providers keep their default message format.
+- Added configuration and documentation for `replay_reasoning_content` provider/model patches.
+
 ## 0.1.7 - 2026-04-28
 
 - Added interactive reasoning configuration support.
